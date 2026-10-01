@@ -104,34 +104,105 @@ async function amapGet(cfg, path, params) {
   throw lastErr;
 }
 
-/* ---------- 类型映射：高德 typecode → 本产品兴趣标签/停留 ---------- */
+/* ---------- 类型映射：高德 typecode → 本产品兴趣标签/停留 ----------
+ * 按官方 POI 分类编码表（amap_poicode 2023-10）精确到二级子类：
+ * 1401=博物馆 1402=展览馆 1404=美术馆 1405=图书馆 1406=科技馆 1407=天文馆 1408=文化宫；
+ * 学校/科研/培训/驾校（1412xx/1413xx/1414xx/1415xx）不在此映射——它们根本不该进候选池。
+ */
 function mapType(typecode, name) {
   const tc = String(typecode || '');
-  if (/^1101/.test(tc)) return { tags: ['自然'], dwellSec: 1500, scenic: 0.7 };   // 公园广场
-  if (/^1102/.test(tc)) return { tags: ['自然', '人文'], dwellSec: 1200, scenic: 0.75 }; // 风景名胜
-  if (/^14/.test(tc)) return { tags: ['人文', '建筑'], dwellSec: 1800, scenic: 0.6 };    // 科教文化
+  if (/^1101/.test(tc)) return { tags: ['自然'], dwellSec: 1500, scenic: 0.7 };          // 公园广场（公园/动物园/植物园/水族馆/城市广场）
+  if (/^1102/.test(tc)) return { tags: ['自然', '人文'], dwellSec: 1500, scenic: 0.8 };  // 风景名胜（含寺庙/纪念馆/观景点/红色景区）
+  if (/^1401/.test(tc)) return { tags: ['人文', '建筑'], dwellSec: 2400, scenic: 0.75 }; // 博物馆
+  if (/^140[2467]/.test(tc)) return { tags: ['人文', '建筑'], dwellSec: 1800, scenic: 0.75 }; // 展览馆/美术馆/科技馆/天文馆
+  if (/^140[58]/.test(tc)) return { tags: ['人文'], dwellSec: 1200, scenic: 0.6 };       // 图书馆/文化宫
   if (/^05/.test(tc)) return { tags: ['美食'], dwellSec: 1500, scenic: 0.5 };            // 餐饮
-  if (/^06/.test(tc)) return { tags: ['街区'], dwellSec: 900, scenic: 0.45 };            // 购物/街区
-  if (/^08/.test(tc)) return { tags: ['街区'], dwellSec: 900, scenic: 0.45 };            // 体育休闲
-  if (/^07/.test(tc)) return { tags: ['人文'], dwellSec: 1200, scenic: 0.55 };           // 风景名胜其他
+  if (/^06(01|10)/.test(tc)) return { tags: ['街区'], dwellSec: 900, scenic: 0.55 };     // 商场/特色商业街（步行街）
+  if (/^0612/.test(tc)) return { tags: ['街区', '人文'], dwellSec: 600, scenic: 0.5 };   // 古玩/书店/礼品/土特产小店
+  if (/^08(05|06)/.test(tc)) return { tags: ['街区'], dwellSec: 1200, scenic: 0.6 };     // 休闲场所/影剧院（游乐场/露营/音乐厅/剧场）
   void name;
   return { tags: ['街区'], dwellSec: 900, scenic: 0.4 };
 }
 
-/* ---------- 周边候选（§7.4：覆盖几个不同类别，去重后评分压缩） ---------- */
+/* ---------- 游览准入：名称黑名单（兜底，不依赖类目表准确性） ----------
+ * 检索类目已收窄到白名单，但高德仍可能返回楼内混合业态；这些名称的场所在"逛街游览"语境下
+ * 没有游览价值（学校/培训机构/医院/银行/批发市场/纯运动场馆/酒店书吧/设施节点等），
+ * 一律不进候选池。注意"公园"不得被"幼儿园"误伤——黑名单用完整词，不用单字"园"。
+ * 2026-10-01 春熙路实数据补强：080500 休闲场所在商圈=拼豆/DIY 工坊重灾区（名称词兜底）、
+ * 亚朵酒店把大堂书吧标成"图书馆"（连锁品牌词）、商场内部设施节点（楼梯/扶梯）。 */
+const EXCLUDE_NAME_RE = new RegExp([
+  '学校', '学院', '大学', '培训', '补习', '考研', '驾校', '幼儿园', '托育', '托管',
+  '医院', '诊所', '卫生服务', '药店', '药房', '体检',
+  '银行', '储蓄', '信用社', '证券', '保险', '营业厅',
+  '加油站', '充电站', '加气站', '停车场', '洗车', '汽修', '维修', '4S',
+  '五金', '建材', '家居', '家装', '批发', '菜市场', '超市', '便利店', '粮油',
+  '公司', '工厂', '产业园', '写字楼', '办公楼', '宿舍', '公寓',
+  '宾馆', '酒店', '民宿', '旅馆', '旅舍', '网吧', '网咖', '棋牌', 'KTV', '夜总会', '迪厅', '彩票',
+  '殡仪', '墓园', '陵园', '养老院', '敬老院', '福利院',
+  '快递', '驿站', '公厕', '环卫', '变电站', '水厂',
+  '楼梯', '扶梯', '电梯', '出入口', '通道', '收银', '柜台', '卫生间', '厕所',
+  '拼豆', '手作', 'DIY', '自拍', '换装', '密室', '剧本杀', '影院', '影城', '电玩', 'PS5',
+  '亚朵', '如家', '汉庭', '全季', '锦江之星', '7天', '速8', '格林', '维也纳', '丽枫', '桔子',
+  '希尔顿', '万豪', '洲际', '凯悦', '香格里拉', '索菲特', '喜来登', '威斯汀', '华住', '首旅',
+].join('|'), 'i');
+
+/** 名称归一化：去掉括注（分店/楼层/打卡点后缀）与空白，再截到第一个分隔符前的"品牌段"
+ * （"笑古里喜剧剧场(商业场店)"→"笑古里"；"IFS国际金融中心-圆形窗洞"→"IFS国际金融中心"），
+ * 分隔符前不足 2 字时退回整体前 8 字（"运·本命年"→"运本命年旗舰店"）。
+ * 用于同主体/同品牌去重。 */
+function normalizeNameForDedupe(name) {
+  const base = String(name || '').replace(/[（(【\[][^）)】\]]*[）)】\]]/g, '').replace(/\s+/g, '');
+  const m = base.match(/^[^-·—|｜/]*/);
+  const brand = m && m[0].length >= 2 ? m[0] : base;
+  return brand.slice(0, 8);
+}
+
+/** 同主体去重：归一化品牌段相同视为同一地点/同一品牌连锁，
+ * 组内只保留离起点最近的那个（亚朵书吧 ×3、礼信堂特产 ×2、春熙路牌打卡点 ×5、
+ * 同楼"笑古里"×3 这类重复由此消除）。 */
+function dedupeByPrefix(cands) {
+  const groups = new Map();
+  for (const c of cands) {
+    const key = normalizeNameForDedupe(c.name);
+    if (!key) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  const kept = [];
+  for (const list of groups.values()) {
+    list.sort((a, b) => (a.distanceM ?? 9999) - (b.distanceM ?? 9999));
+    kept.push(list[0]);
+  }
+  return kept;
+}
+
+/* ---------- 周边候选（§7.4：覆盖几个不同类别，去重后评分压缩） ----------
+ * 检索类目白名单（官方 POI 分类编码表）：只搜"值得逛"的子类，每组用 | 合并为一次请求。
+ * 此前整包检索 140000/060000/080000 三个大类，高等院校与培训机构混进候选（"考研学校"），
+ * 便利店/超市/家电卖场/KTV 同理，而 061000 特色商业街这类最该有的点反而从未被搜过。 */
+const SEARCH_TYPE_GROUPS = [
+  '110100|110200',                                    // 公园广场/风景名胜（含打卡点/观景点/雕塑）
+  '050000',                                           // 餐饮
+  '140100|140200|140400|140500|140600|140700|140800', // 博物馆/展览馆/美术馆/图书馆/科技馆/天文馆/文化宫
+  '060100|061000|061201|061205|061209|061214',        // 商场/特色商业街(步行街)/古玩/书店/礼品/土特产
+  '080602|080603',                                    // 音乐厅/剧场（080601 电影院实数据被"私人影院/PS5电玩"包间店占满，剔除）
+  // 注：080500 休闲场所不检索——实数据里该子类被手工 DIY/拼豆/自拍馆工坊占满（2026-10-01 春熙路验证）
+];
+
 async function searchAround(cfg, point, radiusM) {
-  const types = ['110100', '110200', '050000', '140000', '060000', '080000']; // 公园/风景名胜/餐饮/科教文化/购物/体育休闲
   const seen = new Map();
-  for (const t of types) {
+  for (const types of SEARCH_TYPE_GROUPS) {
     const json = await amapGet(cfg, '/v3/place/around', {
-      location: `${point.lng},${point.lat}`, types: t, radius: String(Math.min(radiusM, 4000)),
+      location: `${point.lng},${point.lat}`, types, radius: String(Math.min(radiusM, 4000)),
       offset: '15', page: '1', extensions: 'base',
     });
     for (const p of json.pois || []) {
       if (!seen.has(p.id)) seen.set(p.id, p);
     }
   }
-  return [...seen.values()].map((p) => {
+  return dedupeByPrefix([...seen.values()]
+    .filter((p) => !EXCLUDE_NAME_RE.test(p.name || '')))
+    .map((p) => {
     const [lng, lat] = p.location.split(',').map(Number);
     const m = mapType(p.typecode, p.name);
     return {
@@ -345,7 +416,10 @@ class AmapAreaGraph {
 
 /** 构建真实闲逛"场所包"（结构同演示包，数据来源标注为高德实时查询） */
 async function buildAmapAreaPack(cfg, origin, budgetSec) {
-  const radiusM = Math.min(4000, Math.max(1200, Math.round((budgetSec / 3600) * 2500)));
+  // 检索半径=步行可达圈：闲逛者不会把 1.5 小时花在"赶路去 4km 外"上。
+  // 此前 (budgetSec/3600)*2500 封顶 4000m——两小时的闲逛也在 4km 半径找点，
+  // 候选间实际步行 1-3km，每站光交通就吃掉 15-30 分钟，半天只装得下两三站（2026-10-01 修）。
+  const radiusM = Math.min(2500, Math.max(1000, Math.round((budgetSec / 3600) * 700)));
   const rawCands = await searchAround(cfg, origin, radiusM);
   // 粗筛：按类型分桶保证多样性，每桶取最近 4 个，再按预算取前 8~12 进精算（§7.4 评分压缩）。
   // 候选数同时受路由矩阵配额约束：配额必须够抓满"起点 + 候选"的两两组合，
@@ -398,4 +472,4 @@ async function buildAmapAreaPack(cfg, origin, budgetSec) {
   return { pack, graph };
 }
 
-module.exports = { searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf };
+module.exports = { searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };

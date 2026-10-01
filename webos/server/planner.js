@@ -114,7 +114,9 @@ function scoreCandidates(pack, intent, graph, originNodeId) {
     const distM = graph.route(originNodeId, poi.entranceNode).distanceM ?? 5000;
     const distPenalty = clamp(distM / 2000, 0, 1);
     const coverageBonus = intent.objective === 'poi_coverage' ? 0.35 : 0;
-    const relaxAdj = intent.objective === 'relax' ? (scenic >= 0.6 ? 0.2 : -0.25) : 0; // 不默认"点越多越好"（§2.2）
+    // relax 取向："宁缺毋滥"只惩罚真正低质的兜底点（真实街点 scenic 0.4-0.6 不再被一刀切扣分
+    // ——此前的 -0.25 会把整条街区压到收益门槛之下，半天只排得进两三站，2026-10-01 修）
+    const relaxAdj = intent.objective === 'relax' ? (scenic >= 0.65 ? 0.15 : scenic >= 0.4 ? 0 : -0.2) : 0; // 不默认"点越多越好"（§2.2）
     const score = interestScore + scenic * 0.8 + coverageBonus + quietBonus + relaxAdj - costPenalty - distPenalty * 0.5;
     out.push({ poi, score, distM, must: intent.hard.mustVisitIds.includes(poi.id) });
   }
@@ -407,8 +409,10 @@ function solveOnce(pack, intent, graph, policy) {
 
     // 3) 预算填充：主循环按收益门槛收敛后，剩余预算还装得下一个点就继续补——
     //    用户给的是"半天"，不该只逛两三个点就闲着。按分数密度（score/增量小时）挑最划算的候选。
-    //    relax 目标除外（§2.2：放松不堆点，少而精是合法结果）。
-    if (intent.objective !== 'relax') {
+    //    relax 也填充，但要求更高的密度门槛：少而精 ≠ 两三站就收工，只是不硬塞低性价比的点
+    //    （此前 relax 整段跳过，而城市闲逛曾默认 relax，半天 4 小时实测只有 2 站，2026-10-01 修）。
+    const fillMinDensity = intent.objective === 'relax' ? 0.6 : 0;
+    {
       while (true) {
         const pool = optional.filter((c) => !seq.includes(c.poi.entranceNode));
         if (!pool.length) break;
@@ -432,6 +436,7 @@ function solveOnce(pack, intent, graph, policy) {
           }
         }
         if (!chosen) break; // 剩余候选一个都塞不进预算
+        if (fillMinDensity && chosen.density < fillMinDensity) break; // relax：剩余点性价比都不够，宁缺毋滥
         seq.splice(chosen.pos, 0, chosen.nid);
         curSch = chosen.sch;
         insertedAny = true;

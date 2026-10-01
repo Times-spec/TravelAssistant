@@ -194,7 +194,10 @@ function normalizeIntent(input, packs, preParsed = null) {
   const textEngine = preParsed ? 'llm' : 'rules';
 
   // 目标
-  let objective = form.objective || parsed.objective || (scene === 'venue' ? 'highlights' : 'relax');
+  // 目标。两种场景默认都是 highlights：用户说"陪我逛半天"，期待的是排满值得去点的路线；
+  // relax 曾是城市闲逛的默认，但它压低街区点收益并曾跳过预算填充，半天实测只排两三站（2026-10-01 修）。
+  // relax 仍可由用户文字（散心/放空）或景区模式选择触发。
+  let objective = form.objective || parsed.objective || 'highlights';
   evidence.objective = { source: form.objective ? 'form' : parsed.objective ? 'text' : 'default' };
 
   // 起点（规划起点与设备位置分离，§1 表）
