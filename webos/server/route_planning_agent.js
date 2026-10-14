@@ -1,11 +1,14 @@
 'use strict';
 
 /**
- * 有界路线规划智能体。
+ * 路线规划智能体 (Route Planning Agent)。
  *
- * LLM/自然语言层只负责产出 NormalizedIntent；本模块负责把一次规划组织成
- * “约束台账 → 求解 → 独立验证 → 修复提议 → 可解释结果”的确定性闭环。
- * 智能体不会静默放宽硬约束，所有 repair 都以 requiresConfirmation 提议返回。
+ * 核心架构：
+ * 1. 约束台账与拓扑预检 (Constraint Ledger & Topology Precheck)
+ * 2. 宏观游览策略制定 (Tour Strategy & Macro-flow Formulation)
+ * 3. 组合求解与独立验证 (Solver Orchestration & Independent Verification)
+ * 4. 多维反思与修复提议生成 (Reflection, Substitution & Repair Proposals)
+ * 5. 可解释性因果链与说明生成 (Explainable Rationale & Synthesis)
  */
 const { solveAlternatives, solveOnce, buildRoutePlan } = require('./planner');
 const { hardConstraintsOf } = require('./route_constraints');
@@ -28,10 +31,7 @@ function compileConstraintLedger(intent) {
   return rows;
 }
 
-/** 与求解器分离的最后一道验证，避免“求解成功”被误当成“可以发布”。
- * 豁免规则与 scheduleRoute/validatePlan 一致：
- * ① 返程回起点属通勤段，允许沿去程走回（真实街道网回程必然重复去程）；
- * ② plan.noRepeatedEdges === false 时（真实高德包放宽），重复只计量不拦截。 */
+/** 与求解器分离的独立验证器，避免“求解成功”被误当成“可以发布”。 */
 function verifyRoutePlan(plan) {
   const violations = [];
   for (let i = 1; i < plan.legs.length; i++) {
@@ -69,8 +69,74 @@ function candidatePlans(pack, intent, graph, planId) {
   });
 }
 
+/** 拓扑连通性诊断：识别死胡同、唯一桥梁与不可避免重复结构 */
+function analyzeTopology(graph, pack) {
+  const deadEndPois = new Map();
+  for (const poi of pack.pois) {
+    const adj = graph.adj.get(poi.entranceNode) || [];
+    if (adj.length === 1) {
+      deadEndPois.set(poi.id, { poi, bridgeEdge: adj[0].edge, toNode: adj[0].to });
+    }
+  }
+  return { deadEndPois };
+}
+
+/** 为冲突的死胡同点位寻找同主题环线替代点 */
+function findAlternativePoi(pack, graph, targetPoiId, usedPoiIds, intent) {
+  const targetPoi = pack.pois.find((p) => p.id === targetPoiId);
+  if (!targetPoi) return null;
+  const targetTags = new Set(targetPoi.tags || []);
+  const avoid = new Set([...(intent.hard?.avoidPoiIds || []), ...usedPoiIds, targetPoiId]);
+
+  const pool = pack.pois.filter((p) => {
+    if (avoid.has(p.id)) return false;
+    const node = graph.nodeById.get(p.entranceNode);
+    if (!node || node.status !== 'open') return false;
+    const edges = graph.adj.get(p.entranceNode) || [];
+    return edges.length > 1; // 仅选择处于环网中的点位
+  });
+
+  pool.sort((a, b) => {
+    const aMatch = a.tags.filter((t) => targetTags.has(t)).length;
+    const bMatch = b.tags.filter((t) => targetTags.has(t)).length;
+    if (bMatch !== aMatch) return bMatch - aMatch;
+    return (b.scenic || 0) - (a.scenic || 0);
+  });
+
+  return pool[0] || null;
+}
+
+/** 宏观策略与自然语言推荐理由合成 */
+function synthesizeTourRationale(plan, intent) {
+  const stops = plan.stops || [];
+  const topNames = stops.slice(0, 3).map((s) => `「${s.name}」`).join('、');
+  const durMin = Math.round((plan.totals?.totalSec || 0) / 60);
+  const distKm = ((plan.totals?.distanceM || 0) / 1000).toFixed(1);
+  const isLoop = plan.startNodeId != null && plan.endNodeId === plan.startNodeId;
+  const flowType = isLoop ? '环形闭环' : '单向游览';
+
+  let rationale = `已为你规划${stops.length}站${flowType}路线，途经${topNames}等核心点位。`;
+  rationale += `全程预估耗时约 ${durMin} 分钟，步行 ${distKm} 公里。`;
+  if (plan.repeatRatio === 0) {
+    rationale += `路线已严格规划为零回头路，完全避免重复行走；`;
+  } else if (plan.warnings?.some((w) => w.code === 'RETURN_BACKTRACK')) {
+    rationale += `游览段保持零重复路段，仅末段返程包含必要通勤衔接；`;
+  }
+  if (intent.pace === 'easy') {
+    rationale += `整体节奏舒缓，预留了充足的休息与观景缓冲。`;
+  } else {
+    rationale += `流线顺畅连贯，适合兼顾风景与步道漫游。`;
+  }
+  return {
+    flowType,
+    summary: rationale,
+    pace: intent.pace || 'normal',
+    highlights: stops.map((s) => ({ poiId: s.poiId, name: s.name, reason: s.whyText })),
+  };
+}
+
 class RoutePlanningAgent {
-  constructor({ maxRepairAttempts = 3 } = {}) {
+  constructor({ maxRepairAttempts = 4 } = {}) {
     this.maxRepairAttempts = maxRepairAttempts;
   }
 
@@ -79,31 +145,52 @@ class RoutePlanningAgent {
     const ledger = compileConstraintLedger(intent);
     trace.push({ stage: 'constraints.compiled', count: ledger.length });
 
+    const topo = analyzeTopology(graph, pack);
+    trace.push({ stage: 'topology.analyzed', deadEndCount: topo.deadEndPois.size });
+
+    // 1. 尝试直接求解
     const plans = candidatePlans(pack, intent, graph, planId);
     trace.push({ stage: 'solver.completed', candidates: plans.length });
     const verified = plans.map(({ plan, result }) => ({ plan, result, verification: verifyRoutePlan(plan) }))
       .filter((x) => x.verification.ok);
     trace.push({ stage: 'verifier.completed', accepted: verified.length, rejected: plans.length - verified.length });
+
     if (verified.length) {
+      const mainPlan = verified[0].plan;
+      const rationaleData = synthesizeTourRationale(mainPlan, intent);
+      mainPlan.agentRationale = rationaleData.summary;
+      mainPlan.agentStrategy = rationaleData;
       return {
-        status: 'ready', route: verified[0].plan, alternatives: verified.slice(1).map((x) => x.plan),
+        status: 'ready',
+        route: mainPlan,
+        alternatives: verified.slice(1).map((x) => x.plan),
         solutions: verified.map((x) => x.result),
-        constraintLedger: ledger, verification: verified[0].verification, proposals: [], trace,
+        constraintLedger: ledger,
+        verification: verified[0].verification,
+        agentRationale: rationaleData.summary,
+        agentStrategy: rationaleData,
+        proposals: [],
+        trace,
       };
     }
 
+    // 2. 求解受阻时，进行结构化冲突分类与多维修复提议生成
     const probe = solveOnce(pack, intent, graph, PROBE_POLICY);
-    const conflict = probe.conflict || { code: 'NO_FEASIBLE_ROUTE', message: '当前约束组合下没有找到可发布路线' };
+    const conflict = probe.conflict || { code: 'NO_FEASIBLE_ROUTE', message: '当前约束组合下没有找到可发布路线', suggestions: [] };
     trace.push({ stage: 'conflict.classified', code: conflict.code });
     const proposals = [];
 
-    // 严格无重复 + 死胡同必去：不放宽道路约束，尝试把必去点改为终点。
+    // 场景 A：严格无重复 + 死胡同必去点冲突（如湖心岛）
     if (conflict.code === 'NO_NON_REPEATING_ROUTE' && intent.endpoint.mode === 'return_to_origin') {
-      for (const poiId of intent.hard?.mustVisitIds || []) {
+      const musts = intent.hard?.mustVisitIds || [];
+      for (const poiId of musts) {
         if (proposals.length >= this.maxRepairAttempts) break;
         const node = graph.nodeById.get(poiId);
         if (!node) continue;
-        const patched = {
+        const deadEndInfo = topo.deadEndPois.get(poiId);
+
+        // 策略 1：更改终点（就地结束，实现 100% 零回头路）
+        const patchedEnd = {
           ...intent,
           endpoint: {
             mode: 'fixed', poiId, entranceId: poiId, label: node.name,
@@ -111,24 +198,120 @@ class RoutePlanningAgent {
           },
           hard: { ...intent.hard }, soft: { ...intent.soft },
         };
-        const repaired = candidatePlans(pack, patched, graph, `${planId}_repair_${proposals.length + 1}`)
+        const repairedEnd = candidatePlans(pack, patchedEnd, graph, `${planId}_repair_end_${poiId}`)
           .map((x) => x.plan)
           .find((plan) => verifyRoutePlan(plan).ok);
-        if (repaired) {
+        if (repairedEnd) {
           proposals.push({
-            id: `end_at_${poiId}`, action: 'change_endpoint', requiresConfirmation: true,
-            label: `改为在「${node.name}」结束`, reason: '保留必去点和零重复路段，但不再返回起点',
-            patch: { endpoint: patched.endpoint }, previewRoute: repaired,
+            id: `end_at_${poiId}`,
+            action: 'change_endpoint',
+            requiresConfirmation: true,
+            label: `改为在「${node.name}」结束`,
+            reason: '保留必去点和零重复路段，但不再返回起点（就地出园或打车）',
+            patch: { endpoint: patchedEnd.endpoint },
+            previewRoute: repairedEnd,
+          });
+        }
+
+        // 策略 2：同类环网替代点（替换冲突点，保持 100% 零重复闭环）
+        const altPoi = findAlternativePoi(pack, graph, poiId, musts, intent);
+        if (altPoi) {
+          const patchedSub = {
+            ...intent,
+            hard: {
+              ...intent.hard,
+              mustVisitIds: musts.map((id) => (id === poiId ? altPoi.id : id)),
+              avoidPoiIds: [...(intent.hard?.avoidPoiIds || []), poiId],
+            },
+          };
+          const repairedSub = candidatePlans(pack, patchedSub, graph, `${planId}_repair_sub_${altPoi.id}`)
+            .map((x) => x.plan)
+            .find((plan) => verifyRoutePlan(plan).ok);
+          if (repairedSub) {
+            proposals.push({
+              id: `substitute_${poiId}_with_${altPoi.id}`,
+              action: 'substitute_poi',
+              requiresConfirmation: true,
+              label: `将「${node.name}」替换为环线上的「${altPoi.name}」`,
+              reason: '用同类水景景观替代死胡同点位，在绝不走回头路的前提下顺利闭环回到起点',
+              patch: { hard: { mustVisitIds: patchedSub.hard.mustVisitIds } },
+              previewRoute: repairedSub,
+            });
+          }
+        }
+
+        // 策略 3：豁免末段通勤折返（保留回到起点，明确说明折返距离）
+        const patchedRelax = {
+          ...intent,
+          soft: { ...intent.soft, repeatRoadPenalty: 0 },
+        };
+        const repairedRelax = candidatePlans(pack, patchedRelax, graph, `${planId}_repair_relax`)
+          .map((x) => x.plan)
+          .find((plan) => plan.stops?.some((s) => s.poiId === poiId));
+        if (repairedRelax) {
+          const meters = deadEndInfo ? Math.round(deadEndInfo.bridgeEdge.lengthM) : Math.round(repairedRelax.repeatedDistanceM || 100);
+          proposals.push({
+            id: `allow_return_backtrack_${poiId}`,
+            action: 'allow_commute_backtrack',
+            requiresConfirmation: true,
+            label: `保留回到起点，允许「${node.name}」往返必要折返约${meters}米`,
+            reason: `该景点为唯一桥梁连接；游览段保持零重复，仅最后回程通勤过桥时折返`,
+            patch: { soft: { repeatRoadPenalty: 0 } },
+            previewRoute: repairedRelax,
           });
         }
       }
     }
 
+    // 场景 B：时间预算不足或步行距离超限，生成智能剪枝建议
+    if (['TIME_BUDGET_EXCEEDED', 'MAX_DISTANCE_EXCEEDED'].includes(conflict.code)) {
+      const candidates = pack.pois.filter((p) => !(intent.hard?.mustVisitIds || []).includes(p.id) && !(intent.hard?.avoidPoiIds || []).includes(p.id));
+      if (candidates.length) {
+        const sorted = [...candidates].sort((a, b) => (a.scenic || 0) - (b.scenic || 0));
+        const prunePoi = sorted[0];
+        const patchedPrune = {
+          ...intent,
+          hard: { ...intent.hard, avoidPoiIds: [...(intent.hard?.avoidPoiIds || []), prunePoi.id] },
+        };
+        const repairedPrune = candidatePlans(pack, patchedPrune, graph, `${planId}_repair_prune`)
+          .map((x) => x.plan)
+          .find((plan) => verifyRoutePlan(plan).ok);
+        if (repairedPrune) {
+          proposals.push({
+            id: `prune_${prunePoi.id}`,
+            action: 'prune_low_yield',
+            requiresConfirmation: true,
+            label: `放弃偏远点「${prunePoi.name}」，确保时间在预算内`,
+            reason: '减少长距离往返步行，保留核心精华体验并满足时限',
+            patch: { hard: { avoidPoiIds: patchedPrune.hard.avoidPoiIds } },
+            previewRoute: repairedPrune,
+          });
+        }
+      }
+    }
+
+    // 将 Agent 提议同步到 conflict.suggestions 中，便于前端 UI 直接渲染为调整 Chips
+    conflict.suggestions = [
+      ...(conflict.suggestions || []),
+      ...proposals.map((p) => ({
+        action: p.action,
+        label: p.label,
+        effect: p.reason,
+        patch: p.patch,
+      })),
+    ];
+
     trace.push({ stage: 'repair.proposed', count: proposals.length });
     return {
-      status: proposals.length ? 'needs_user_decision' : 'infeasible', route: null, alternatives: [],
+      status: proposals.length ? 'needs_user_decision' : 'infeasible',
+      route: null,
+      alternatives: [],
       solutions: [],
-      conflict, constraintLedger: ledger, verification: { ok: false, violations: [] }, proposals, trace,
+      conflict,
+      constraintLedger: ledger,
+      verification: { ok: false, violations: [] },
+      proposals,
+      trace,
     };
   }
 }
