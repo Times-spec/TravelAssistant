@@ -206,25 +206,36 @@ function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
   let endNodeId = opts.endNodeId;
   let endLeg = null;
   if (endNodeId && endNodeId !== prevNode) {
-    // 返程选路：能不走回头路就不走。此前 allowRepeat 直接把"不重复物理路段"约束关掉，
-    // 于是一律取最短路——哪怕旁边就有一条干净的环路，也照样原路返回（2026-09-30 修）。
-    // 但绕行不能离谱：超出阈值时仍按最短路走，重复距离如实计量并在校验层提示。
-    // 真实街道网上回程往往必然重复去程，所以这里的降级是"通勤豁免"而非"零重复"。
-    const isReturnTrip = opts.isReturnTrip || endNodeId === opts.startNodeId;
-    let allowRepeat = isReturnTrip;
-    if (isReturnTrip && traversal.hard.noRepeatedEdges) {
-      const clean = traversal.probe(prevNode, endNodeId, { allowRepeat: false });
-      if (clean.status === 'ok') {
-        const direct = traversal.probe(prevNode, endNodeId, { allowRepeat: true });
-        if (direct.status !== 'ok') {
-          allowRepeat = false;
-        } else {
-          const detourM = clean.distanceM - direct.distanceM;
-          allowRepeat = detourM > Math.max(RETURN_DETOUR_MAX_EXTRA_M, direct.distanceM * (RETURN_DETOUR_MAX_RATIO - 1));
+    // 返程选路：能不走回头路就不走。
+    // - 严格模式（用户明确要求"不走回头路"）：返程也不允许重复，无解交给冲突/提议链路；
+    // - 普通模式：优先绕干净的环路；绕行离谱或没有干净路线时按"通勤豁免"放行最短路。
+    //   真实街道网上回程往往必然重复去程，所以这里的降级是通勤豁免而非零重复。
+    const isReturnTrip = opts.isReturnTrip || endNodeId === opts.startNodeId || intent.endpoint?.mode === 'return_to_origin';
+    const strictNoRepeat = intent.hard?.noRepeatedEdges !== false
+      && (intent.soft?.repeatRoadPenalty === 1 || opts.strictNoRepeat);
+    let r;
+    if (isReturnTrip) {
+      if (strictNoRepeat) {
+        r = traversal.route(prevNode, endNodeId, { allowRepeat: false });
+      } else {
+        let allowRepeat = true;
+        if (traversal.hard.noRepeatedEdges) {
+          const clean = traversal.probe(prevNode, endNodeId, { allowRepeat: false });
+          if (clean.status === 'ok') {
+            const direct = traversal.probe(prevNode, endNodeId, { allowRepeat: true });
+            if (direct.status !== 'ok') {
+              allowRepeat = false;
+            } else {
+              const detourM = clean.distanceM - direct.distanceM;
+              allowRepeat = detourM > Math.max(RETURN_DETOUR_MAX_EXTRA_M, direct.distanceM * (RETURN_DETOUR_MAX_RATIO - 1));
+            }
+          }
         }
+        r = traversal.route(prevNode, endNodeId, { allowRepeat });
       }
+    } else {
+      r = traversal.route(prevNode, endNodeId, { allowRepeat: false });
     }
-    const r = traversal.route(prevNode, endNodeId, { allowRepeat });
     if (r.status !== 'ok') {
       problems.push({ nodeId: endNodeId, code: r.code || (traversal.hard.noRepeatedEdges ? 'end_requires_repeated_edge' : 'end_unreachable') });
       return { ok: false, problems, constraintMetrics: traversal.metrics() };
@@ -389,6 +400,10 @@ function solveOnce(pack, intent, graph, policy) {
         if (!sch) continue;
         const delta = sch.totals.totalSec - baseSec;
         const dRepeat = (sch.totals.repeatSightM || 0) - baseRepeat;
+        // 硬约束下，可选点不得让游览段新增重复路段。
+        // 只比游览段（repeatSightM）：返程回起点的通勤折返是被豁免的，不能拿来卡可选点，
+        // 否则死胡同必去 + 回起点时所有可选点都会被误拒，路线塌缩成 1 站。
+        if (intent.hard?.noRepeatedEdges !== false && dRepeat > 0) continue;
         const gain = cand.score * policy.interestW - delta / 3600 * policy.timeCostW
           - (repeatOn ? dRepeat / 1000 * REPEAT_GATE_W : 0);
         // 首个点位放宽收益门槛（否则离起点较远时会一个点都排不进去）；
@@ -417,6 +432,7 @@ function solveOnce(pack, intent, graph, policy) {
         const pool = optional.filter((c) => !seq.includes(c.poi.entranceNode));
         if (!pool.length) break;
         const baseSec = curSch ? curSch.totals.totalSec : 0;
+        const baseRepeatFill = curSch ? curSch.totals.repeatSightM || 0 : 0;
         let chosen = null;
         for (const cand of pool) {
           const nid = cand.poi.entranceNode;
@@ -425,6 +441,8 @@ function solveOnce(pack, intent, graph, policy) {
             const trial = [...seq.slice(0, pos), nid, ...seq.slice(pos)];
             const sch = trySchedule(trial);
             if (!sch) continue;
+            // 与插入阶段同一口径：只禁止游览段新增重复，返程通勤不计入。
+            if (intent.hard?.noRepeatedEdges !== false && ((sch.totals.repeatSightM || 0) - baseRepeatFill) > 0) continue;
             const c = routeCost(sch, intent);
             if (!bestCost || costLess(c, bestCost)) {
               bestCost = c; bestPos = pos; bestTrial = sch; bestDelta = sch.totals.totalSec - baseSec;
@@ -755,6 +773,7 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
     revalidateAfter: fmt(schedule.endArrivalMs + 3600000),
     provenance: { solverVersion: SOLVER_VERSION, policyVersion: POLICY_VERSION, dataVersion: pack.venue.packVersion },
     noRepeatedEdges: intent.hard?.noRepeatedEdges !== false, // 独立校验器按同一语义复核
+    strictNoRepeat: !!(intent.hard?.noRepeatedEdges !== false && (intent.soft?.repeatRoadPenalty === 1 || intent.hard?.strictNoRepeat)),
     startNodeId: solved.startNodeId,
     endNodeId: solved.endNodeId,
     candidateCount: solved.candidateCount || 0,

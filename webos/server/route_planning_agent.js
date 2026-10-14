@@ -44,7 +44,8 @@ function verifyRoutePlan(plan) {
   const sightLegs = returnTrip ? plan.legs.slice(0, -1) : plan.legs;
   if (plan.noRepeatedEdges !== false) {
     const used = new Set();
-    for (const leg of sightLegs) {
+    const legsToCheck = plan.strictNoRepeat ? plan.legs : sightLegs;
+    for (const leg of legsToCheck) {
       const keys = leg.physicalSegmentKeys?.length
         ? leg.physicalSegmentKeys
         : (leg.edgeIds || []).map((eid) => `e:${eid}`);
