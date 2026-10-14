@@ -351,8 +351,8 @@ class JobRunner {
     }
     const locked = remaining.filter((s) => s.locked).map((s) => s.poiId);
 
-    // 新预算：以"现在"为起点（§12.2 不能从过时的规划起点计算返程）
-    const nowMs = Date.now();
+    // 新预算：以"现在"为起点（§12.2 不能从过时的规划起点计算返程；预定未来行程以预定时刻为准）
+    const nowMs = intent0.startAtMs && intent0.startAtMs > Date.now() ? intent0.startAtMs : Date.now();
     let latestEndAtMs = intent0.latestEndAtMs;
     if (cause === 'deadline_changed' && data.newLatestEndClock) {
       const z = tk.msToZoned(nowMs, intent0.timezone);

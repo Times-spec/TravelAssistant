@@ -204,10 +204,13 @@ function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
   let endNodeId = opts.endNodeId;
   let endLeg = null;
   if (endNodeId && endNodeId !== prevNode) {
-    // 回到起点的返程允许沿去程走回（通勤性质；真实街道网上回程必然重复去程），
-    // 游览段仍严格不重复；重复距离照常计量并在校验层如实提示
-    const isReturnTrip = opts.isReturnTrip || endNodeId === opts.startNodeId;
-    const r = traversal.route(prevNode, endNodeId, { allowRepeat: isReturnTrip });
+    // 优先尝试不走重复路的返回；若无解且属于回到起点的通勤段且非严格模式，才允许沿去程折返
+    const isReturnTrip = opts.isReturnTrip || endNodeId === opts.startNodeId || (intent.endpoint?.mode === 'return_to_origin');
+    const strictNoRepeat = intent.hard?.noRepeatedEdges !== false && (intent.soft?.repeatRoadPenalty === 1 || opts.strictNoRepeat);
+    let r = traversal.route(prevNode, endNodeId, { allowRepeat: false });
+    if (r.status !== 'ok' && isReturnTrip && !strictNoRepeat) {
+      r = traversal.route(prevNode, endNodeId, { allowRepeat: true });
+    }
     if (r.status !== 'ok') {
       problems.push({ nodeId: endNodeId, code: r.code || (traversal.hard.noRepeatedEdges ? 'end_requires_repeated_edge' : 'end_unreachable') });
       return { ok: false, problems, constraintMetrics: traversal.metrics() };
@@ -298,7 +301,17 @@ function solveOnce(pack, intent, graph, policy) {
       const trial = [...seq.slice(0, pos), nid, ...seq.slice(pos)];
       const sch = trySchedule(trial);
       if (!sch) continue;
+      // 当要求不重复路段时，可选点绝对不能导致引入重复路段
+      if (intent.hard?.noRepeatedEdges !== false && sch.constraintMetrics?.repeatedEdgeIds?.length > 0) {
+        continue;
+      }
       const delta = sch.totals.totalSec - baseSec;
+      // 避免荒谬的大绕路：如果为了看这个点增加的步行时间远超停留时间
+      const dwellSec = (cand.poi.dwellSec || 900) * policy.dwellFactor;
+      const walkDeltaSec = delta - dwellSec;
+      if (walkDeltaSec > 1800 && walkDeltaSec > dwellSec * 2.5) {
+        continue;
+      }
       const gain = cand.score * policy.interestW - delta / 3600 * policy.timeCostW;
       // 首个点位放宽收益门槛（否则离起点较远时会一个点都排不进去）
       const accepted = (gain > 0 || !insertedAny) && delta < bestDelta;
@@ -329,8 +342,14 @@ function solveOnce(pack, intent, graph, policy) {
         for (let pos = 0; pos <= seq.length; pos++) {
           const trial = [...seq.slice(0, pos), nid, ...seq.slice(pos)];
           const sch = trySchedule(trial);
-          if (sch && sch.totals.totalSec - baseSec < bestDelta) {
-            bestDelta = sch.totals.totalSec - baseSec; bestPos = pos; bestTrial = sch;
+          if (sch && (!intent.hard?.noRepeatedEdges || sch.constraintMetrics?.repeatedEdgeIds?.length === 0)) {
+            const delta = sch.totals.totalSec - baseSec;
+            const dwellSec = (cand.poi.dwellSec || 900) * policy.dwellFactor;
+            const walkDeltaSec = delta - dwellSec;
+            if (walkDeltaSec > 1800 && walkDeltaSec > dwellSec * 2.5) continue;
+            if (delta < bestDelta) {
+              bestDelta = delta; bestPos = pos; bestTrial = sch;
+            }
           }
         }
         if (bestTrial) {
@@ -347,14 +366,18 @@ function solveOnce(pack, intent, graph, policy) {
 
   // 4) 2-opt 局部换序（限量迭代）
   let bestSch = trySchedule(seq);
-  for (let iter = 0; iter < 3 && seq.length >= 3; iter++) {
+  for (let iter = 0; iter < 5 && seq.length >= 3; iter++) {
     let improved = false;
     for (let i = 0; i < seq.length - 1; i++) {
       for (let j = i + 1; j < seq.length; j++) {
         const trial = [...seq.slice(0, i), ...seq.slice(i, j + 1).reverse(), ...seq.slice(j + 1)];
         const sch = trySchedule(trial);
-        if (sch && (!bestSch || sch.totals.totalSec < bestSch.totals.totalSec - 15)) {
-          seq = trial; bestSch = sch; improved = true;
+        if (sch) {
+          const prevRepeats = bestSch?.constraintMetrics?.repeatedEdgeIds?.length || 0;
+          const newRepeats = sch.constraintMetrics?.repeatedEdgeIds?.length || 0;
+          if (newRepeats < prevRepeats || (newRepeats === prevRepeats && sch.totals.totalSec < bestSch.totals.totalSec - 15)) {
+            seq = trial; bestSch = sch; improved = true;
+          }
         }
       }
     }
@@ -614,6 +637,7 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
     revalidateAfter: fmt(schedule.endArrivalMs + 3600000),
     provenance: { solverVersion: SOLVER_VERSION, policyVersion: POLICY_VERSION, dataVersion: pack.venue.packVersion },
     noRepeatedEdges: intent.hard?.noRepeatedEdges !== false, // 独立校验器按同一语义复核
+    strictNoRepeat: !!(intent.hard?.noRepeatedEdges !== false && (intent.soft?.repeatRoadPenalty === 1 || intent.hard?.strictNoRepeat)),
     startNodeId: solved.startNodeId,
     endNodeId: solved.endNodeId,
     candidateCount: solved.candidateCount || 0,

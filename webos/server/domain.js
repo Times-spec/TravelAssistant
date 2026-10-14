@@ -309,7 +309,7 @@ function normalizeIntent(input, packs, preParsed = null) {
   };
   const soft = {
     freePreferred: !!(form.freePreferred || parsed.soft.freePreferred),
-    repeatRoadPenalty: form.avoidRepeat === false ? 0 : (parsed.soft.repeatRoadPenalty ?? 1),
+    repeatRoadPenalty: form.avoidRepeat ? 1 : (parsed.soft.repeatRoadPenalty ?? 0),
     restPreferred: !!(form.restPreferred || parsed.soft.restPreferred || pace === 'easy'),
     quietPreferred: !!(form.quietPreferred || parsed.soft.quietPreferred),
     stepFewPreferred: !!parsed.soft.stepFewPreferred,
