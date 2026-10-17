@@ -231,9 +231,12 @@ class JobRunner {
         plan_.agentRationale = agentResult.agentRationale || null;
         plan_.agentStrategy = agentResult.agentStrategy || null;
       }
-      // 备选标题体现真实取向差异；主推荐不加" · 轻松版"这类后缀（否则读起来像次级方案）
-      if (i > 0 && r.policy.name === 'light') plan_.title += ' · 轻松版';
-      if (i > 0 && r.policy.name === 'full') plan_.title += ' · 全览版';
+      // 备选标题体现真实取向差异（主推荐不加后缀，避免读起来像次级方案）；
+      // 三种策略都要有区分，否则主推 light、备选 balanced 时会撞成同一个标题
+      if (i > 0) {
+        plan_.title += r.policy.name === 'light' ? ' · 轻松版'
+          : r.policy.name === 'full' ? ' · 全览版' : ' · 均衡版';
+      }
       if (!existing) store.insert('route_versions', plan_);
       routeIds.push(plan_.routeId);
       version++;
