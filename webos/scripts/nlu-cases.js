@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { ruleNLU, normalizeIntent, confirmChips } = require('../server/domain');
 const { loadPacks } = require('../server/providers');
-const { llmNLU } = require('../server/llm');
+const { llmNLU, parseCommand } = require('../server/llm');
 const { createHarness } = require('./live-test-support');
 const packs = loadPacks(path.join(__dirname, '..'));
 const cfg = { llm: { baseUrl: 'http://llm.test', apiKey: '', model: 'test' }, limits: { maxLlmTokens: 1000 } };
@@ -120,6 +120,42 @@ async function main() {
     const p = await llmNLU(cfg, '下雨了，室内为主'); assert.equal(p.soft.indoorPreferred, true);
     at('09:00', () => assert.equal(intent('下雨了', {}, p).soft.indoorPreferred, true));
   }));
+  const commandHarness = () => {
+    const h = createHarness();
+    const pack = h.ctx.packs.find((p) => p.venue.id === 'venue_qinghu');
+    const node = pack.nodes.find((n) => n.id === pack.pois[0].entranceNode);
+    h.ctx.store.insert('intents', { id: 'intent-command', venueId: pack.venue.id, origin: { point: node }, hard: { avoidPoiIds: [] } });
+    h.ctx.store.insert('plans', { id: 'plan-command', intentId: 'intent-command' });
+    h.ctx.store.insert('route_versions', { id: 'route-command', stops: [{ poiId: pack.pois[0].id, name: pack.pois[0].name, coord: [node.lng, node.lat], entranceNodeId: node.id }], endArrivalAt: '2026-10-18T17:00:00+08:00' });
+    h.ctx.store.insert('trips', { id: 'trip-command', ownerId: h.req.user.id, planId: 'plan-command', activeRouteVersionId: 'route-command', status: 'active' });
+    return h;
+  };
+  for (const [text, cause, wantsPoi] of [['我想去附近喝杯咖啡', 'stop_add_requested', true], ['我累了', 'fatigue_reported', false], ['跳过下一站', 'stop_skipped', true]]) {
+    await check(`T4 规则指令与回复一致 ${text}`, async () => {
+      const { api, req, ctx } = commandHarness();
+      const r = await api.aiCommand(req, {}, {}, { tripId: 'trip-command', text });
+      assert.equal(r.action, 'replan'); assert.equal(r.cause, cause); assert.equal(!!r.data.poiId, wantsPoi);
+      if (wantsPoi) assert(ctx.packs.some((p) => p.pois.some((poi) => poi.id === r.data.poiId)));
+      assert.match(r.reply, /提议|确认/); assert.doesNotMatch(r.reply, /已经添加|已为你/);
+    });
+  }
+  await check('T4 模型错误返回none仍能识别咖啡诉求', () => modelResult({ action: 'none', reply: '帮你找家咖啡店加进行程' }, async () => {
+    const r = await parseCommand({ ...cfg, providers: { llm: 'http' } }, '我想去附近喝杯咖啡', {});
+    assert.equal(r.action, 'replan'); assert.equal(r.cause, 'stop_add_requested'); assert.equal(r.data.poiName, '咖啡');
+  }));
+  await check('T4 非重排回复不许承诺执行', () => modelResult({ action: 'none', reply: '已为你安排并添加进路线' }, async () => {
+    const { api, req, ctx } = commandHarness();
+    ctx.cfg.providers.llm = 'http'; ctx.cfg.llm = cfg.llm;
+    const r = await api.aiCommand(req, {}, {}, { tripId: 'trip-command', text: '随便聊聊' });
+    assert.equal(r.action, 'none'); assert.equal(r.cause, null); assert.equal(r.data.poiId, null);
+    assert.doesNotMatch(r.reply, /帮你|已为你|加进|添加|安排/);
+  }));
+  await check('T4 没有可用候选不生成加站承诺', async () => {
+    const { api, req, ctx } = commandHarness();
+    ctx.runner.resolvePackGraph = async () => ({ pack: { pois: [], nodes: [] } });
+    const r = await api.aiCommand(req, {}, {}, { tripId: 'trip-command', text: '喝杯咖啡' });
+    assert.equal(r.action, 'none'); assert.equal(r.data.poiId, null); assert.doesNotMatch(r.reply, /帮你|已为你|加进|添加|安排/);
+  });
   console.log(`NLU: ${passed} passed, 0 failed`);
 }
 main().catch((e) => { console.error(e); process.exitCode = 1; });

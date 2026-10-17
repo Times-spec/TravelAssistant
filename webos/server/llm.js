@@ -118,7 +118,23 @@ ${contextNote}`;
 /** 途中自然语言指令解析（游览页"说一句话调整行程"） */
 const COMMAND_CAUSES = ['fatigue_reported', 'rain_reported', 'stop_skipped', 'queue_reported', 'closure_reported', 'deadline_changed', 'finish_requested', 'stop_add_requested'];
 
+// 明确指令也走确定性兜底，避免模型或网络不可用时说了却没有动作。
+function ruleCommand(text) {
+  let cause = null, poiName = null;
+  if (/累了|太累|走不动|想歇|休息一下/.test(text)) cause = 'fatigue_reported';
+  else if (/下雨|天气不好/.test(text)) cause = 'rain_reported';
+  else if (/跳过下一站|下一站不去|不想去下一站/.test(text)) { cause = 'stop_skipped'; poiName = '下一站'; }
+  else if (/喝.*咖啡|(?:想|找|加|去).*(?:咖啡|cafe|coffee)/i.test(text)) { cause = 'stop_add_requested'; poiName = '咖啡'; }
+  else if (/吃(?:点|些|个|东西|饭)|饿了|找.*(?:餐|美食)/.test(text)) { cause = 'stop_add_requested'; poiName = '美食'; }
+  else if (/找.*(?:地方|地儿).*(?:坐|休息)|坐坐/.test(text)) { cause = 'stop_add_requested'; poiName = '休息'; }
+  else if (/我要回去|我想回去|结束游览|结束了/.test(text)) cause = 'finish_requested';
+  return cause ? { action: 'replan', cause, data: { poiName }, reply: '可生成调整提议，确认后生效' } : null;
+}
+
 async function parseCommand(cfg, text, context) {
+  const fallback = ruleCommand(text);
+  const unknown = { action: 'none', cause: null, data: {}, reply: '没太理解，可以说“我累了”“跳过下一站”“喝杯咖啡”' };
+  if (cfg.providers && cfg.providers.llm !== 'http') return fallback || unknown;
   const sys = `你是游览行程助手。根据用户的一句话，判断要做什么，只输出 JSON：
 {
   "action": "replan|answer|none",
@@ -128,6 +144,8 @@ async function parseCommand(cfg, text, context) {
 }
 判断规则：
 - 累了/走不动/想歇 → fatigue_reported；下雨/天气不好 → rain_reported；不想去某站/跳过 → stop_skipped；排队/人多等太久 → queue_reported（extraWaitMin 填等待分钟数）；某处关门了/在装修 → closure_reported；时间不够/要提前结束/几点前必须走 → deadline_changed（newLatestEndClock 填时间）；要回去/结束了 → finish_requested；想再加一个地方 → stop_add_requested（poiName 填地方名）；
+- “喝咖啡/吃东西/找个地方坐坐”等品类诉求也必须 action=replan、cause=stop_add_requested，poiName 分别填“咖啡/美食/休息”；“跳过下一站”的 poiName 填“下一站”；
+- replan 只代表生成提议，须等用户确认才生效；action=none/answer 不得说“帮你/已为你/加进/添加/安排”等执行承诺；
 - 只是闲聊或问题（"这是什么地方""介绍一下"）→ action=answer，reply 直接回答（不超过60字，不要编造事实）；
 - 看不出要调整什么 → action=none，reply 说明可以怎么调整。
 当前行程上下文：${JSON.stringify(context)}`;
@@ -137,7 +155,7 @@ async function parseCommand(cfg, text, context) {
     const j = JSON.parse(m[0]);
     const action = ['replan', 'answer', 'none'].includes(j.action) ? j.action : 'none';
     const cause = COMMAND_CAUSES.includes(j.cause) ? j.cause : null;
-    return {
+    const result = {
       action: action === 'replan' && !cause ? 'none' : action,
       cause,
       data: {
@@ -147,8 +165,9 @@ async function parseCommand(cfg, text, context) {
       },
       reply: typeof j.reply === 'string' ? j.reply.slice(0, 120) : '',
     };
+    return fallback || result;
   } catch (e) {
-    return { action: 'none', cause: null, data: {}, reply: '没太理解，可以说"我累了""跳过下一站""再加一个地方"这类说法' };
+    return fallback || unknown;
   }
 }
 
@@ -198,4 +217,4 @@ async function answerWithMaterial(cfg, guide, question) {
   }
 }
 
-module.exports = { llmNLU, generateGuide, parseCommand, answerWithMaterial };
+module.exports = { llmNLU, generateGuide, parseCommand, ruleCommand, answerWithMaterial };

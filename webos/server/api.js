@@ -494,66 +494,79 @@ class Api {
     const trip = body.tripId ? store.findOne('trips', (t) => t.id === body.tripId && t.ownerId === req.user.id) : null;
     let context = {};
     let route = null;
+    let nextStop = null;
     if (trip) {
       route = store.byId('route_versions', trip.activeRouteVersionId);
       const visited = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'arrive_confirm').map((e) => e.data.poiId);
       const skipped = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'stop_skipped').map((e) => e.data.poiId);
       const remaining = route ? route.stops.filter((s) => !visited.includes(s.poiId) && !skipped.includes(s.poiId)) : [];
       const next = remaining[0];
+      nextStop = next || null;
       context = {
         venue: trip.venueName || null,
         nextStop: next ? next.name : null,
         remaining: remaining.map((s) => s.name),
         locked: remaining.filter((s) => s.locked).map((s) => s.name),
         endLabel: route ? route.endLabel : null,
-        plannedEnd: route ? route.endArrivalAt.slice(11, 16) : null,
+        plannedEnd: route && route.endArrivalAt ? route.endArrivalAt.slice(11, 16) : null,
       };
-    }
-    if (cfg.providers.llm !== 'http') {
-      return { action: 'none', cause: null, data: {}, reply: '当前未配置 AI 服务，请用下面的按钮调整行程' };
     }
     const { parseCommand } = require('./llm');
     const parsed = await parseCommand(cfg, text, context);
 
-    // 把 AI 解析出的人名/地名解析成系统内真实点位 ID（模型不创造 ID §6.2）
+    // 模型只给名字；最终动作必须有真实行程与点位支持。
     const resolved = { poiId: null, poiName: parsed.data.poiName || null };
+    const matchName = (name, candidate) => name && candidate && (candidate.includes(name) || name.includes(candidate));
+    if (parsed.action === 'replan' && (!trip || !route || !['active', 'paused'].includes(trip.status))) {
+      parsed.action = 'none'; parsed.reply = '请先开始一条游览路线，再提出调整需求';
+    }
     if (parsed.action === 'replan') {
-      const byName = (name) => {
-        if (!name || !route) return null;
-        const all = route.stops.find((s) => s.name.includes(name) || name.includes(s.name));
-        if (all) return { poiId: all.poiId, poiName: all.name };
-        const skippedStop = route.stops.find((s) => s.name.includes(name));
-        return skippedStop ? { poiId: skippedStop.poiId, poiName: skippedStop.name } : null;
-      };
-      const hit = byName(parsed.data.poiName);
-      if (hit) { resolved.poiId = hit.poiId; resolved.poiName = hit.poiName; }
-      else if (parsed.data.poiName && parsed.cause === 'stop_add_requested') {
-        // 想加的地方：在场所内检索真实点位
+      let hit = null;
+      if (parsed.cause === 'stop_add_requested') {
+        // 与规划使用同一候选包，避免只支持 live 场所、却漏掉城市闲逛与演示包。
         try {
           const plan = store.byId('plans', trip.planId);
           const intent = store.byId('intents', plan.intentId);
-          if (intent.venueRef) {
-            const { resolveVenue } = require('./live_venue');
-            const v = await resolveVenue(cfg, intent.venueRef, intent.budgetSec, {
-              food: (intent.interests || []).some((i) => i.tag === '美食'),
-              mustVisitIds: intent.hard.mustVisitIds || [],
-            });
-            const m = v.pois.find((p) => p.name.includes(parsed.data.poiName) || parsed.data.poiName.includes(p.name));
-            if (m) { resolved.poiId = m.id; resolved.poiName = m.shortName; }
+          const { pack } = await this.ctx.runner.resolvePackGraph(intent);
+          const inRoute = new Set(route.stops.map((s) => s.poiId));
+          const excluded = new Set(intent.hard && intent.hard.avoidPoiIds || []);
+          const candidates = pack.pois.filter((p) => !inRoute.has(p.id) && !excluded.has(p.id) && p.status !== 'closed');
+          const name = parsed.data.poiName || '';
+          let matches = candidates.filter((p) => matchName(name, p.name) || matchName(name, p.shortName));
+          if (!matches.length) {
+            if (/咖啡|cafe|coffee/i.test(name)) matches = candidates.filter((p) => /咖啡|cafe|coffee/i.test(p.name) || (p.tags || []).includes('美食'));
+            else if (/吃|美食|餐|饭/.test(name)) matches = candidates.filter((p) => (p.tags || []).includes('美食'));
+            else if (/坐|休息|歇/.test(name)) matches = candidates.filter((p) => /茶|咖啡|休息|驿站|长椅|cafe|coffee/i.test(p.name) || p.restArea === true);
           }
-        } catch (e) { /* 检索失败：让用户直接用按钮添加 */ }
+          const target = nextStop && nextStop.coord ? { lng: nextStop.coord[0], lat: nextStop.coord[1] } : intent.origin.point;
+          const pointOf = (p) => p.coord && !Array.isArray(p.coord) ? p.coord : (pack.nodes || []).find((n) => n.id === p.entranceNode);
+          hit = matches.map((p) => ({ poi: p, point: pointOf(p) })).filter((p) => p.point && Number.isFinite(p.point.lng) && Number.isFinite(p.point.lat))
+            .sort((a, b) => haversineM(target, a.point) - haversineM(target, b.point))[0]?.poi;
+          if (hit) { resolved.poiId = hit.id; resolved.poiName = hit.name; }
+        } catch (_) { /* 无候选就如实说明，不作执行承诺 */ }
+      } else if (['stop_skipped', 'closure_reported', 'queue_reported'].includes(parsed.cause)) {
+        const name = parsed.data.poiName;
+        hit = !name || /^(?:下一站|下个点|下一个地方)$/.test(name) ? nextStop
+          : route.stops.find((s) => matchName(name, s.name));
+        if (hit) { resolved.poiId = hit.poiId; resolved.poiName = hit.name; }
       }
-      parsed.data.poiId = resolved.poiId;
-      if ((parsed.cause === 'stop_skipped' || parsed.cause === 'closure_reported' || parsed.cause === 'stop_add_requested')
-        && parsed.data.poiName && !resolved.poiId) {
-        parsed.reply = `没找到「${parsed.data.poiName}」，换个别名试试，或直接用按钮选择`;
-        parsed.action = 'none';
+      if (['stop_skipped', 'closure_reported', 'stop_add_requested'].includes(parsed.cause) && !resolved.poiId) {
+        parsed.action = 'none'; parsed.reply = `当前候选中没有找到「${resolved.poiName || '目标点位'}」，请用按钮选择地点`;
+      } else {
+        const replies = {
+          stop_add_requested: `找到「${resolved.poiName}」，可生成加站提议，确认后生效`,
+          stop_skipped: `可生成跳过「${resolved.poiName}」的提议，确认后生效`,
+          fatigue_reported: '可生成轻松节奏的调整提议，确认后生效',
+          rain_reported: '可生成优先室内的调整提议，确认后生效',
+        };
+        parsed.reply = replies[parsed.cause] || '可生成调整提议，确认后生效';
       }
     }
+    if (parsed.action !== 'replan' && /帮你|已为你|加进|添加|安排/.test(parsed.reply || '')) parsed.reply = '当前没有可执行的调整，请说明具体需求或用按钮选择';
     return {
-      action: parsed.action, cause: parsed.cause,
+      action: parsed.action, cause: parsed.action === 'replan' ? parsed.cause : null,
       data: {
-        poiId: resolved.poiId,
+        poiId: parsed.action === 'replan' ? resolved.poiId : null,
         extraWaitMin: parsed.data.extraWaitMin,
         newLatestEndClock: parsed.data.newLatestEndClock,
       },
