@@ -103,19 +103,34 @@ li.active .stage-dot { background: var(--warn); animation: pulse 1s infinite alt
 .agent-title { font-size: 14px; font-weight: 700; }
 .agent-badge { flex: none; font-size: 11px; font-weight: 600; color: var(--green-d); background: var(--green-l); border-radius: 6px; padding: 2px 7px; }
 .agent-sub { font-size: 11px; line-height: 1.5; color: var(--ink-2); margin-top: 3px; }
-.agent-steps { margin-top: 8px; }
-.agent-step { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; font-size: 12px; line-height: 1.55; }
-.agent-dot { flex: none; width: 16px; height: 16px; border-radius: 50%; margin-top: 1px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; }
+.agent-stepper { display: flex; gap: 4px; margin-top: 8px; overflow-x: auto; padding-bottom: 1px; scrollbar-width: none; }
+.agent-stepper::-webkit-scrollbar { height: 0; }
+.agent-stepbtn { flex: 1 0 auto; min-width: 56px; display: flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 5px 6px; border: 1px solid var(--line); border-radius: 9px; background: #fff;
+  font: inherit; font-size: 10.5px; color: var(--ink-2); cursor: pointer; }
+.agent-stepbtn.sel { border-color: var(--green); background: var(--green-l); color: var(--green-d); }
+.agent-steplabel { white-space: nowrap; }
+.agent-dot { flex: none; width: 14px; height: 14px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; }
 .agent-dot.done { background: var(--green); color: #fff; }
 .agent-dot.active { border: 2px solid var(--green); color: var(--green-d); background: var(--green-l); animation: agentPulse 1.3s ease-in-out infinite; }
-.agent-dot.pending { border: 1px solid var(--line); color: var(--ink-3, var(--ink-2)); }
+.agent-dot.pending { border: 1px solid var(--line); color: var(--ink-2); }
 @keyframes agentPulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(15, 111, 79, .28); }
   50% { box-shadow: 0 0 0 4px rgba(15, 111, 79, 0); }
 }
-.agent-name { flex: none; width: 60px; font-weight: 600; color: var(--ink); }
-.agent-detail { flex: 1; min-width: 0; color: var(--ink-2); }
-.agent-ms { flex: none; font-size: 11px; color: var(--ink-2); opacity: .7; }
+.agent-detawrap { margin-top: 8px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.agent-detahead { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; background: var(--green-l); }
+.agent-detaname { font-size: 12px; font-weight: 700; color: var(--green-d); }
+.agent-detailbox { padding: 9px 10px; background: #fbfcfb; font-size: 12px; line-height: 1.6; }
+.agent-mini { font-size: 11px; color: var(--ink-2); line-height: 1.6; }
+.agent-cand { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: 9px; background: #fff;
+  margin-top: 6px; cursor: pointer; font: inherit; text-align: left; }
+.agent-cand.sel { border-color: var(--green); background: var(--green-l); }
+.agent-cand-title { font-size: 12px; font-weight: 600; color: var(--ink); }
+.agent-act { flex: none; white-space: nowrap; }
+.agent-proposal { color: var(--ink); }
+.agent-checked { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
 .agent-ledger { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; padding-top: 9px; border-top: 1px dashed var(--line); }
 .agent-chip { font-size: 11px; color: var(--green-d); background: var(--green-l); border-radius: 999px; padding: 2px 8px; }
 .agent-chip.soft { color: var(--ink-2); background: #f1f3f2; }

@@ -146,7 +146,12 @@ class JobRunner {
     const { pack, graph } = await this.resolvePackGraph(intent);
     const { confirmChips } = require('./domain');
 
-    store.update('plans', plan.id, { status: 'retrieving' });
+    store.update('plans', plan.id, {
+      status: 'retrieving',
+      // 决策卡在刷新/重进后仍要能展示：把确认条件与预算随计划落库
+      confirmChips: confirmChips(intent),
+      budgetSec: intent.budgetSec,
+    });
     this.emit(job, 'intent.normalized', { intentId: intent.intentId, revision: intent.revision, chips: confirmChips(intent), unresolved: intent.unresolved });
     await sleep(250);
     if (this.cancelled(job)) return;
@@ -163,9 +168,11 @@ class JobRunner {
     const startNodeId = intent.origin.entranceId && graph.nodeById.has(intent.origin.entranceId)
       ? intent.origin.entranceId : originNear.node.id;
     const cands = scoreCandidates(pack, intent, graph, startNodeId);
+    const candidatePreview = { count: cands.length, names: cands.slice(0, 12).map((c) => c.poi.name) };
+    store.update('plans', plan.id, { candidatePreview });
     this.emit(job, 'candidates.ready', {
       count: cands.length,
-      names: cands.slice(0, 12).map((c) => c.poi.name),
+      names: candidatePreview.names,
       demo: cfg.demoMode && intent.venueId !== 'area_amap',
     });
     store.update('plans', plan.id, { status: 'solving' });

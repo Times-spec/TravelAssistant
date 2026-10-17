@@ -167,6 +167,7 @@ export function renderHome(view) {
             class: 'chip' + (d.endpointMode === v ? ' sel' : ''),
             onclick: () => {
               d.endpointMode = v;
+              d.endpointTouched = true; // 用户显式选过终点：优先于一句话里的终点描述
               if (v !== 'fixed') { d.endpointPoint = null; d.endpointLabel = null; d.endpointEntranceId = null; d.endpointPoiId = null; }
               saveDraft(); rerender();
             },
@@ -190,7 +191,7 @@ export function renderHome(view) {
         h('div', { class: 'field-label' }, h('span', {}, '终点'), h('span', { class: 'tl-meta' }, '逛完去哪，决定路线往哪边收')),
         h('div', { class: 'chips' },
           [['return_to_origin', '回到起点'], ['flexible', '顺路结束'], ['fixed', '指定地点']].map(([v, label]) =>
-            h('button', { class: 'chip' + (d.endpointMode === v ? ' sel' : ''), onclick: () => { d.endpointMode = v; saveDraft(); rerender(); } }, label)),
+            h('button', { class: 'chip' + (d.endpointMode === v ? ' sel' : ''), onclick: () => { d.endpointMode = v; d.endpointTouched = true; saveDraft(); rerender(); } }, label)),
           d.endpointMode === 'fixed' ? h('button', { class: 'chip sel', onclick: () => openPointPicker('endpoint') }, d.endpointLabel ? '📍 ' + d.endpointLabel : '🔍 选终点') : null)),
     // 景区游玩不问"想看什么"：场所自带人文/自然属性，兴趣标签是城市闲逛的专属字段
     ...(isVenueScene ? [] : [h('div', { class: 'field' },
@@ -516,7 +517,7 @@ export function renderHome(view) {
     if (purpose === 'origin') {
       if (coord) d.origin = { lng: coord.lng, lat: coord.lat, crs: 'GCJ02', label: item.name, source: 'search' };
     } else if (purpose === 'endpoint') {
-      if (coord) { d.endpointMode = 'fixed'; d.endpointPoint = { lng: coord.lng, lat: coord.lat, crs: 'GCJ02' }; d.endpointLabel = item.name; }
+      if (coord) { d.endpointMode = 'fixed'; d.endpointTouched = true; d.endpointPoint = { lng: coord.lng, lat: coord.lat, crs: 'GCJ02' }; d.endpointLabel = item.name; }
     } else if (purpose === 'must' || purpose === 'avoid') {
       if (item.kind !== 'poi') { toast('请选择具体点位'); return; }
       const arr = purpose === 'must' ? d.mustVisit : d.avoid;
@@ -554,6 +555,7 @@ export function renderHome(view) {
             : { lng: lngLat.lng, lat: lngLat.lat, crs: 'GCJ02', entranceId: null, poiId: null, label: '地图所选位置', source: 'map_pick' };
         } else {
           d.endpointMode = 'fixed';
+          d.endpointTouched = true;
           d.endpointPoint = snapped ? { lng: near.node.lng, lat: near.node.lat, crs: 'GCJ02' } : { lng: lngLat.lng, lat: lngLat.lat, crs: 'GCJ02' };
           d.endpointLabel = snapped ? near.node.name : '地图所选终点';
           // 大门/点位级精度要一路传到规划器，吸附失败必须清掉残留 id
@@ -696,6 +698,7 @@ export function renderHome(view) {
         d.origin = { lng: picked.lng, lat: picked.lat, crs: 'GCJ02', label: picked.label, source: 'map_pick', entranceId: picked.entranceId, poiId: picked.poiId };
       } else {
         d.endpointMode = 'fixed';
+        d.endpointTouched = true;
         d.endpointPoint = { lng: picked.lng, lat: picked.lat, crs: 'GCJ02' };
         d.endpointLabel = picked.label;
         d.endpointEntranceId = picked.entranceId;
@@ -746,6 +749,8 @@ export function buildIntentPayload(d) {
       timeMode: d.timeMode, durationSec: d.durationSec, latestEndClock: d.latestEndClock,
       startMode: d.startMode, startAtMs: d.startAtMs,
       endpointMode: d.endpointMode,
+      // 只有用户显式选过终点才把表单值当强约束；否则一句话里的"顺路结束/从东门出"应能生效
+      endpointTouched: !!d.endpointTouched,
       endpointPoint: d.endpointPoint, endpointLabel: d.endpointLabel,
       endpointEntranceId: d.endpointEntranceId, endpointPoiId: d.endpointPoiId,
       mobility: d.mobility, pace: d.pace, interests: d.interests,

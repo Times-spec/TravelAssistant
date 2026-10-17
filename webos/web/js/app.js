@@ -30,7 +30,7 @@ function defaultDraft() {
     origin: null,
     timeMode: 'duration', durationSec: 7200, latestEndClock: '17:00',
     startMode: 'now', startAtMs: null,
-    endpointMode: 'return_to_origin', endpointPoint: null, endpointLabel: null, endpointEntranceId: null, endpointPoiId: null,
+    endpointMode: 'return_to_origin', endpointTouched: false, endpointPoint: null, endpointLabel: null, endpointEntranceId: null, endpointPoiId: null,
     mobility: 'walk', pace: 'normal', interests: [], text: '',
     mustVisit: [], avoid: [],
     freePreferred: false, budgetHardZero: false, avoidRepeat: null, // null=未表态 true=明确不回头 false=允许通勤折返

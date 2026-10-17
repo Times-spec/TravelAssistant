@@ -191,6 +191,12 @@ function normalizeIntent(input, packs, preParsed = null) {
 
   // 文本理解（真实模式优先 LLM 结果；规则引擎兜底；两者同 Schema、同校验路径）
   const parsed = preParsed || ruleNLU(text);
+  // LLM 的终点 schema 只有"回到起点/顺路结束"，没有"从东门出"这类具名门；
+  // 用规则解析补齐缺失的 endpointRef（LLM 已给出终点时仍以 LLM 为准）。
+  if (preParsed && !parsed.endpointRef) {
+    const rules = ruleNLU(text);
+    if (rules.endpointRef) parsed.endpointRef = rules.endpointRef;
+  }
   const textEngine = preParsed ? 'llm' : 'rules';
 
   // 目标
@@ -214,9 +220,12 @@ function normalizeIntent(input, packs, preParsed = null) {
   const tz = (pack && pack.venue.timezone) || timezone;
   const times = resolveTimes(form, parsed, tz, evidence);
 
-  // 终点
+  // 终点：用户显式选过 → 表单优先；没选过 → 一句话里的终点描述优先（此前默认值总把文字条件盖掉）
   let endpoint;
-  const ep = form.endpointMode || (parsed.endpointRef && parsed.endpointRef.mode) || 'return_to_origin';
+  const ep = (form.endpointTouched ? form.endpointMode : null)
+    || (parsed.endpointRef && parsed.endpointRef.mode)
+    || form.endpointMode
+    || 'return_to_origin';
   if (ep === 'fixed' && form.endpointPoint) {
     // entranceId/poiId：用户在地图上吸附到具体门/点位时由前端写入，planner 优先用它定位（比裸坐标更稳）
     endpoint = { mode: 'fixed', point: form.endpointPoint, poiId: form.endpointPoiId || null, entranceId: form.endpointEntranceId || null, label: form.endpointLabel || '指定终点' };
@@ -230,7 +239,7 @@ function normalizeIntent(input, packs, preParsed = null) {
   } else {
     endpoint = { mode: 'return_to_origin' };
   }
-  evidence.endpoint = { source: form.endpointMode ? 'form' : parsed.endpointRef ? 'text' : 'default', rawSpan: undefined };
+  evidence.endpoint = { source: form.endpointTouched ? 'form' : parsed.endpointRef ? 'text' : 'default', rawSpan: undefined };
 
   // 交通：表单与文本冲突 → 追问（§4.4：步行与自然语言骑行冲突属于决定性冲突）
   let mobility = form.mobility && form.mobility !== 'skip' ? form.mobility : 'walk';

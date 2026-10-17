@@ -38,6 +38,8 @@ export function renderPlan(view, ctx, planId) {
 
   let taskFailed = false; // 任务级失败：立即停掉阶段动画，改显示失败卡片
   let agentCollapsed = false; // 决策链可收起（默认展开：等待期它就是进度）
+  let agentSelected = null; // 当前查看的决策步骤
+  let agentSelectedManual = false; // 用户点过步骤后，不再自动跟随活动步骤
 
   const SOFT_LABELS = {
     freePreferred: '免费优先', repeatRoadPenalty: '少走回头路', restPreferred: '多休息',
@@ -49,24 +51,120 @@ export function renderPlan(view, ctx, planId) {
     return list.find((t) => t.stage === stage) || null;
   }
 
+  function ledgerText(r) {
+    if (r.kind === 'route.edge_repeat') return '不重复路段';
+    if (r.kind === 'poi.must_visit') return `必去 ${(r.value || []).length} 处`;
+    if (r.kind === 'poi.avoid') return `避开 ${(r.value || []).length} 处`;
+    if (r.kind === 'time.latest_end') return `最晚 ${fmtClock(r.value)} 到终点`;
+    if (r.kind === 'route.max_distance') return `步行 ≤ ${(r.value / 1000).toFixed(1)}km`;
+    if (r.kind === 'route.max_cost') return r.value === 0 ? '零门票（硬条件）' : `预算 ≤ ¥${r.value}`;
+    return SOFT_LABELS[r.kind] || null;
+  }
+
   /** 约束台账：硬约束用绿 chip，软偏好用灰 chip；没有台账时不占位 */
   function ledgerChips(ledger) {
     const chips = [];
     for (const r of ledger || []) {
-      if (r.kind === 'route.edge_repeat') chips.push({ text: '不重复路段', hard: true });
-      else if (r.kind === 'poi.must_visit' && (r.value || []).length) chips.push({ text: `必去 ${r.value.length} 处`, hard: true });
-      else if (r.kind === 'poi.avoid' && (r.value || []).length) chips.push({ text: `避开 ${r.value.length} 处`, hard: true });
-      else if (r.kind === 'time.latest_end' && r.value) chips.push({ text: `最晚 ${fmtClock(r.value)} 到终点`, hard: true });
-      else if (r.kind === 'route.max_distance' && r.value != null) chips.push({ text: `步行 ≤ ${(r.value / 1000).toFixed(1)}km`, hard: true });
-      else if (r.kind === 'route.max_cost' && r.value != null) chips.push({ text: r.value === 0 ? '零门票（硬条件）' : `预算 ≤ ¥${r.value}`, hard: true });
-      else if (r.hardness === 'soft' && SOFT_LABELS[r.kind]) chips.push({ text: SOFT_LABELS[r.kind], hard: false });
+      const text = ledgerText(r);
+      if (!text) continue;
+      if (r.kind === 'poi.must_visit' || r.kind === 'poi.avoid') {
+        if (!(r.value || []).length) continue;
+      }
+      chips.push({ text, hard: r.hardness === 'hard' });
     }
     if (!chips.length) return null;
     return h('div', { class: 'agent-ledger' },
       ...chips.map((c) => h('span', { class: 'agent-chip' + (c.hard ? '' : ' soft') }, c.text)));
   }
 
-  /** 智能体决策过程：等待时按真实任务事件逐步点亮；完成后保留为可回看的决策链 */
+  /** 决策卡详情：点步骤切换；候选方案可直接点选，修复提议可直接采纳 */
+  function agentDetail(key, d) {
+    const { plan, versions, ledger, solver, topology, verifier, isAgent } = d;
+    const box = (...children) => h('div', { class: 'agent-detailbox' }, ...children.filter(Boolean));
+    if (key === 'intent') {
+      const chips = (plan && plan.confirmChips) || [];
+      const labels = chips.length ? chips.map((c) => c.label)
+        : (stageState.confirmText ? stageState.confirmText.split(' · ') : []);
+      return box(
+        h('div', { class: 'agent-mini' }, 'AI 只负责把话听懂；路线由确定性求解器生成，硬约束不会被静默放宽。'),
+        labels.length
+          ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...labels.map((l) => h('span', { class: 'agent-chip' }, l)))
+          : h('div', { class: 'agent-mini', style: 'margin-top:4px' }, plan ? '条件已用于本次规划。' : '正在解析条件…'));
+    }
+    if (key === 'candidates') {
+      const preview = plan && plan.candidatePreview;
+      const count = preview ? preview.count : (stageState.candidateInfo != null ? stageState.candidateInfo : null);
+      const names = (preview && preview.names) || [];
+      return box(
+        h('div', { class: 'agent-mini' }, count != null
+          ? `共 ${count} 个候选进入评分：按兴趣匹配 × 步行距离排序，最多 24 个进入求解。`
+          : (plan ? '候选点已进入求解（旧计划未保留候选明细）。' : '正在按兴趣匹配与步行距离评分…')),
+        names.length ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...names.map((n) => h('span', { class: 'agent-chip soft' }, n))) : null);
+    }
+    if (key === 'solver') {
+      const budget = plan && plan.budgetSec;
+      const mainId = plan && plan.mainRouteId;
+      return box(
+        h('div', { class: 'agent-mini', style: 'margin-bottom:6px' }, versions.length
+          ? `${solver ? solver.candidates : versions.length} 个候选方案；主推荐按「兴趣得分 × 预算利用率」选出${topology ? `；拓扑预检发现死胡同 ${topology.deadEndCount} 处` : ''}。点方案可直接切换查看。`
+          : '正在生成候选方案：不同权重分别求解，再按预算利用率选出主推荐…'),
+        ...versions.map((v) => {
+          const util = budget ? Math.round(Math.min(1, v.totals.totalSec / budget) * 100) : null;
+          const selected = v.routeId === selRouteId;
+          return h('div', {
+            class: 'agent-cand' + (selected ? ' sel' : ''),
+            onclick: () => {
+              // 选备选时展开备选列表，否则右侧路线卡仍停在主推荐，看起来像没切换
+              if (v.routeId !== mainId) altExpanded = true;
+              selRouteId = v.routeId;
+              refreshRouteViews();
+              renderStages();
+            },
+          },
+            h('div', { style: 'min-width:0' },
+              h('div', { class: 'agent-cand-title' }, (v.routeId === mainId ? '主推荐 · ' : '备选 · ') + v.title),
+              h('div', { class: 'agent-mini' }, `${v.stops.length} 站 · ${fmtMin(v.totals.totalSec)}${util != null ? ` · 预算利用 ${util}%` : ''}`)),
+            h('span', { class: 'agent-mini agent-act' }, selected ? '✓ 当前查看' : '查看'));
+        }));
+    }
+    if (key === 'verify') {
+      if (!isAgent) return box(h('div', { class: 'agent-mini' }, '当前为算法直解模式，未执行智能体的独立验证。'));
+      const hard = (ledger || []).filter((r) => r.hardness === 'hard'
+        && (!['poi.must_visit', 'poi.avoid'].includes(r.kind) || (r.value || []).length));
+      return box(
+        h('div', { class: 'agent-mini' }, verifier
+          ? `独立校验器与求解器分离：通过 ${verifier.accepted} 个、拒绝 ${verifier.rejected} 个；硬约束未通过不会发布。`
+          : '等待求解结果进入独立验证…'),
+        hard.length ? h('div', { class: 'agent-checked' }, ...hard.map((r) => h('div', { class: 'agent-mini' }, '✓ ' + ledgerText(r)))) : null);
+    }
+    if (key === 'guide') {
+      const v = versions.find((x) => x.routeId === selRouteId) || versions[0];
+      if (!v) return box(h('div', { class: 'agent-mini' }, '路线尚未生成，讲解会在路线就绪后按站补充。'));
+      const ready = new Set(((planData && planData.guides) || []).filter((g) => g.routeId === v.routeId).map((g) => g.poiId));
+      const hasGuide = ready.size > 0;
+      return box(
+        h('div', { class: 'agent-mini', style: 'margin-bottom:6px' }, hasGuide
+          ? '讲解只引用已核验资料；无资料时明确「内容暂缺」，不编造。'
+          : '讲解随主推荐生成；该备选方案暂未准备讲解。'),
+        ...v.stops.map((s) => h('div', { class: 'agent-mini' }, `${hasGuide ? (ready.has(s.poiId) ? '✓' : '…') : '·'} ${s.name}`)));
+    }
+    if (key === 'repair') {
+      const ps = (plan && plan.agentProposals) || [];
+      return box(
+        h('div', { class: 'agent-mini', style: 'margin-bottom:6px' }, '硬约束无解时，智能体只给「需要你确认」的调整，不静默放宽。'),
+        ...ps.map((p) => h('button', {
+          class: 'agent-cand agent-proposal',
+          onclick: () => applySuggestion(p),
+        },
+          h('div', { style: 'min-width:0' },
+            h('div', { class: 'agent-cand-title' }, p.label),
+            h('div', { class: 'agent-mini' }, p.reason || '')),
+          h('span', { class: 'agent-mini agent-act' }, '采纳'))));
+    }
+    return null;
+  }
+
+  /** 智能体决策过程：等待时按真实事件点亮；完成后保留为可交互的决策链 */
   function renderStages() {
     if (taskFailed) { progressCard.classList.add('hidden'); return; }
     const plan = planData && planData.plan;
@@ -81,7 +179,8 @@ export function renderPlan(view, ctx, planId) {
     const intentDone = stageState.intent === 'done' || solverDone;
     const candDone = stageState.candidates === 'done' || solverDone;
     const verifyDone = !!verifier || stageState.alt === 'done';
-    const hasVersions = !!(planData && planData.versions && planData.versions.length);
+    const versions = (planData && planData.versions ? planData.versions : []).filter((v) => !v.isProposal);
+    const hasVersions = versions.length > 0;
 
     // trace 里的 ms 是"从智能体开始到该步结束"的累计值，展示时换算成单步耗时
     const stepMs = (end, start) => {
@@ -90,32 +189,39 @@ export function renderPlan(view, ctx, planId) {
       return d <= 0 ? '<1ms' : d + 'ms';
     };
     const steps = [];
-    const push = (state, label, detail, ms) => steps.push({ state, label, detail, ms });
-    push(intentDone ? 'done' : 'active', '理解需求',
+    const push = (key, state, label, detail, ms) => steps.push({ key, state, label, detail, ms });
+    push('intent', intentDone ? 'done' : 'active', '理解需求',
       stageState.confirmText || '解析游玩方式、目的地、时长与偏好');
-    push(candDone ? 'done' : stageState.candidates === 'active' ? 'active' : 'pending', '候选检索',
+    push('candidates', candDone ? 'done' : stageState.candidates === 'active' ? 'active' : 'pending', '候选检索',
       stageState.candidateInfo != null
         ? `命中 ${stageState.candidateInfo} 个候选点${stageState.candidateNames ? ' · ' + stageState.candidateNames : ''}`
         : '按兴趣匹配与步行距离评分');
-    push(solverDone ? 'done' : candDone && !allDone ? 'active' : 'pending', '组合求解',
+    push('solver', solverDone ? 'done' : candDone && !allDone ? 'active' : 'pending', '组合求解',
       solver
         ? `生成 ${solver.candidates} 个候选方案${topology ? `（拓扑预检：死胡同 ${topology.deadEndCount} 处）` : ''}`
         : (solverDone ? '按固定策略直接求解' : '确定性求解：编排顺序、停留与时间窗'),
       stepMs(solver, topology));
     if (isAgent) {
-      push(verifyDone ? 'done' : solverDone ? 'active' : 'pending', '独立验证',
+      push('verify', verifyDone ? 'done' : solverDone ? 'active' : 'pending', '独立验证',
         verifier ? `通过 ${verifier.accepted} 个 / 拒绝 ${verifier.rejected} 个` : '分离式校验器复核硬约束与可发布性',
         stepMs(verifier, solver));
     }
     // 讲解只在有路线版本时才生成；不可行/待确认的计划不该出现"讲解已就绪"
     if (hasVersions) {
-      push(allDone || stageState.guide === 'done' ? 'done' : stageState.guide === 'active' ? 'active' : 'pending', '讲解补充',
+      push('guide', allDone || stageState.guide === 'done' ? 'done' : stageState.guide === 'active' ? 'active' : 'pending', '讲解补充',
         stageState.guideDetail || (allDone ? '各站讲解已就绪' : '为每站准备可核验的讲解'));
     }
     if (repair && repair.count > 0) {
-      push('done', '修复提议', `${repair.count} 条待确认方案（不放宽硬约束）`, stepMs(repair, verifier));
+      push('repair', 'done', '修复提议', `${repair.count} 条待确认方案（不放宽硬约束）`, stepMs(repair, verifier));
     }
 
+    const keys = steps.map((s) => s.key);
+    if (!agentSelectedManual || !keys.includes(agentSelected)) {
+      agentSelected = (repair && repair.count > 0) ? 'repair'
+        : allDone ? 'solver'
+          : ((steps.find((s) => s.state === 'active') || steps[0]).key);
+    }
+    const selected = steps.find((s) => s.key === agentSelected) || steps[0];
     const activeStep = steps.find((s) => s.state === 'active');
     const summary = allDone
       ? `${steps.length} 步完成${verifier ? ` · 独立验证通过 ${verifier.accepted} 个方案` : ''}`
@@ -135,12 +241,18 @@ export function renderPlan(view, ctx, planId) {
         agentCollapsed ? summary : (isAgent
           ? '只编排「约束台账 → 求解 → 独立验证 → 修复提议」，不直接生成道路'
           : '当前为算法直解模式，未启用智能体编排')),
-      agentCollapsed ? null : h('div', { class: 'agent-steps' }, ...steps.map((s) =>
-        h('div', { class: 'agent-step' },
+      agentCollapsed ? null : h('div', { class: 'agent-stepper' }, ...steps.map((s) =>
+        h('button', {
+          class: 'agent-stepbtn' + (agentSelected === s.key ? ' sel' : ''),
+          onclick: () => { agentSelected = s.key; agentSelectedManual = true; renderStages(); },
+        },
           h('span', { class: 'agent-dot ' + s.state }, s.state === 'done' ? '✓' : s.state === 'active' ? '●' : '·'),
-          h('span', { class: 'agent-name' }, s.label),
-          h('span', { class: 'agent-detail' }, s.detail || ''),
-          s.ms != null ? h('span', { class: 'agent-ms' }, s.ms) : null))),
+          h('span', { class: 'agent-steplabel' }, s.label)))),
+      agentCollapsed ? null : h('div', { class: 'agent-detawrap' },
+        h('div', { class: 'agent-detahead' },
+          h('span', { class: 'agent-detaname' }, selected.label),
+          selected.ms ? h('span', { class: 'agent-mini' }, '本步 ' + selected.ms) : null),
+        agentDetail(selected.key, { plan, versions, ledger, solver, topology, verifier, repair, isAgent })),
       agentCollapsed ? null : ledgerChips(ledger),
     ].filter(Boolean));
   }
@@ -436,6 +548,7 @@ export function renderPlan(view, ctx, planId) {
         d.endpointEntranceId = ep.entranceId || null;
         d.endpointPoiId = ep.poiId || null;
       }
+      d.endpointTouched = true;
       saveDraftSafe();
       toast('已调整终点，正在重新规划…');
       return replan();
