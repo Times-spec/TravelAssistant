@@ -14,6 +14,8 @@ async function main() {
   const groups = stopMarkerGroups(route, { nextPoiId: 'third' });
   assert.equal(groups.length, 4); assert.equal(groups.find((g) => g.isNext).text, '2·3');
   assert.equal(groups.find((g) => g.endsHere).text, '5/终');
+  const loop = structuredClone(route); loop.legs[0].geometry.coordinates[0] = [...route.stops.at(-1).coord];
+  assert.equal(stopMarkerGroups(loop).find((g) => g.endsHere).text, '起/5/终');
   const nodes = [], labels = [];
   const map = { el: (name, attrs) => { const node = { name, attrs }; nodes.push(node); return node; } };
   renderSvgRoute(map, route, { toXY: (p) => ({ x: p.lng * 1000, y: p.lat * 1000 }) }, { nextPoiId: 'third', labels: 'all', drawLabel: (_m, _p, text) => labels.push(text) });

@@ -250,6 +250,7 @@ export function stopMarkerGroups(route, opts = {}) {
   }
   const lastLeg = route.legs[route.legs.length - 1];
   const end = lastLeg && lastLeg.geometry.coordinates.at(-1);
+  const first = route.legs[0]?.geometry.coordinates[0];
   const groups = new Map();
   stops.forEach((stop, index) => {
     const key = root(index);
@@ -262,9 +263,10 @@ export function stopMarkerGroups(route, opts = {}) {
     const states = members.map((m) => opts.stopState ? opts.stopState(m.stop) : null);
     const state = states.every((s) => s === 'done') ? 'done' : states.every((s) => s === 'skip') ? 'skip' : null;
     const endsHere = !!(end && members.some((m) => m.index === stops.length - 1 && distM(m.stop.coord, end) < 60));
+    const startsHere = !!(endsHere && first && distM(first, anchor.stop.coord) < 30);
     const numbers = members.map((m) => m.index + 1).join('·');
-    const text = endsHere ? numbers + '/终' : members.length > 1 ? numbers : state === 'done' ? '✓' : state === 'skip' ? '✕' : numbers;
-    return { coord: anchor.stop.coord, text, endsHere, state, isNext: !!current, label: current ? current.stop.name : null, title: members.map((m) => `${m.index + 1}. ${m.stop.name}`).join(' / ') };
+    const text = endsHere ? (startsHere ? '起/' : '') + numbers + '/终' : members.length > 1 ? numbers : state === 'done' ? '✓' : state === 'skip' ? '✕' : numbers;
+    return { coord: anchor.stop.coord, text, endsHere, startsHere, state, isNext: !!current, label: current ? current.stop.name : null, title: members.map((m) => `${m.index + 1}. ${m.stop.name}`).join(' / ') };
   });
 }
 
@@ -307,20 +309,22 @@ export function renderSvgRoute(map, route, proj, opts = {}) {
   const markers = stopMarkerGroups(route, opts);
   const mergedEnd = markers.some((m) => m.endsHere);
   const sameEnd = first && endPt && distM(first, endPt) < 30;
-  if (first) svgBadge(map, proj.toXY({ lng: first[0], lat: first[1] }), sameEnd && !mergedEnd ? '起/终' : '起', '#0f6f4f', bounds);
+  if (first && !markers.some((m) => m.startsHere)) svgBadge(map, proj.toXY({ lng: first[0], lat: first[1] }), sameEnd && !mergedEnd ? '起/终' : '起', '#0f6f4f', bounds);
   if (endPt && !sameEnd && !mergedEnd) svgBadge(map, proj.toXY({ lng: endPt[0], lat: endPt[1] }), '终', '#c2410c', bounds);
   // 站点：下一站最醒目；已到访/跳过弱化；标签只给关键站点，避免互相压字
   markers.forEach((marker) => {
-    const p = proj.toXY({ lng: marker.coord[0], lat: marker.coord[1] });
-    grow(bounds, p);
+    const point = proj.toXY({ lng: marker.coord[0], lat: marker.coord[1] });
+    grow(bounds, point);
+    const canvas = map.pin ? map.pin(point) : map;
+    const p = map.pin ? { x: 0, y: 0 } : point;
     const { state, isNext } = marker;
     const fill = state === 'skip' ? '#b8c2bd' : state === 'done' ? '#8a9a92' : isNext ? '#1677ff' : '#0f6f4f';
-    if (isNext) map.el('circle', { cx: p.x, cy: p.y, r: 17, fill: '#1677ff', opacity: 0.18 });
+    if (isNext) canvas.el('circle', { cx: p.x, cy: p.y, r: 17, fill: '#1677ff', opacity: 0.18 });
     const width = Math.max(isNext ? 24 : 20, marker.text.length * 7 + 10);
-    map.el('rect', { x: p.x - width / 2, y: p.y - 11, width, height: 22, rx: 11, fill, stroke: '#fff', 'stroke-width': 2.5, class: 'route-stop-marker' });
-    const t = map.el('text', { x: p.x, y: p.y + 4, 'font-size': isNext ? 12 : 10.5, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
+    canvas.el('rect', { x: p.x - width / 2, y: p.y - 11, width, height: 22, rx: 11, fill, stroke: '#fff', 'stroke-width': 2.5, class: 'route-stop-marker' });
+    const t = canvas.el('text', { x: p.x, y: p.y + 4, 'font-size': isNext ? 12 : 10.5, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
     t.textContent = marker.text;
-    if (isNext && opts.drawLabel) opts.drawLabel(map, p, marker.label, -20, '#0b4fbf');
+    if (isNext && opts.drawLabel) opts.drawLabel(canvas, p, marker.label, -20, '#0b4fbf');
   });
   return { bounds, legBounds };
 }
@@ -342,9 +346,11 @@ function svgDirChevrons(map, pts, color) {
 }
 function svgBadge(map, p, text, bg, bounds) {
   grow(bounds, p);
+  const canvas = map.pin ? map.pin(p) : map;
+  if (map.pin) p = { x: 0, y: 0 };
   const w = text.length > 1 ? 30 : 20;
-  map.el('rect', { x: p.x - w / 2, y: p.y - 10, width: w, height: 20, rx: 10, fill: bg, stroke: '#fff', 'stroke-width': 2 });
-  const t = map.el('text', { x: p.x, y: p.y + 4, 'font-size': 11, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
+  canvas.el('rect', { x: p.x - w / 2, y: p.y - 10, width: w, height: 20, rx: 10, fill: bg, stroke: '#fff', 'stroke-width': 2 });
+  const t = canvas.el('text', { x: p.x, y: p.y + 4, 'font-size': 11, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
   t.textContent = text;
 }
 export function emptyBounds() { return { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity }; }

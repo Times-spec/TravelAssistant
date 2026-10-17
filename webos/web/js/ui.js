@@ -159,6 +159,7 @@ export class SvgMap {
   }
   _apply() {
     this.svg.setAttribute('viewBox', `${this.view.x} ${this.view.y} ${this.view.w} ${this.view.h}`);
+    this._scalePins();
     // 缩放分级（视口宽度≈可见米数）：远图只看路线骨架，中图出现站名与转向箭头，近图补转向文字
     const w = this.view.w;
     this.svg.classList.toggle('am-z-far', w > 2200);
@@ -172,6 +173,22 @@ export class SvgMap {
     this._apply();
   }
   clear() { this.root.innerHTML = ''; }
+  _scalePins() {
+    const rect = this.svg.getBoundingClientRect();
+    const unit = 1 / Math.min((rect.width || 360) / this.view.w, (rect.height || 300) / this.view.h);
+    this.root.querySelectorAll('[data-map-pin]').forEach((pin) => {
+      pin.setAttribute('transform', `translate(${pin.dataset.x} ${pin.dataset.y}) scale(${unit})`);
+    });
+  }
+  pin(point) {
+    const group = this.el('g', { 'data-map-pin': '1', 'data-x': point.x, 'data-y': point.y });
+    this._scalePins();
+    return { el: (name, attrs) => {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', name);
+      for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+      group.appendChild(node); return node;
+    } };
+  }
   el(name, attrs) {
     const e = document.createElementNS('http://www.w3.org/2000/svg', name);
     for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
@@ -274,7 +291,7 @@ export class AmapRouteMap {
     const markers = stopMarkerGroups(route, opts);
     const mergedEnd = markers.some((m) => m.endsHere);
     const sameEnd = first && endPt && distM(first, endPt) < 30;
-    if (first) {
+    if (first && !markers.some((m) => m.startsHere)) {
       this._add(new AMap.Marker({ position: new AMap.LngLat(first[0], first[1]), content: badgeContent(sameEnd && !mergedEnd ? '起/终' : '起', '#0f6f4f'), anchor: 'center', title: '起点', zIndex: 45 }));
     }
     if (endPt && !sameEnd && !mergedEnd) {
