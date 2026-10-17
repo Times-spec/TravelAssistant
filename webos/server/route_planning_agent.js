@@ -152,19 +152,25 @@ class RoutePlanningAgent {
   }
 
   plan({ pack, intent, graph, planId = 'agent_plan' }) {
+    const t0 = Date.now();
     const trace = [];
+    const mark = (stage, extra = {}) => {
+      const row = { stage, ms: Date.now() - t0, ...extra };
+      trace.push(row);
+      return row;
+    };
     const ledger = compileConstraintLedger(intent);
-    trace.push({ stage: 'constraints.compiled', count: ledger.length });
+    mark('constraints.compiled', { count: ledger.length });
 
     const topo = analyzeTopology(graph, pack);
-    trace.push({ stage: 'topology.analyzed', deadEndCount: topo.deadEndPois.size });
+    mark('topology.analyzed', { deadEndCount: topo.deadEndPois.size });
 
     // 1. 尝试直接求解
     const plans = candidatePlans(pack, intent, graph, planId);
-    trace.push({ stage: 'solver.completed', candidates: plans.length });
+    mark('solver.completed', { candidates: plans.length });
     const verified = plans.map(({ plan, result }) => ({ plan, result, verification: verifyRoutePlan(plan) }))
       .filter((x) => x.verification.ok);
-    trace.push({ stage: 'verifier.completed', accepted: verified.length, rejected: plans.length - verified.length });
+    mark('verifier.completed', { accepted: verified.length, rejected: plans.length - verified.length });
 
     if (verified.length) {
       const mainPlan = verified[0].plan;
@@ -188,7 +194,7 @@ class RoutePlanningAgent {
     // 2. 求解受阻时，进行结构化冲突分类与多维修复提议生成
     const probe = solveOnce(pack, intent, graph, PROBE_POLICY);
     const conflict = probe.conflict || { code: 'NO_FEASIBLE_ROUTE', message: '当前约束组合下没有找到可发布路线', suggestions: [] };
-    trace.push({ stage: 'conflict.classified', code: conflict.code });
+    mark('conflict.classified', { code: conflict.code });
     const proposals = [];
 
     // 场景 A：严格无重复 + 死胡同必去点冲突（如湖心岛）
@@ -338,7 +344,7 @@ class RoutePlanningAgent {
       })),
     ];
 
-    trace.push({ stage: 'repair.proposed', count: proposals.length });
+    mark('repair.proposed', { count: proposals.length });
     return {
       status: proposals.length ? 'needs_user_decision' : 'infeasible',
       route: null,

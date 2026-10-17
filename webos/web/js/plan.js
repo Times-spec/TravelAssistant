@@ -13,10 +13,8 @@ export function renderPlan(view, ctx, planId) {
   const cleanupFns = [];
 
   const stageState = { intent: 'active', candidates: 'todo', route: 'todo', alt: 'todo', guide: 'todo', done: 'todo' };
-  const stageDesc = {
-    intent: '正在确认你的想法', candidates: '正在查找适合的地点', route: '正在核对步行时间与开放情况',
-    alt: '备选生成中', guide: '沿途讲解补充中', done: '',
-  };
+  // 只重置阶段键：stageState 上还挂着 confirmText / candidateInfo 等展示字段，不能被一并写成 'done'
+  const STAGE_KEYS = ['intent', 'candidates', 'route', 'alt', 'guide', 'done'];
 
   const root = h('div', {});
   view.append(root);
@@ -39,21 +37,112 @@ export function renderPlan(view, ctx, planId) {
   cleanupFns.push(() => bottomBar.remove());
 
   let taskFailed = false; // 任务级失败：立即停掉阶段动画，改显示失败卡片
+  let agentCollapsed = false; // 决策链可收起（默认展开：等待期它就是进度）
+
+  const SOFT_LABELS = {
+    freePreferred: '免费优先', repeatRoadPenalty: '少走回头路', restPreferred: '多休息',
+    quietPreferred: '安静', stepFewPreferred: '少台阶', stepFreeRequired: '轮椅可达',
+  };
+
+  function agentTrace(stage) {
+    const list = (planData && planData.plan && planData.plan.agentTrace) || [];
+    return list.find((t) => t.stage === stage) || null;
+  }
+
+  /** 约束台账：硬约束用绿 chip，软偏好用灰 chip；没有台账时不占位 */
+  function ledgerChips(ledger) {
+    const chips = [];
+    for (const r of ledger || []) {
+      if (r.kind === 'route.edge_repeat') chips.push({ text: '不重复路段', hard: true });
+      else if (r.kind === 'poi.must_visit' && (r.value || []).length) chips.push({ text: `必去 ${r.value.length} 处`, hard: true });
+      else if (r.kind === 'poi.avoid' && (r.value || []).length) chips.push({ text: `避开 ${r.value.length} 处`, hard: true });
+      else if (r.kind === 'time.latest_end' && r.value) chips.push({ text: `最晚 ${fmtClock(r.value)} 到终点`, hard: true });
+      else if (r.kind === 'route.max_distance' && r.value != null) chips.push({ text: `步行 ≤ ${(r.value / 1000).toFixed(1)}km`, hard: true });
+      else if (r.kind === 'route.max_cost' && r.value != null) chips.push({ text: r.value === 0 ? '零门票（硬条件）' : `预算 ≤ ¥${r.value}`, hard: true });
+      else if (r.hardness === 'soft' && SOFT_LABELS[r.kind]) chips.push({ text: SOFT_LABELS[r.kind], hard: false });
+    }
+    if (!chips.length) return null;
+    return h('div', { class: 'agent-ledger' },
+      ...chips.map((c) => h('span', { class: 'agent-chip' + (c.hard ? '' : ' soft') }, c.text)));
+  }
+
+  /** 智能体决策过程：等待时按真实任务事件逐步点亮；完成后保留为可回看的决策链 */
   function renderStages() {
     if (taskFailed) { progressCard.classList.add('hidden'); return; }
-    const labels = {
-      intent: '正在理解你的想法…', candidates: '正在查找适合的地点…', route: '正在核对步行时间与开放情况…',
-      alt: '正在生成备选方案…', guide: '正在补充沿途讲解…', done: '',
+    const plan = planData && planData.plan;
+    const ledger = (plan && plan.constraintLedger) || [];
+    const topology = agentTrace('topology.analyzed');
+    const solver = agentTrace('solver.completed');
+    const verifier = agentTrace('verifier.completed');
+    const repair = agentTrace('repair.proposed');
+    const isAgent = !plan || plan.planningMode !== 'algorithm';
+    const allDone = stageState.done === 'done';
+    const solverDone = !!solver || stageState.route === 'done';
+    const intentDone = stageState.intent === 'done' || solverDone;
+    const candDone = stageState.candidates === 'done' || solverDone;
+    const verifyDone = !!verifier || stageState.alt === 'done';
+    const hasVersions = !!(planData && planData.versions && planData.versions.length);
+
+    // trace 里的 ms 是"从智能体开始到该步结束"的累计值，展示时换算成单步耗时
+    const stepMs = (end, start) => {
+      if (!end || end.ms == null) return null;
+      const d = end.ms - (start && start.ms != null ? start.ms : 0);
+      return d <= 0 ? '<1ms' : d + 'ms';
     };
-    const order = ['intent', 'candidates', 'route', 'alt', 'guide'];
-    const active = order.find((k) => stageState[k] === 'active') || (stageState.done === 'done' ? null : 'intent');
-    progressCard.innerHTML = '';
-    if (!active && stageState.done === 'done') { progressCard.classList.add('hidden'); return; }
+    const steps = [];
+    const push = (state, label, detail, ms) => steps.push({ state, label, detail, ms });
+    push(intentDone ? 'done' : 'active', '理解需求',
+      stageState.confirmText || '解析游玩方式、目的地、时长与偏好');
+    push(candDone ? 'done' : stageState.candidates === 'active' ? 'active' : 'pending', '候选检索',
+      stageState.candidateInfo != null
+        ? `命中 ${stageState.candidateInfo} 个候选点${stageState.candidateNames ? ' · ' + stageState.candidateNames : ''}`
+        : '按兴趣匹配与步行距离评分');
+    push(solverDone ? 'done' : candDone && !allDone ? 'active' : 'pending', '组合求解',
+      solver
+        ? `生成 ${solver.candidates} 个候选方案${topology ? `（拓扑预检：死胡同 ${topology.deadEndCount} 处）` : ''}`
+        : (solverDone ? '按固定策略直接求解' : '确定性求解：编排顺序、停留与时间窗'),
+      stepMs(solver, topology));
+    if (isAgent) {
+      push(verifyDone ? 'done' : solverDone ? 'active' : 'pending', '独立验证',
+        verifier ? `通过 ${verifier.accepted} 个 / 拒绝 ${verifier.rejected} 个` : '分离式校验器复核硬约束与可发布性',
+        stepMs(verifier, solver));
+    }
+    // 讲解只在有路线版本时才生成；不可行/待确认的计划不该出现"讲解已就绪"
+    if (hasVersions) {
+      push(allDone || stageState.guide === 'done' ? 'done' : stageState.guide === 'active' ? 'active' : 'pending', '讲解补充',
+        stageState.guideDetail || (allDone ? '各站讲解已就绪' : '为每站准备可核验的讲解'));
+    }
+    if (repair && repair.count > 0) {
+      push('done', '修复提议', `${repair.count} 条待确认方案（不放宽硬约束）`, stepMs(repair, verifier));
+    }
+
+    const activeStep = steps.find((s) => s.state === 'active');
+    const summary = allDone
+      ? `${steps.length} 步完成${verifier ? ` · 独立验证通过 ${verifier.accepted} 个方案` : ''}`
+      : (activeStep ? `正在${activeStep.label}…` : '准备中…');
+
     progressCard.classList.remove('hidden');
-    const detail = active === 'guide' && stageState.guideDetail ? '（' + stageState.guideDetail + '）' : '';
-    progressCard.append(h('div', { class: 'status-line' },
-      h('span', { class: 'status-dot' }),
-      h('span', {}, (labels[active] || '规划中…') + detail)));
+    progressCard.innerHTML = '';
+    // 原生 append 会把 null 变成字面量 "null"，先过滤再展开
+    progressCard.append(...[
+      h('div', { class: 'agent-head' },
+        h('div', { class: 'agent-head-left' },
+          h('div', { class: 'agent-title' }, '🤖 智能体决策过程'),
+          h('span', { class: 'agent-badge' }, isAgent ? '有界智能体' : '算法直解')),
+        h('button', { class: 'link-btn', onclick: () => { agentCollapsed = !agentCollapsed; renderStages(); } },
+          agentCollapsed ? '展开 ▾' : '收起 ▴')),
+      h('div', { class: 'agent-sub' },
+        agentCollapsed ? summary : (isAgent
+          ? '只编排「约束台账 → 求解 → 独立验证 → 修复提议」，不直接生成道路'
+          : '当前为算法直解模式，未启用智能体编排')),
+      agentCollapsed ? null : h('div', { class: 'agent-steps' }, ...steps.map((s) =>
+        h('div', { class: 'agent-step' },
+          h('span', { class: 'agent-dot ' + s.state }, s.state === 'done' ? '✓' : s.state === 'active' ? '●' : '·'),
+          h('span', { class: 'agent-name' }, s.label),
+          h('span', { class: 'agent-detail' }, s.detail || ''),
+          s.ms != null ? h('span', { class: 'agent-ms' }, s.ms) : null))),
+      agentCollapsed ? null : ledgerChips(ledger),
+    ].filter(Boolean));
   }
 
   let altExpanded = false;
@@ -460,6 +549,8 @@ export function renderPlan(view, ctx, planId) {
     if (['infeasible', 'needs_clarification'].includes(planData.plan.status) && planData.plan.conflict) {
       showConflict(planData.plan.conflict, planData.plan.status);
     }
+    // 计划里已经落了 agentTrace / constraintLedger：刷新或重进页面也能回看决策链
+    renderStages();
     if (selRouteId) await refreshRouteViews();
   }
 
@@ -475,7 +566,7 @@ export function renderPlan(view, ctx, planId) {
     }
     const jobId = planData.plan.currentJobId;
     if (['ready', 'conditional', 'infeasible'].includes(planData.plan.status) && planData.versions.length) {
-      Object.keys(stageState).forEach((k) => { stageState[k] = 'done'; });
+      STAGE_KEYS.forEach((k) => { stageState[k] = 'done'; });
       renderStages();
     }
     if (!jobId) return;
@@ -485,6 +576,7 @@ export function renderPlan(view, ctx, planId) {
       if (evt.type === 'intent.normalized') {
         stageState.intent = 'done'; stageState.candidates = 'active';
         if (p.chips) {
+          stageState.confirmText = p.chips.map((c) => c.label).slice(0, 4).join(' · ');
           chipsBar.classList.remove('hidden');
           chipsBar.innerHTML = '';
           chipsBar.append(...p.chips.map((c) => h('span', { class: 'cchip', onclick: () => { location.hash = '#/'; } }, c.label)));
@@ -495,6 +587,7 @@ export function renderPlan(view, ctx, planId) {
       } else if (evt.type === 'candidates.ready') {
         stageState.candidates = 'done'; stageState.route = 'active';
         stageState.candidateInfo = p.count;
+        stageState.candidateNames = (p.names || []).slice(0, 3).join('、');
       } else if (evt.type === 'route.ready') {
         stageState.route = 'done'; stageState.alt = 'active'; stageState.guide = 'active';
         await loadPlan();
@@ -517,7 +610,7 @@ export function renderPlan(view, ctx, planId) {
           showFailure(p.message);
         }
       } else if (evt.type === 'job.completed') {
-        Object.keys(stageState).forEach((k) => { if (stageState[k] !== 'done') stageState[k] = 'done'; });
+        STAGE_KEYS.forEach((k) => { if (stageState[k] !== 'done') stageState[k] = 'done'; });
         stageState.done = 'done';
         await loadPlan(true);
       }
