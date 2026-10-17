@@ -20,6 +20,7 @@ export function renderTrip(view, ctx, tripId) {
   let liveHooks = [];   // 定位更新时只刷新这些局部（剩余距离、当前步、到站提示），不整页重绘
   let svgView = null;   // SVG 降级地图的状态（重绘/取景/我的位置）
   const stepRequests = new Map(); // 每个方向的一段只请求一次；失败保留几何导引。
+  cleanups.push(() => { renderSeq++; stepRequests.clear(); });
 
   // 途中调整的可点选项（AI 兜底路径与服务端 cause 一一对应）
   const quick = [
