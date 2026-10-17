@@ -19,6 +19,7 @@ export function renderTrip(view, ctx, tripId) {
   let lastPos = null;   // { pt:[lng,lat] GCJ-02, acc, at }
   let liveHooks = [];   // 定位更新时只刷新这些局部（剩余距离、当前步、到站提示），不整页重绘
   let svgView = null;   // SVG 降级地图的状态（重绘/取景/我的位置）
+  const stepRequests = new Map(); // 每个方向的一段只请求一次；失败保留几何导引。
 
   // 途中调整的可点选项（AI 兜底路径与服务端 cause 一一对应）
   const quick = [
@@ -90,7 +91,35 @@ export function renderTrip(view, ctx, tripId) {
 
     // 当前这段 = 通往下一站的那段；全部到站后 = 回终点那段
     const nextIdx = next ? route.stops.findIndex((st) => st.poiId === next.poiId) : route.stops.length;
-    const curLeg = route.legs[nextIdx] || null;
+    let curLeg = route.legs[nextIdx] || null;
+    if (curLeg && !curLeg.steps?.length && (curLeg.provider || '').startsWith('amap')) {
+      const points = curLeg.geometry.coordinates;
+      if (points.length >= 2) {
+        const key = `${points[0].join(',')}>${points.at(-1).join(',')}`;
+        if (!stepRequests.has(key)) {
+          stepRequests.set(key, get(`/v1/legs/steps?from=${encodeURIComponent(points[0].join(','))}&to=${encodeURIComponent(points.at(-1).join(','))}`)
+            .then((result) => {
+              // 只补充同一条步行路径的指令；若高德另选道路，继续按既有折线导引。
+              const supplement = { geometry: { coordinates: result.geometry || [] }, distanceM: result.distanceM };
+              const aligned = result.geometry?.length >= 2 && result.geometry.every((p) => (projectOnLeg(curLeg, p)?.offM ?? Infinity) <= 50)
+                && points.every((p) => (projectOnLeg(supplement, p)?.offM ?? Infinity) <= 50);
+              if (result.steps?.length && aligned) {
+                stepRequests.set(key, result);
+                if (seq === renderSeq) return render();
+              } else stepRequests.set(key, null);
+            }).catch(() => { stepRequests.set(key, null); }));
+        }
+        const result = stepRequests.get(key);
+        if (result && Array.isArray(result.steps)) {
+          curLeg = { ...curLeg, steps: result.steps.map((step) => {
+            const p = result.geometry[step.startIdx || 0];
+            let startIdx = 0;
+            for (let i = 1; i < points.length; i++) if (p && distM(p, points[i]) < distM(p, points[startIdx])) startIdx = i;
+            return { ...step, startIdx };
+          }) };
+        }
+      }
+    }
     const states = legStates(route, nextIdx);
     const endName = endNameOf(route);
     const target = next

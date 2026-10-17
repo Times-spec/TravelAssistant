@@ -15,6 +15,8 @@ class Api {
   constructor(ctx) {
     this.ctx = ctx; // {store, cfg, packs, sseHub, runner}
     this.routes = [];
+    this.legStepCache = new Map();
+    this.legStepRates = new Map();
     const R = (method, pattern, handler, opts = {}) => {
       const keys = [];
       const rx = new RegExp('^' + pattern.replace(/\{(\w+)\}/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
@@ -26,6 +28,7 @@ class Api {
     R('GET', '/v1/venues', this.listVenues.bind(this));
     R('GET', '/v1/venues/{id}', this.getVenue.bind(this));
     R('GET', '/v1/places/search', this.searchPlaces.bind(this));
+    R('GET', '/v1/legs/steps', this.legSteps.bind(this));
     R('GET', '/v1/places/nearby-venues', this.nearbyVenues.bind(this));
     R('POST', '/v1/ai/ask', this.aiAsk.bind(this));
     R('POST', '/v1/locations/normalize', this.normalizeLocation.bind(this));
@@ -96,6 +99,47 @@ class Api {
   }
 
   /* ---------- 基础 ---------- */
+  async legSteps(req, _p, query) {
+    const parsePoint = (value) => {
+      const parts = String(value || '').split(',');
+      if (parts.length !== 2 || parts.some((p) => !p.trim())) throw E.badRequest('请提供from/to的经纬度');
+      const [lng, lat] = parts.map(Number);
+      if (!Number.isFinite(lng) || !Number.isFinite(lat) || Math.abs(lng) > 180 || Math.abs(lat) > 90) throw E.badRequest('经纬度无效');
+      return { lng, lat };
+    };
+    const from = parsePoint(query.from), to = parsePoint(query.to);
+    const now = Date.now();
+    const owner = req.user.id;
+    for (const [key, rate] of this.legStepRates) if (now - rate.since >= 60000) this.legStepRates.delete(key);
+    const rate = this.legStepRates.get(owner) || { since: now, count: 0 };
+    if (rate.count >= 60) throw new ApiError('RATE_LIMITED', '导航步骤请求过于频繁，请稍后再试', { status: 429, retryable: true });
+    rate.count++; this.legStepRates.set(owner, rate);
+    const cell = (p) => {
+      const row = Math.round(p.lat * 110940 / 50);
+      const lat = row * 50 / 110940;
+      return `${Math.round(p.lng * 111320 * Math.cos(lat * Math.PI / 180) / 50)},${row}`;
+    };
+    const key = `${cell(from)}>${cell(to)}`;
+    for (const [k, entry] of this.legStepCache) if (entry.expiresAt <= now) this.legStepCache.delete(k);
+    const cached = this.legStepCache.get(key);
+    if (cached) return { ...await cached.promise, cached: true };
+    if (this.ctx.cfg.providers.map !== 'amap') return { steps: [], available: false, cached: false };
+    const entry = { expiresAt: now + 30 * 60000 };
+    entry.promise = (async () => {
+      try {
+        // walkingRoute 自带高德全局限速门；本接口再按用户限制请求次数。
+        const route = await require('./amap').walkingRoute(this.ctx.cfg, from, to);
+        return { steps: route.steps || [], geometry: route.geometry, distanceM: route.distanceM, provider: route.provider, available: !!route.steps?.length };
+      } catch (_) {
+        if (this.legStepCache.get(key) === entry) this.legStepCache.delete(key);
+        return { steps: [], available: false };
+      }
+    })();
+    if (this.legStepCache.size >= 512) this.legStepCache.delete(this.legStepCache.keys().next().value);
+    this.legStepCache.set(key, entry);
+    return { ...await entry.promise, cached: false };
+  }
+
   async getConfig() {
     const { cfg } = this.ctx;
     return {

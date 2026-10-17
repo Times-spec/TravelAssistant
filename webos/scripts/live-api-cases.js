@@ -39,6 +39,32 @@ async function main() {
     const r = await api.replanTrip(req, { id: 'trip' }, {}, { cause: 'finish_requested' });
     assert.equal(ctx.store.byId('jobs', r.jobId).payload.currentNodeId, 'node-2');
   });
+  await check('T6 导航步骤50m网格缓存且有方向和过期', async () => {
+    const { api, req, ctx } = createHarness({ providers: { map: 'amap', llm: 'rules' } });
+    const amap = require('../server/amap'); const realRoute = amap.walkingRoute; const realNow = Date.now;
+    let now = 1000000, calls = 0; Date.now = () => now;
+    amap.walkingRoute = async () => { calls++; return { steps: [{ instruction: '沿测试步道走', distanceM: 80 }], distanceM: 80, durationSec: 60, geometry: [[104.06, 30.66], [104.061, 30.661]], provider: 'amap-walking' }; };
+    try {
+      assert(api.match('GET', '/v1/legs/steps'));
+      const a = await api.legSteps(req, {}, { from: '104.060001,30.660001', to: '104.061001,30.661001' });
+      const b = await api.legSteps(req, {}, { from: '104.060002,30.660002', to: '104.061002,30.661002' });
+      assert.equal(a.steps.length, 1); assert.equal(b.cached, true); assert.equal(calls, 1);
+      await api.legSteps(req, {}, { from: '104.061001,30.661001', to: '104.060001,30.660001' }); assert.equal(calls, 2);
+      now += 1800001;
+      await api.legSteps(req, {}, { from: '104.060001,30.660001', to: '104.061001,30.661001' }); assert.equal(calls, 3);
+      assert.equal(ctx.cfg.limits.maxLlmTokens, 1000);
+    } finally { amap.walkingRoute = realRoute; Date.now = realNow; }
+  });
+  await check('T6 步骤失败返回空列表并限制频繁调用', async () => {
+    const { api, req } = createHarness({ providers: { map: 'amap', llm: 'rules' } });
+    const amap = require('../server/amap'); const realRoute = amap.walkingRoute;
+    amap.walkingRoute = async () => { throw new Error('provider unavailable'); };
+    try {
+      const r = await api.legSteps(req, {}, { from: '104.06,30.66', to: '104.061,30.661' }); assert.deepEqual(r.steps, []);
+      for (let i = 0; i < 59; i++) await api.legSteps(req, {}, { from: '104.06,30.66', to: '104.061,30.661' });
+      await assert.rejects(() => api.legSteps(req, {}, { from: '104.06,30.66', to: '104.061,30.661' }), (e) => e.status === 429);
+    } finally { amap.walkingRoute = realRoute; }
+  });
   console.log(`API: ${passed} passed, 0 failed`);
 }
 main().catch((e) => { console.error(e); process.exitCode = 1; });
