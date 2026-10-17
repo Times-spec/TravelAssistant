@@ -1,5 +1,6 @@
 // 首页（向导版）：先让用户做选择，再生成路线。
-// 三步：① 想怎么逛 → ② 哪个地方 → ③ 怎么安排（起点/时间/偏好）→ 生成路线。
+// 三步：① 想怎么逛（闲逛 / 景区）→ ② 哪个地方（景区定场所、闲逛定起点，地点都在这一步定死）
+//       → ③ 怎么安排（只排路线：时长/玩法/节奏，不再改地点）→ 生成路线。
 // AI 不再是入口，而是每一步都能调用的助手（"一句话帮我填"）与游览中的导游（见 trip.js）。
 import { post, get } from './api.js';
 import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, loadAmap } from './ui.js';
@@ -43,11 +44,15 @@ export function renderHome(view) {
       class: 'choice-card' + (sel ? ' sel' : ''),
       onclick: () => {
         d.scene = scene;
-        if (scene === 'wander') { d.venueId = null; d.venueRef = null; }
+        if (scene === 'wander') {
+          d.venueId = null; d.venueRef = null;
+          // 景区流程里自动落到园内的起点对城市闲逛没有意义，交回第二步重新确定
+          if (d.origin && d.origin.source === 'venue') d.origin = null;
+        }
         if (scene === 'venue') d.interests = []; // 场所属性不由游客选，兴趣标签只属于城市闲逛
         applySceneDefaults(scene);
         saveDraft();
-        goStep(scene === 'venue' && !d.venueId && !d.venueRef ? 2 : 3);
+        goStep(2); // 地点统一在第二步确定（闲逛的起点也在第二步）
       },
     }, h('span', { class: 'choice-e' }, emoji),
       h('div', {}, h('div', { class: 'choice-t' }, title), h('div', { class: 'choice-d' }, desc)));
@@ -59,21 +64,56 @@ export function renderHome(view) {
     if (scene === 'wander' && untouched && d.endpointMode === 'flexible') d.endpointMode = 'return_to_origin';
   }
 
-  /* ================= 第二步：哪个地方 ================= */
-  const step2 = h('div', { class: 'step-body' },
-    h('h3', { class: 'sec-title' }, '逛哪个地方？'),
-    d.venueRef
-      ? h('div', { class: 'picked' },
-        h('div', { class: 'picked-name' }, '🏞️ ' + d.venueRef.name),
-        h('div', { class: 'tl-meta' }, [d.venueRef.district, d.venueRef.city].filter(Boolean).join(' · ')),
+  /* ================= 第二步：哪个地方（景区定场所 / 闲逛定起点） ================= */
+  // 这一步是"地点"的唯一入口：景区选定场所（并可指定进哪个门），城市闲逛选定出发地。
+  // 第三步只排路线，不再提供地点更改。
+  const isVenueScene = d.scene !== 'wander';
+
+  function placePicker() {
+    if (!isVenueScene) {
+      if (d.origin) {
+        return h('div', { class: 'picked' },
+          h('div', { class: 'picked-name' }, '🚶 从「' + d.origin.label + '」开始逛'),
+          h('div', { class: 'tl-meta' }, '按这个起点逛周边，终点在第三步设置'),
+          h('div', { class: 'chips', style: 'margin-top:8px' },
+            h('button', { class: 'chip', onclick: openOriginSheet }, '换一个起点'),
+            h('button', { class: 'chip', onclick: () => goStep(3) }, '就这里，下一步')));
+      }
+      return h('div', {},
+        h('button', { class: 'btn btn-ghost btn-block', onclick: locateMe }, '📡 使用当前位置'),
+        h('button', { class: 'btn btn-ghost btn-block', style: 'margin-top:8px', onclick: () => openPointPicker('origin') }, '🔍 搜索 / 地图精确选点'),
+        h('div', { class: 'tl-meta', style: 'margin-top:10px' }, '城市闲逛需要一个明确的出发地：定位、搜索或在地图上点准'));
+    }
+    if (d.venueRef || d.venueId) {
+      return h('div', { class: 'picked' },
+        h('div', { class: 'picked-name' }, '🏞️ ' + ((d.venueRef && d.venueRef.name) || d.venueId)),
+        h('div', { class: 'tl-meta' }, d.venueRef ? [d.venueRef.district, d.venueRef.city].filter(Boolean).join(' · ') : ''),
         h('div', { class: 'chips', style: 'margin-top:8px' },
-          h('button', { class: 'chip', onclick: () => openVenueSearch() }, '换一个'),
-          h('button', { class: 'chip', onclick: () => goStep(3) }, '就这里，下一步')))
-      : h('div', {},
-        h('button', { class: 'btn btn-ghost btn-block', onclick: openVenueSearch }, '🔍 搜索公园 / 景区 / 校园'),
-        h('button', { class: 'btn btn-ghost btn-block', style: 'margin-top:8px', onclick: findNearbyVenues }, '📍 看看我附近有什么可逛的'),
-        h('div', { id: 'nearby-list', style: 'margin-top:8px' }),
-        h('div', { class: 'tl-meta', style: 'margin-top:10px' }, '不知道去哪？也可以展开下面的"一句话"，我来帮你找')),
+          h('button', { class: 'chip', onclick: openVenueSearch }, '换一个'),
+          h('button', { class: 'chip', onclick: () => goStep(3) }, '就这里，下一步')));
+    }
+    return h('div', {},
+      h('button', { class: 'btn btn-ghost btn-block', onclick: openVenueSearch }, '🔍 搜索公园 / 景区 / 校园'),
+      h('button', { class: 'btn btn-ghost btn-block', style: 'margin-top:8px', onclick: findNearbyVenues }, '📍 看看我附近有什么可逛的'),
+      h('div', { id: 'nearby-list', style: 'margin-top:8px' }),
+      h('div', { class: 'tl-meta', style: 'margin-top:10px' }, '不知道去哪？也可以展开下面的"一句话"，我来帮你找'));
+  }
+
+  const startRow = h('div', { class: 'field' },
+    h('div', { class: 'field-label' },
+      h('span', {}, '从哪里进'),
+      h('button', { class: 'link-btn', onclick: openOriginSheet }, '更改')),
+    h('div', { class: 'value-row' }, d.origin
+      ? '📍 ' + d.origin.label
+      : '未指定：默认按场所入口自动确定（点「更改」可指定具体门或当前位置）'));
+
+  const step2 = h('div', { class: 'step-body' },
+    h('h3', { class: 'sec-title' }, isVenueScene ? '逛哪个地方？' : '从哪儿开始逛？'),
+    placePicker(),
+    isVenueScene && (d.venueRef || d.venueId) ? startRow : null,
+    h('div', { class: 'tl-meta', style: 'margin-top:10px' },
+      isVenueScene ? '先定场所，再定从哪个门进；地点在第二步就固定下来'
+        : '从这一步选定的地方出发逛周边；地点在第二步就固定下来'),
   );
 
   async function findNearbyVenues() {
@@ -100,7 +140,7 @@ export function renderHome(view) {
             d.venueRef = { id: v.id, name: v.name, lng: v.coord.lng, lat: v.coord.lat, city: v.city, district: v.district };
             d.origin = { lng: norm.point.lng, lat: norm.point.lat, crs: 'GCJ02', label: '当前位置', source: 'device' };
             applySceneDefaults('venue');
-            saveDraft(); toast('已选择：' + v.name); goStep(3);
+            saveDraft(); toast('已选择：' + v.name); rerender(); // 留在第二步确认起点
           },
         }, h('div', { class: 'n' }, v.name, h('span', { class: 'tag' }, (v.distanceM / 1000).toFixed(1) + 'km')),
           h('div', { class: 'a' }, v.disambiguation || v.address || '')));
@@ -111,15 +151,14 @@ export function renderHome(view) {
     }
   }
 
-  /* ================= 第三步：怎么安排（按模式分流字段） ================= */
+  /* ================= 第三步：怎么安排（只排路线；地点已在第二步定好，这里不再提供更改） ================= */
   // 景区游玩：场所自带人文/自然等属性，不是游客选的 → 用"想怎么体验"表达玩法；
   // 城市闲逛：终点与兴趣标签是主字段（"从学校出发逛半天，想看看人文和美食"）。
-  const isVenueScene = d.scene !== 'wander';
   const step3 = h('div', { class: 'step-body' },
     h('h3', { class: 'sec-title' }, '怎么安排？'),
     h('div', { class: 'field' },
-      h('div', { class: 'field-label' }, h('span', {}, '从哪里出发'), h('button', { class: 'link-btn', onclick: openOriginSheet }, '更改')),
-      h('div', { class: 'value-row' }, d.origin ? '📍 ' + d.origin.label : '未选择（当前位置 / 搜索定位 / 地图精确选点）')),
+      h('div', { class: 'field-label' }, h('span', {}, '起点'), h('span', { class: 'tl-meta' }, '第二步已确定')),
+      h('div', { class: 'value-row' }, d.origin ? '📍 ' + d.origin.label : '按场所入口自动确定')),
     isVenueScene ? h('div', { class: 'field' },
       h('div', { class: 'field-label' }, h('span', {}, '从哪个门出'), h('span', { class: 'tl-meta' }, '决定路线往哪个门收尾')),
       h('div', { class: 'chips' },
@@ -204,23 +243,28 @@ export function renderHome(view) {
 
   /* ================= 底部按钮 ================= */
   const primary = h('button', { class: 'btn btn-primary btn-lg', onclick: onPrimary }, primaryLabel());
-  // 进入第 2/3 步后提供回退出口：景区 2→1、3→2；闲逛 3→1（闲逛没有第 2 步）
+  // 进入第 2/3 步后提供回退出口：两种玩法都有完整三步，按步号回退即可
   const backBtn = d.step > 1
-    ? h('button', { class: 'btn btn-ghost btn-lg', onclick: () => goStep(d.step === 2 ? 1 : d.scene === 'venue' ? 2 : 1) }, '‹ 上一步')
+    ? h('button', { class: 'btn btn-ghost btn-lg', onclick: () => goStep(d.step - 1) }, '‹ 上一步')
     : null;
   const bottomBar = h('div', { class: 'bottom-bar' }, backBtn, primary);
   function primaryLabel() {
     if (d.step === 1) return '下一步';
-    if (d.step === 2) return (d.venueRef || d.venueId) ? '下一步' : '先去选地方';
+    if (d.step === 2) {
+      if (isVenueScene && !d.venueRef && !d.venueId) return '先去选地方';
+      if (!isVenueScene && !d.origin) return '先定起点';
+      return '下一步';
+    }
     return '生成路线';
   }
   async function onPrimary() {
     if (d.step === 1) {
       if (!d.scene) { toast('先选一种逛法'); return; }
-      return goStep(d.scene === 'venue' && !d.venueId && !d.venueRef ? 2 : 3);
+      return goStep(2); // 地点统一在第二步确定
     }
     if (d.step === 2) {
-      if (!d.venueRef && !d.venueId) { toast('先搜索并选定一个地方'); return; }
+      if (isVenueScene && !d.venueRef && !d.venueId) { toast('先搜索并选定一个地方'); return; }
+      if (!isVenueScene && !d.origin) { toast('先确定从哪儿出发'); return; }
       return goStep(3);
     }
     await doSubmit();
@@ -230,7 +274,10 @@ export function renderHome(view) {
   async function doSubmit() {
     if (state.config.setupRequired) { toast('服务端未配置地图服务，请按提示配置后使用', 4000); return; }
     if (d.scene === 'venue' && !d.venueId && !d.venueRef) { goStep(2); toast('先选定一个地方'); return; }
-    if (!d.origin) { openOriginSheet(); toast('先确定从哪里出发'); return; }
+    if (d.scene === 'wander' && !d.origin) { goStep(2); toast('先在第二步确定从哪儿出发'); return; }
+    // 景区没有指定进门位置 → 按场所入口自动确定（第二步会显示为"默认按场所入口"）
+    if (!d.origin) await resolveVenueOrigin();
+    if (!d.origin) { goStep(2); toast('先确定从哪里出发'); return; }
     primary.disabled = true;
     const old = primary.textContent;
     primary.textContent = '正在规划…';
@@ -253,6 +300,26 @@ export function renderHome(view) {
       primary.disabled = false;
       primary.textContent = old;
     }
+  }
+
+  /** 景区未指定进门位置时按场所入口兜底：优先第一个大门，其次场所坐标（拿不到就交回第二步） */
+  async function resolveVenueOrigin() {
+    const isLive = String(d.venueId || '').startsWith('live:');
+    let origin = null;
+    if (!isLive) {
+      try {
+        const pack = await getVenuePack({ id: d.venueId, ref: d.venueRef });
+        const gate = (pack.nodes || []).find((n) => n.type === 'entrance');
+        if (gate) origin = { lng: gate.lng, lat: gate.lat, crs: 'GCJ02', entranceId: gate.id, label: gate.name, source: 'venue' };
+        else if (pack.venue && pack.venue.center) {
+          origin = { lng: pack.venue.center.lng, lat: pack.venue.center.lat, crs: 'GCJ02', label: pack.venue.name + '入口', source: 'venue' };
+        }
+      } catch (e) { /* 场所包取不到时退回场所坐标 */ }
+    }
+    if (!origin && d.venueRef && typeof d.venueRef.lng === 'number') {
+      origin = { lng: d.venueRef.lng, lat: d.venueRef.lat, crs: 'GCJ02', label: (d.venueRef.name || '场所') + '（起点自动安排）', source: 'venue' };
+    }
+    if (origin) { d.origin = origin; saveDraft(); }
   }
 
   /* ================= 追问 ================= */
@@ -319,7 +386,7 @@ export function renderHome(view) {
               applySceneDefaults('venue');
               saveDraft(); closeSheet();
               toast('已选择：' + v.name);
-              goStep(3);
+              rerender(); // 留在第二步：确认从哪个门进
             },
           }, h('div', { class: 'n' }, v.name), h('div', { class: 'a' }, v.disambiguation || v.address || '')));
         }
@@ -333,7 +400,7 @@ export function renderHome(view) {
 
   /* ================= 弹层：起点 ================= */
   function openOriginSheet() {
-    openSheet('从哪里出发', h('div', {},
+    openSheet(isVenueScene ? '从哪个门进' : '从哪里出发', h('div', {},
       optRow('📡', '使用当前位置', '点击时才申请定位权限', () => { closeSheet(); locateMe(); }),
       optRow('🔍', '搜索 / 地图精确选点', '先搜大致位置，再在地图上点准到具体门', () => { closeSheet(); openPointPicker('origin'); })));
   }
