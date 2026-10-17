@@ -234,7 +234,17 @@ class RoutePlanningAgent {
               requiresConfirmation: true,
               label: `将「${node.name}」替换为环线上的「${altPoi.name}」`,
               reason: '用同类水景景观替代死胡同点位，在绝不走回头路的前提下顺利闭环回到起点',
-              patch: { hard: { mustVisitIds: patchedSub.hard.mustVisitIds } },
+              patch: {
+                hard: {
+                  mustVisitIds: patchedSub.hard.mustVisitIds,
+                  avoidPoiIds: patchedSub.hard.avoidPoiIds,
+                },
+                // 前端草稿保存的是带名字的对象，而不是裸 id；把名字一并带回，点击后无需再查
+                pois: {
+                  mustVisit: [{ id: altPoi.id, name: altPoi.name }],
+                  avoid: [{ id: poiId, name: node.name }],
+                },
+              },
               previewRoute: repairedSub,
             });
           }
@@ -243,6 +253,7 @@ class RoutePlanningAgent {
         // 策略 3：豁免末段通勤折返（保留回到起点，明确说明折返距离）
         const patchedRelax = {
           ...intent,
+          hard: { ...intent.hard, strictNoRepeat: false },
           soft: { ...intent.soft, repeatRoadPenalty: 0 },
         };
         const repairedRelax = candidatePlans(pack, patchedRelax, graph, `${planId}_repair_relax`)
@@ -256,7 +267,7 @@ class RoutePlanningAgent {
             requiresConfirmation: true,
             label: `保留回到起点，允许「${node.name}」往返必要折返约${meters}米`,
             reason: `该景点为唯一桥梁连接；游览段保持零重复，仅最后回程通勤过桥时折返`,
-            patch: { soft: { repeatRoadPenalty: 0 } },
+            patch: { soft: { repeatRoadPenalty: 0 }, hard: { strictNoRepeat: false } },
             previewRoute: repairedRelax,
           });
         }
@@ -283,7 +294,10 @@ class RoutePlanningAgent {
             requiresConfirmation: true,
             label: `放弃偏远点「${prunePoi.name}」，确保时间在预算内`,
             reason: '减少长距离往返步行，保留核心精华体验并满足时限',
-            patch: { hard: { avoidPoiIds: patchedPrune.hard.avoidPoiIds } },
+            patch: {
+              hard: { avoidPoiIds: patchedPrune.hard.avoidPoiIds },
+              pois: { avoid: [{ id: prunePoi.id, name: prunePoi.name }] },
+            },
             previewRoute: repairedPrune,
           });
         }

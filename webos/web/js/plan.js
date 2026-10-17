@@ -77,6 +77,7 @@ export function renderPlan(view, ctx, planId) {
           h('span', {}, s.endLabel),
           h('span', {}, s.hasUnknownCost ? '费用部分待确认' : s.knownCostCny > 0 ? `约 ¥${s.knownCostCny}` : '门票 ¥0')),
         s.coverage ? h('div', { class: 'tl-meta' }, `${s.coverage.scopeLabel}，本路线覆盖 ${s.coverage.visited} 个`) : null,
+        v.agentRationale ? h('div', { class: 'rc-rationale' }, v.agentRationale) : null,
         v.repeatRatio > 0.05 ? h('div', { class: 'tl-meta' },
           `重复路段约 ${Math.round(v.repeatRatio * 100)}%`
           + (v.sightRepeatRatio > 0.05 ? `；其中游览段约 ${Math.round(v.sightRepeatRatio * 100)}% 为死胡同/唯一通道等必要重复` : '')
@@ -331,6 +332,44 @@ export function renderPlan(view, ctx, planId) {
       toast('预算增加 30 分钟，正在重新规划…');
       return replan();
     }
+    if (s.action === 'change_endpoint' || s.action === 'change_endpoint_flexible') {
+      const ep = (s.patch && s.patch.endpoint) || null;
+      if (s.action === 'change_endpoint_flexible' || !ep || ep.mode === 'flexible') {
+        d.endpointMode = 'flexible';
+        d.endpointPoint = null; d.endpointLabel = null;
+        d.endpointEntranceId = null; d.endpointPoiId = null;
+      } else {
+        d.endpointMode = 'fixed';
+        d.endpointPoint = ep.point || null;
+        d.endpointLabel = ep.label || '指定终点';
+        d.endpointEntranceId = ep.entranceId || null;
+        d.endpointPoiId = ep.poiId || null;
+      }
+      saveDraftSafe();
+      toast('已调整终点，正在重新规划…');
+      return replan();
+    }
+    if (s.action === 'substitute_poi' || s.action === 'prune_low_yield') {
+      const hard = (s.patch && s.patch.hard) || {};
+      const pois = (s.patch && s.patch.pois) || {};
+      const mergePois = (list, ids, meta) => {
+        const known = new Map((list || []).map((x) => [x.id, x]));
+        const extra = new Map((meta || []).map((x) => [x.id, x]));
+        return ids.map((id) => known.get(id) || extra.get(id) || { id, name: id });
+      };
+      if (Array.isArray(hard.mustVisitIds)) d.mustVisit = mergePois(d.mustVisit, hard.mustVisitIds, pois.mustVisit);
+      if (Array.isArray(hard.avoidPoiIds)) d.avoid = mergePois(d.avoid, hard.avoidPoiIds, pois.avoid);
+      saveDraftSafe();
+      toast(s.action === 'substitute_poi' ? '已替换冲突点位，正在重新规划…' : '已避开该点位，正在重新规划…');
+      return replan();
+    }
+    if (s.action === 'allow_commute_backtrack') {
+      // 明确允许返程通勤折返（覆盖文本里"不重复"的解析结果）
+      d.avoidRepeat = false;
+      saveDraftSafe();
+      toast('已允许必要的返程折返，正在重新规划…');
+      return replan();
+    }
     toast('已记录调整方向「' + s.label + '」，请回到首页修改条件');
     location.hash = '#/';
   }
@@ -360,11 +399,11 @@ export function renderPlan(view, ctx, planId) {
     } catch (e) { toast(e.message, 3500); }
   }
 
-  function showConflict(conflict) {
+  function showConflict(conflict, status) {
     conflictCard.classList.remove('hidden');
     conflictCard.innerHTML = '';
     conflictCard.append(
-      h('h3', {}, '⚠ 当前条件下没有可行方案'),
+      h('h3', {}, status === 'needs_clarification' ? '⚠ 需要你确认一个调整' : '⚠ 当前条件下没有可行方案'),
       h('div', { style: 'margin-bottom:8px' }, conflict.message),
       h('div', { class: 'tl-meta', style: 'margin-bottom:8px' }, '可以这样调整：'),
       h('div', { class: 'chips' }, (conflict.suggestions || []).map((s) =>
@@ -385,7 +424,9 @@ export function renderPlan(view, ctx, planId) {
       const main = planData.versions.find((v) => v.routeId === planData.plan.mainRouteId) || planData.versions[0];
       selRouteId = main ? main.routeId : null;
     }
-    if (planData.plan.status === 'infeasible' && planData.plan.conflict) showConflict(planData.plan.conflict);
+    if (['infeasible', 'needs_clarification'].includes(planData.plan.status) && planData.plan.conflict) {
+      showConflict(planData.plan.conflict, planData.plan.status);
+    }
     if (selRouteId) await refreshRouteViews();
   }
 
@@ -435,7 +476,7 @@ export function renderPlan(view, ctx, planId) {
         toast(`⚠ 路线风险：${p.name} ${p.reason}`, 5000);
       } else if (evt.type === 'job.failed') {
         stageState.route = stageState.route === 'done' ? 'done' : 'active';
-        if (p.conflict) showConflict(p.conflict);
+        if (p.conflict) showConflict(p.conflict, (p.proposals && p.proposals.length) ? 'needs_clarification' : 'infeasible');
         else toast(p.message || '规划失败', 4000);
         renderStages();
       } else if (evt.type === 'job.completed') {

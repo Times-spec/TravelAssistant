@@ -16,7 +16,7 @@ const pack = loadPacks(ROOT).find((p) => p.venue.id === 'venue_qinghu');
 const startNode = pack.venue.entrances[0];
 const startAtMs = Date.parse('2026-10-01T01:00:00Z'); // Asia/Shanghai 09:00
 
-function intentOf({ mustVisitIds = [], maxDistanceM = null } = {}) {
+function intentOf({ mustVisitIds = [], maxDistanceM = null, strictNoRepeat = false } = {}) {
   return {
     intentId: 'int_compare', revision: 1, objective: 'highlights', venueId: pack.venue.id,
     origin: { point: { lng: 104.062, lat: 30.659, crs: 'GCJ02' }, entranceId: startNode, label: '南门' },
@@ -24,7 +24,7 @@ function intentOf({ mustVisitIds = [], maxDistanceM = null } = {}) {
     startAtMs, latestEndAtMs: startAtMs + 7200000, budgetSec: 7200,
     startAt: '2026-10-01T09:00:00+08:00', latestEndAt: '2026-10-01T11:00:00+08:00',
     timezone: 'Asia/Shanghai', pace: 'normal', interests: [{ tag: '自然', weight: 1 }],
-    hard: { mustVisitIds, avoidPoiIds: [], noRepeatedEdges: true, maxDistanceM, maxCostCny: null, stepFreeRequired: false },
+    hard: { mustVisitIds, avoidPoiIds: [], noRepeatedEdges: true, strictNoRepeat, maxDistanceM, maxCostCny: null, stepFreeRequired: false },
     soft: { freePreferred: false, repeatRoadPenalty: 1, restPreferred: false, quietPreferred: false, stepFewPreferred: false },
   };
 }
@@ -50,6 +50,7 @@ const scenarios = [
   { name: '标准两小时闭环', intent: intentOf() },
   { name: '湖心岛死胡同必去', intent: intentOf({ mustVisitIds: ['poi_island'] }) },
   { name: '多重约束：必去两点+2.2km上限', intent: intentOf({ mustVisitIds: ['poi_tower', 'poi_bonsai'], maxDistanceM: 2200 }) },
+  { name: '严格零重复+死胡同必去', intent: intentOf({ mustVisitIds: ['poi_island'], strictNoRepeat: true }) },
 ];
 
 console.log('场景'.padEnd(24), '算法方案'.padEnd(16), '智能体方案'.padEnd(22), '算法/智能体耗时');
@@ -80,9 +81,18 @@ assert(deadEnd.algorithm.route.warnings.some((w) => w.code === 'RETURN_BACKTRACK
 assert(deadEnd.algorithm.route.stops.some((s) => s.poiId === 'poi_island'), '必去的死胡同点不得被丢点优化丢掉');
 assert.equal(deadEnd.agent.status, 'ready');
 assert.equal(deadEnd.agent.verification.ok, true);
+// 返程通勤折返被豁免，但可选点不得因此被全部误拒（2026-10-17 修：守卫曾把返程重复算成插入代价，
+// 使该场景塌缩成 1 站）
+assert(deadEnd.agent.route.stops.length >= 3, `死胡同必去不应挤掉可选点，实际 ${deadEnd.agent.route.stops.length} 站`);
 const multi = rows[2];
 assert(multi.algorithm.route && multi.algorithm.route.totals.distanceM <= 2200);
 assert(multi.agent.route && multi.agent.route.totals.distanceM <= 2200);
+// 严格零重复（用户明确"不回头"）：算法判不可行，智能体必须给出需用户确认的修复提议
+const strict = rows[3];
+assert.equal(strict.algorithm.status, 'infeasible', '严格零重复 + 死胡同必去应判不可行');
+assert.equal(strict.agent.status, 'needs_user_decision', '智能体应转为待用户确认');
+assert(strict.agent.proposals.length >= 1, '智能体应给出至少一条修复提议');
+assert(strict.agent.proposals.every((p) => p.requiresConfirmation), '修复提议必须需用户确认，不得静默放宽硬约束');
 
 const summary = {
   scenarios: rows.length,

@@ -95,6 +95,7 @@ li.active .stage-dot { background: var(--warn); animation: pulse 1s infinite alt
 .rc-stats { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--ink-2); margin-top: 6px; }
 .rc-tradeoff { font-size: 12px; color: var(--warn); margin-top: 6px; }
 .rc-warn { font-size: 12px; color: var(--warn); margin-top: 4px; }
+.rc-rationale { font-size: 12px; line-height: 1.55; color: var(--green-d); background: var(--green-l); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
 
 /* 地图 */
 .map-wrap { border-radius: var(--radius); overflow: hidden; background: #e8efe9; box-shadow: var(--shadow); position: relative; }

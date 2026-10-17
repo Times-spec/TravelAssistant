@@ -212,7 +212,7 @@ function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
     //   真实街道网上回程往往必然重复去程，所以这里的降级是通勤豁免而非零重复。
     const isReturnTrip = opts.isReturnTrip || endNodeId === opts.startNodeId || intent.endpoint?.mode === 'return_to_origin';
     const strictNoRepeat = intent.hard?.noRepeatedEdges !== false
-      && (intent.soft?.repeatRoadPenalty === 1 || opts.strictNoRepeat);
+      && (intent.hard?.strictNoRepeat === true || opts.strictNoRepeat);
     let r;
     if (isReturnTrip) {
       if (strictNoRepeat) {
@@ -773,7 +773,7 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
     revalidateAfter: fmt(schedule.endArrivalMs + 3600000),
     provenance: { solverVersion: SOLVER_VERSION, policyVersion: POLICY_VERSION, dataVersion: pack.venue.packVersion },
     noRepeatedEdges: intent.hard?.noRepeatedEdges !== false, // 独立校验器按同一语义复核
-    strictNoRepeat: !!(intent.hard?.noRepeatedEdges !== false && (intent.soft?.repeatRoadPenalty === 1 || intent.hard?.strictNoRepeat)),
+    strictNoRepeat: !!(intent.hard?.noRepeatedEdges !== false && intent.hard?.strictNoRepeat === true),
     startNodeId: solved.startNodeId,
     endNodeId: solved.endNodeId,
     candidateCount: solved.candidateCount || 0,

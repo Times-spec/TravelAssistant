@@ -301,18 +301,24 @@ function normalizeIntent(input, packs, preParsed = null) {
   evidence.mustVisit = { source: form.mustVisitIds?.length ? 'form' : parsed.mustVisitNames.length ? 'text' : 'default' };
 
   // 预算/无障碍/软偏好
+  // "明确不回头"：只有用户显式表态（表单开关或自然语言"少走回头路/不重复/别绕"）才把返程也纳入零重复；
+  // 默认只把"少重复"作为排序偏好，返程的必要通勤折返仍按通勤豁免处理。
+  const explicitNoRepeat = form.avoidRepeat === true || parsed.soft.repeatRoadPenalty === 1;
+  const allowBacktrack = form.avoidRepeat === false;
   const hard = {
     mustVisitIds,
     avoidPoiIds,
     // 产品固定约束：路线不得重复使用同一物理路段；正反向按同一 edgeId 计算。
     noRepeatedEdges: form.noRepeatedEdges !== false,
+    strictNoRepeat: explicitNoRepeat && !allowBacktrack,
     maxDistanceM: form.maxDistanceM || null,
     maxCostCny: form.budgetHardZero ? 0 : parsed.hard.maxCostCny ?? null,
     stepFreeRequired: !!(form.stepFreeRequired || parsed.hard.stepFreeRequired),
   };
   const soft = {
     freePreferred: !!(form.freePreferred || parsed.soft.freePreferred),
-    repeatRoadPenalty: form.avoidRepeat ? 1 : (parsed.soft.repeatRoadPenalty ?? 0),
+    // 排序偏好默认开启（少走回头路）；只有用户明确"可以走回头路"才关掉。
+    repeatRoadPenalty: allowBacktrack ? 0 : (parsed.soft.repeatRoadPenalty ?? 1),
     restPreferred: !!(form.restPreferred || parsed.soft.restPreferred || pace === 'easy'),
     quietPreferred: !!(form.quietPreferred || parsed.soft.quietPreferred),
     stepFewPreferred: !!parsed.soft.stepFewPreferred,

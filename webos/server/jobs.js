@@ -213,6 +213,11 @@ class JobRunner {
       const existing = store.findOne('route_versions', (x) => x.planId === plan.id && x.version === version + 1);
       const plan_ = existing || buildRoutePlan(pack, intent, graph, r.solved, { version: version + 1, planId: plan.id });
       plan_.policyName = r.policy.name;
+      // 主推荐的 Agent 策略说明随路线版本一起入库，否则只存在于内存里，客户端拿不到
+      if (agentResult && i === 0) {
+        plan_.agentRationale = agentResult.agentRationale || null;
+        plan_.agentStrategy = agentResult.agentStrategy || null;
+      }
       // 备选标题体现真实取向差异（§10.1：不能只改文案，此处标题基于不同权重求解的结果）
       if (r.policy.name === 'light') plan_.title += ' · 轻松版';
       if (r.policy.name === 'full') plan_.title += ' · 全览版';

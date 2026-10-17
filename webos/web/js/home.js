@@ -683,7 +683,7 @@ export function buildIntentPayload(d) {
       endpointEntranceId: d.endpointEntranceId, endpointPoiId: d.endpointPoiId,
       mobility: d.mobility, pace: d.pace, interests: d.interests,
       mustVisitIds: d.mustVisit.map((x) => x.id), avoidPoiIds: d.avoid.map((x) => x.id),
-      freePreferred: d.freePreferred, budgetHardZero: d.budgetHardZero,
+      freePreferred: d.freePreferred, budgetHardZero: d.budgetHardZero, avoidRepeat: d.avoidRepeat,
       stepFreeRequired: d.stepFreeRequired, restPreferred: d.restPreferred, quietPreferred: d.quietPreferred,
       guideStyle: d.guideStyle, needsText: d.stepFew ? '少台阶' : '',
     },

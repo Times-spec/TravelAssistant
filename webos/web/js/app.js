@@ -33,7 +33,7 @@ function defaultDraft() {
     endpointMode: 'return_to_origin', endpointPoint: null, endpointLabel: null, endpointEntranceId: null, endpointPoiId: null,
     mobility: 'walk', pace: 'normal', interests: [], text: '',
     mustVisit: [], avoid: [],
-    freePreferred: false, budgetHardZero: false,
+    freePreferred: false, budgetHardZero: false, avoidRepeat: null, // null=未表态 true=明确不回头 false=允许通勤折返
     stepFreeRequired: false, stepFew: false, restPreferred: false, quietPreferred: false,
     guideStyle: 'normal',
   };
