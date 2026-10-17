@@ -231,9 +231,9 @@ class JobRunner {
         plan_.agentRationale = agentResult.agentRationale || null;
         plan_.agentStrategy = agentResult.agentStrategy || null;
       }
-      // 备选标题体现真实取向差异（§10.1：不能只改文案，此处标题基于不同权重求解的结果）
-      if (r.policy.name === 'light') plan_.title += ' · 轻松版';
-      if (r.policy.name === 'full') plan_.title += ' · 全览版';
+      // 备选标题体现真实取向差异；主推荐不加" · 轻松版"这类后缀（否则读起来像次级方案）
+      if (i > 0 && r.policy.name === 'light') plan_.title += ' · 轻松版';
+      if (i > 0 && r.policy.name === 'full') plan_.title += ' · 全览版';
       if (!existing) store.insert('route_versions', plan_);
       routeIds.push(plan_.routeId);
       version++;
