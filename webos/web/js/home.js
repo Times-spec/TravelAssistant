@@ -178,7 +178,7 @@ export function renderHome(view) {
       h('div', { class: 'chips' }, DURATION_PRESETS.map(([sec, label]) =>
         h('button', {
           class: 'chip' + (d.timeMode === 'duration' && d.durationSec === sec ? ' sel' : ''),
-          onclick: () => { d.timeMode = 'duration'; d.durationSec = sec; saveDraft(); rerender(); },
+          onclick: () => { d.timeMode = 'duration'; d.durationSec = sec; d.durationTouched = true; saveDraft(); rerender(); },
         }, label)),
         d.timeMode === 'arriveBy' ? h('span', { class: 'chip sel' }, d.latestEndClock + ' 前到终点') : null)),
     isVenueScene
@@ -418,12 +418,12 @@ export function renderHome(view) {
       if (d.timeMode === 'duration') {
         body.append(h('div', { class: 'field-label' }, '逛多久'),
           h('div', { class: 'chips' }, DURATION_PRESETS.map(([sec, label]) =>
-            h('button', { class: 'chip' + (d.durationSec === sec ? ' sel' : ''), onclick: () => { d.durationSec = sec; saveDraft(); refresh(); } }, label)),
+            h('button', { class: 'chip' + (d.durationSec === sec ? ' sel' : ''), onclick: () => { d.durationSec = sec; d.durationTouched = true; saveDraft(); refresh(); } }, label)),
             h('label', { class: 'chip' }, '自定义 ',
               h('input', {
                 type: 'number', min: 30, max: 480, value: Math.round(d.durationSec / 60),
                 style: 'width:58px;border:0;outline:0;background:transparent;font:inherit',
-                onchange: (e) => { d.durationSec = Math.max(30, Math.min(480, Number(e.target.value) || 120)) * 60; saveDraft(); },
+                onchange: (e) => { d.durationSec = Math.max(30, Math.min(480, Number(e.target.value) || 120)) * 60; d.durationTouched = true; saveDraft(); },
               }), ' 分钟')));
       } else {
         body.append(h('div', { class: 'field-label' }, '最晚几点到终点'),
@@ -434,12 +434,12 @@ export function renderHome(view) {
       body.append(...[
         h('div', { class: 'field-label', style: 'margin-top:10px' }, '开始时间'),
         h('div', { class: 'chips' },
-          h('button', { class: 'chip' + (d.startMode === 'now' ? ' sel' : ''), onclick: () => { d.startMode = 'now'; d.startAtMs = null; saveDraft(); refresh(); } }, '现在出发'),
-          h('button', { class: 'chip' + (d.startMode === 'later' ? ' sel' : ''), onclick: () => { d.startMode = 'later'; saveDraft(); refresh(); } }, '稍后出发')),
+          h('button', { class: 'chip' + (d.startMode === 'now' ? ' sel' : ''), onclick: () => { d.startMode = 'now'; d.startAtMs = null; d.startTouched = true; saveDraft(); refresh(); } }, '现在出发'),
+          h('button', { class: 'chip' + (d.startMode === 'later' ? ' sel' : ''), onclick: () => { d.startMode = 'later'; d.startTouched = true; saveDraft(); refresh(); } }, '稍后出发')),
         d.startMode === 'later' ? h('input', {
           class: 'input', type: 'datetime-local', style: 'margin-top:8px',
           value: d.startAtMs ? toLocalInput(d.startAtMs) : '',
-          onchange: (e) => { d.startAtMs = e.target.value ? new Date(e.target.value).getTime() : null; saveDraft(); },
+          onchange: (e) => { d.startAtMs = e.target.value ? new Date(e.target.value).getTime() : null; d.startTouched = true; saveDraft(); },
         }) : null,
       ].filter(Boolean));
     }
@@ -748,6 +748,7 @@ export function buildIntentPayload(d) {
       } : null,
       timeMode: d.timeMode, durationSec: d.durationSec, latestEndClock: d.latestEndClock,
       startMode: d.startMode, startAtMs: d.startAtMs,
+      startTouched: !!d.startTouched, durationTouched: !!d.durationTouched,
       endpointMode: d.endpointMode,
       // 只有用户显式选过终点才把表单值当强约束；否则一句话里的"顺路结束/从东门出"应能生效
       endpointTouched: !!d.endpointTouched,

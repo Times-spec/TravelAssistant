@@ -28,6 +28,7 @@ const NLU_SCHEMA = `{
   "mobility": "walk|bike|null",
   "pace": "easy|normal|active|null",
   "durationSec": 秒数|null,
+  "startClock": "HH:mm|null",
   "latestEndClock": "HH:mm|null",
   "endpointMode": "return_to_origin|flexible|null",
   "mustVisitNames": ["用户明确说必去/一定要去/锁定的地点名"],
@@ -55,7 +56,7 @@ async function llmNLU(cfg, text, contextNote = '') {
 - "回到起点/回南门/原路返回" → endpointMode=return_to_origin；"走到哪算哪/顺路" → flexible；
 - 骑行/骑车 → mobility=bike；步行/散步 → walk；
 - 半天=14400 秒；"两/2小时"=7200 秒；"30分钟"=1800 秒；
-- "下午5点前" → latestEndClock="17:00"。
+- "下午两点到五点/14:00-17:00" → startClock="14:00"、latestEndClock="17:00"、durationSec=10800；"下午两点以后" → startClock="14:00"；"下午5点前" → latestEndClock="17:00"。
 ${contextNote}`;
   const ask = async (extra) => {
     const msgs = [{ role: 'system', content: sys }, { role: 'user', content: text }];
@@ -75,6 +76,7 @@ ${contextNote}`;
   // 服务端校验：枚举/范围白名单（§6.3）——不合法的字段一律丢弃
   const TAGS = ['自然', '公园湿地', '街区', '人文', '建筑', '美食'];
   const cleanName = (s) => (typeof s === 'string' && s.trim().length >= 2 && s.length <= 40 ? s.trim() : null);
+  const cleanClock = (s) => typeof s === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(s) ? s : null;
   const out = {
     scene: ['venue', 'wander'].includes(parsed.scene) ? parsed.scene : null,
     venueName: cleanName(parsed.venueName),
@@ -84,7 +86,8 @@ ${contextNote}`;
     mobility: ['walk', 'bike'].includes(parsed.mobility) ? parsed.mobility : null,
     pace: ['easy', 'normal', 'active'].includes(parsed.pace) ? parsed.pace : null,
     durationSec: Number.isFinite(parsed.durationSec) ? Math.max(600, Math.min(28800, parsed.durationSec)) : null,
-    latestEndClock: typeof parsed.latestEndClock === 'string' && /^\d{2}:\d{2}$/.test(parsed.latestEndClock) ? parsed.latestEndClock : null,
+    startClock: cleanClock(parsed.startClock),
+    latestEndClock: cleanClock(parsed.latestEndClock),
     endpointRef: parsed.endpointMode === 'return_to_origin' ? { mode: 'return_to_origin' } : parsed.endpointMode === 'flexible' ? { mode: 'flexible' } : null,
     mustVisitNames: Array.isArray(parsed.mustVisitNames) ? parsed.mustVisitNames.filter((s) => typeof s === 'string' && s.length < 30) : [],
     avoidNames: Array.isArray(parsed.avoidNames) ? parsed.avoidNames.filter((s) => typeof s === 'string' && s.length < 30) : [],

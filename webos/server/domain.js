@@ -31,7 +31,7 @@ function cnToNum(s) {
 function ruleNLU(text) {
   const out = {
     objective: null, interests: [], mobility: null, pace: null,
-    durationSec: null, latestEndClock: null, endpointRef: null,
+    durationSec: null, startClock: null, latestEndClock: null, endpointRef: null,
     mustVisitNames: [], avoidNames: [],
     hard: {}, soft: {}, notes: [],
   };
@@ -51,6 +51,31 @@ function ruleNLU(text) {
     if (m) out.durationSec = Number(m[1]) * 60;
   }
   if (!out.durationSec && /半天/.test(t)) out.durationSec = 4 * 3600;
+
+  // 时间窗的两端必须一起保留；第二个钟点可沿用第一个的上午/下午。
+  const clockPattern = '(上午|中午|下午|晚上|傍晚|今晚|早上|凌晨)?\\s*(\\d{1,2}|[一二两三四五六七八九十]+)\\s*(?:[:：](\\d{2})|点\\s*(半|[一二两三四五六七八九十\\d]+分?)?)';
+  const clockOf = (parts, inheritedPeriod) => {
+    const period = parts[1] || inheritedPeriod;
+    let hour = cnToNum(parts[2]);
+    const minute = parts[3] != null ? Number(parts[3]) : parts[4] === '半' ? 30 : cnToNum((parts[4] || '').replace(/分$/, '')) || 0;
+    if (hour == null || hour > 23 || minute > 59) return null;
+    if (['下午', '晚上', '傍晚', '今晚', '中午'].includes(period) && hour < 12) hour += 12;
+    if (period === '凌晨' && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  };
+  const range = t.match(new RegExp(clockPattern + '\\s*(?:到|至|[-—~～])\\s*' + clockPattern));
+  if (range) {
+    out.startClock = clockOf(range.slice(0, 5));
+    out.latestEndClock = clockOf([null, ...range.slice(5, 9)], range[1]);
+    if (out.startClock && out.latestEndClock && !out.durationSec) {
+      const minutes = (c) => Number(c.slice(0, 2)) * 60 + Number(c.slice(3));
+      const span = (minutes(out.latestEndClock) - minutes(out.startClock) + 1440) % 1440;
+      if (span) out.durationSec = span * 60;
+    }
+  } else {
+    const start = t.match(new RegExp(clockPattern + '\\s*(?:以后|之后|后|出发|开始)'));
+    if (start) out.startClock = clockOf(start);
+  }
 
   // 截止：五点前/17:00前/下午5点前/6点半前
   m = t.match(/(上午|中午|下午|晚上|傍晚|今晚)?\s*(\d{1,2}|[一二两三四五六七八九十]+)\s*[点:：]\s*(半|\d{1,2})?\s*(?:前|之前)/);
@@ -121,15 +146,20 @@ function resolveTimes(form, textParsed, tz, evidence) {
     startMs = Number(form.startAtMs);
     if (startMs < nowMs - 60000) throw E.badRequest('开始时间早于当前时间，请修正日期或时间', { field: 'startAt' });
     mark('startAt', 'form');
+  } else if (textParsed.startClock && !form.startTouched) {
+    const requested = tk.zonedTimeToMs(now.dateStr, textParsed.startClock, tz);
+    startMs = Math.max(nowMs, requested);
+    mark('startAt', 'text', textParsed.startClock);
   } else {
     startMs = nowMs;
     mark('startAt', 'default', '现在');
   }
 
   // 时长：表单优先；文本补充
-  let durationSec = form.durationSec || textParsed.durationSec || 2 * 3600;
+  const formDuration = form.durationTouched !== false && form.durationSec;
+  let durationSec = formDuration || textParsed.durationSec || 2 * 3600;
   durationSec = clamp(durationSec, 30 * 60, 8 * 3600); // 文档 §2.2：30 分钟～8 小时
-  mark('durationSec', form.durationSec ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : '2 小时');
+  mark('durationSec', formDuration ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : '2 小时');
 
   // 截止：表单 arrive-by 模式 or 文本"几点前"
   let latestEndMs = startMs + durationSec * 1000;
@@ -137,7 +167,10 @@ function resolveTimes(form, textParsed, tz, evidence) {
   const parseClock = (clock, source) => {
     const z = tk.msToZoned(startMs, tz);
     let end = tk.zonedTimeToMs(z.dateStr, clock, tz);
-    if (end <= startMs) end += 24 * 3600 * 1000; // 用户说"明天五点前"类语义按次日顺延一次
+    // 跨午夜只按原文本时间窗判断，不能把已经截止的当日时间窗悄悄推到明天。
+    if (source === 'text' && textParsed.startClock) {
+      if (clock <= textParsed.startClock) end += 24 * 3600 * 1000;
+    } else if (end <= startMs) end += 24 * 3600 * 1000;
     deadlineSource = source;
     return end;
   };
@@ -150,7 +183,8 @@ function resolveTimes(form, textParsed, tz, evidence) {
   }
   // 双约束并存（"逛两小时，五点前回"）→ 取较紧（上面已是 min 语义：默认推导 vs 截止取更早）
   const byDuration = startMs + durationSec * 1000;
-  if (latestEndMs > byDuration && !form.timeMode?.startsWith('arriveBy')) latestEndMs = byDuration;
+  const textWindow = !!(textParsed.startClock && textParsed.latestEndClock);
+  if (latestEndMs > byDuration && form.timeMode !== 'arriveBy' && (!textWindow || formDuration)) latestEndMs = byDuration;
   if (latestEndMs < byDuration && (form.timeMode === 'arriveBy' || textParsed.latestEndClock)) {
     // 截止更紧 → 实际预算被截止压缩，确认条需展示
   }

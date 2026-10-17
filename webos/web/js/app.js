@@ -29,7 +29,7 @@ function defaultDraft() {
     venueId: null, venueRef: null, objective: 'highlights',
     origin: null,
     timeMode: 'duration', durationSec: 7200, latestEndClock: '17:00',
-    startMode: 'now', startAtMs: null,
+    startMode: 'now', startAtMs: null, startTouched: false, durationTouched: false,
     endpointMode: 'return_to_origin', endpointTouched: false, endpointPoint: null, endpointLabel: null, endpointEntranceId: null, endpointPoiId: null,
     mobility: 'walk', pace: 'normal', interests: [], text: '',
     mustVisit: [], avoid: [],
