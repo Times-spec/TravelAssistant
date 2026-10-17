@@ -867,7 +867,7 @@ class Api {
     if (!trip) throw E.notFound('行程不存在');
     if (trip.status !== 'active' && trip.status !== 'paused') throw E.badRequest('行程已结束');
     const base = store.byId('route_versions', body.baseRouteId || trip.activeRouteVersionId);
-    if (!base) throw E.badRequest('基准版本无效');
+    if (!base || base.planId !== trip.planId) throw E.badRequest('基准版本无效');
 
     // 锁定必去点的跳过需先解锁提示（§12.1）
     if (body.cause === 'stop_skipped' && body.data && body.data.poiId) {
@@ -889,6 +889,7 @@ class Api {
       const stop = poiId && (base.stops.find((s) => s.poiId === poiId)
         || store.find('route_versions', (r) => r.planId === trip.planId).slice().reverse()
           .flatMap((r) => r.stops || []).find((s) => s.poiId === poiId));
+      if (last && !stop?.entranceNodeId) throw E.badRequest('最近到达点无法定位，请确认当前位置后重试', { field: 'currentNodeId' });
       currentNodeId = stop && stop.entranceNodeId || base.startNodeId;
     }
     const job = createJob(store, {

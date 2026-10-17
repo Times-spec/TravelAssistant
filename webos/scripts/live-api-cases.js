@@ -40,6 +40,11 @@ async function main() {
     const r = await api.replanTrip(req, { id: 'trip' }, {}, { cause: 'finish_requested' });
     assert.equal(ctx.store.byId('jobs', r.jobId).payload.currentNodeId, 'node-2');
   });
+  await check('T5 到达点无法映射时追问位置，不静默回起点', async () => {
+    const { api, req, ctx } = tripHarness();
+    ctx.store.insert('trip_events', { tripId: 'trip', type: 'arrive_confirm', data: { poiId: 'unknown' } });
+    await assert.rejects(() => api.replanTrip(req, { id: 'trip' }, {}, { cause: 'fatigue_reported' }), (e) => e.details.field === 'currentNodeId');
+  });
   await check('T6 导航步骤50m网格缓存且有方向和过期', async () => {
     const { api, req, ctx } = createHarness({ providers: { map: 'amap', llm: 'rules' } });
     const amap = require('../server/amap'); const realRoute = amap.walkingRoute; const realNow = Date.now;
