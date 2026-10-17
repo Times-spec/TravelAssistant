@@ -166,9 +166,9 @@ function resolveTimes(form, textParsed, tz, evidence) {
 
   // 时长：表单优先；文本补充
   const formDuration = form.durationTouched !== false && form.durationSec;
-  let durationSec = formDuration || textParsed.durationSec || 2 * 3600;
+  let durationSec = formDuration || textParsed.durationSec || form.durationSec || 2 * 3600;
   durationSec = clamp(durationSec, 30 * 60, 8 * 3600); // 文档 §2.2：30 分钟～8 小时
-  mark('durationSec', formDuration ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : '2 小时');
+  mark('durationSec', formDuration ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : tk.fmtDuration(durationSec));
 
   // 截止：表单 arrive-by 模式 or 文本"几点前"
   let latestEndMs = startMs + durationSec * 1000;

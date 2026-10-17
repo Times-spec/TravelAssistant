@@ -58,6 +58,9 @@ async function main() {
   await check('T1 显式选择现在出发优先', () => at('09:00', () => {
     assert.equal(intent('下午两点以后', { startMode: 'now', startTouched: true }).startAtMs, Date.now());
   }));
+  await check('T1 没有文本时保留已有表单时长', () => at('09:00', () => {
+    assert.equal(intent('', { durationSec: 10800, durationTouched: false }).budgetSec, 10800);
+  }));
   await check('T1 已截止时间窗不静默顺延', () => at('18:00', () => assert.throws(() => intent('下午两点到五点'), /开始时间已晚于截止时间/)));
   await check('T1 HTTP 模型提取与合并', async () => {
     await modelResult({ startClock: '14:00', latestEndClock: '17:00', durationSec: 10800 }, async () => {
