@@ -222,13 +222,22 @@ async function walkingRoute(cfg, from, to) {
   });
   const p = json.route.paths[0];
   const coords = [];
+  // 逐步导引：保留高德每一步的文字指令/动作/道路名与它在折线里的起点下标，
+  // 前端"怎么走"卡片直接用（此前只拼折线、把指令全扔了，游览页只能外跳高德导航）。
+  const steps = [];
   for (const s of p.steps || []) {
+    const startIdx = Math.max(0, coords.length - 1);
     for (const pair of String(s.polyline || '').split(';')) {
       const [lng, lat] = pair.split(',').map(Number);
       if (Number.isFinite(lng) && Number.isFinite(lat)) coords.push([lng, lat]);
     }
+    const str = (v) => (typeof v === 'string' ? v : '');
+    steps.push({
+      instruction: str(s.instruction), action: str(s.action), assistantAction: str(s.assistant_action),
+      road: str(s.road), distanceM: Number(s.distance) || 0, startIdx,
+    });
   }
-  return { distanceM: Number(p.distance), durationSec: Number(p.duration), geometry: coords, provider: 'amap-walking' };
+  return { distanceM: Number(p.distance), durationSec: Number(p.duration), geometry: coords, steps, provider: 'amap-walking' };
 }
 
 /* ---------- 文本搜索 / 逆地理 / 坐标转换 ---------- */
@@ -269,10 +278,25 @@ async function convertCoord(cfg, lng, lat) {
 }
 
 /* ---------- 真实闲逛区域：与 VenueGraph/pack 同构的适配器 ---------- */
+const END_NODE_MIN_M = 80; // 终点离起点不到 80m 视为同一端口（"回到附近"），不额外建节点
+
+/** 绕行量：从 o 去 e 的路上顺道经过 c 要多走多少（直线近似） */
+function detourM(o, c, e) {
+  return haversineM(o, c) + haversineM(c, e) - haversineM(o, e);
+}
+/** 终点并入矩阵缓存键（约 50m 网格），换了终点必须重抓 OD */
+function endKeyOf(e) {
+  return `end@${Math.round(e.lng / 0.0005)},${Math.round(e.lat / 0.0005)}`;
+}
+
 class AmapAreaGraph {
-  constructor(cfg, origin, budgetSec) {
+  constructor(cfg, origin, budgetSec, endpoint) {
     this.cfg = cfg;
     this.origin = origin; // {lng,lat,crs:'GCJ02'}
+    // 用户指定的终点（与起点相距 > END_NODE_MIN_M 时单独建节点 am_end）。
+    // 此前图里只有 am_origin 一个端口，规划器把终点吸附到"最近的候选点"，
+    // 于是末站→真实终点这一段既不参与排序也不在地图上，末站可能离终点很远（2026-10-18 修）。
+    this.endpoint = endpoint && Number.isFinite(endpoint.lng) && haversineM(origin, endpoint) > END_NODE_MIN_M ? endpoint : null;
     this.budgetSec = budgetSec;
     this.nodes = new Map();
     this._routeCache = new Map();
@@ -288,10 +312,17 @@ class AmapAreaGraph {
       id: 'am_origin', name: this.origin.label || '起点', type: 'entrance',
       lng: this.origin.lng, lat: this.origin.lat, status: 'open',
     });
+    if (this.endpoint) {
+      this.nodes.set('am_end', {
+        id: 'am_end', name: this.endpoint.label || '终点', type: 'entrance',
+        lng: this.endpoint.lng, lat: this.endpoint.lat, status: 'open',
+      });
+    }
     for (const c of cands) {
       this.nodes.set(c.id, { id: c.id, name: c.name, type: 'poi', lng: c.lng, lat: c.lat, status: 'open' });
     }
-    const ids = ['am_origin', ...cands.map((c) => c.id)];
+    const ports = this.endpoint ? ['am_origin', 'am_end'] : ['am_origin'];
+    const ids = [...ports, ...cands.map((c) => c.id)];
 
     // 命中缓存：矩阵直接复原，一次网络请求都不发（同一场所反复规划只有首次慢）
     const cached = matrixCacheGet(opts.cacheKey);
@@ -316,7 +347,7 @@ class AmapAreaGraph {
         const eid = 'ame_' + (++this._edgeSeq);
         const physicalSegmentKeys = geometrySegmentKeys(r.geometry);
         this._edges.set(eid, { id: eid, from: ids[i], to: ids[j], lengthM: r.distanceM, walkAllowed: true, stepsKnown: false, steps: null, physicalSegmentKeys });
-        this._storePair(ids[i], ids[j], eid, r.distanceM, r.geometry, physicalSegmentKeys, true);
+        this._storePair(ids[i], ids[j], eid, r.distanceM, r.geometry, physicalSegmentKeys, true, null, r.steps);
         return true;
       } catch (e) {
         this._storePair(ids[i], ids[j], null, null, [], [], false, e.message);
@@ -332,9 +363,11 @@ class AmapAreaGraph {
     }
     // 二次重试：起点↔候选的边必须拿到真实路由，否则候选会被误判不可达。
     // （此前这里是 `calls < maxCalls`，而 calls 早已等于上限，重试一次都没跑过。）
-    for (let j = 1; j < ids.length && attempts < maxCalls; j++) {
-      const cur = this._routeCache.get(ids[0] + '>' + ids[j]);
-      if (!cur || cur.status !== 'ok') await fetchPair(0, j);
+    for (let p = 0; p < ports.length; p++) {
+      for (let j = p + 1; j < ids.length && attempts < maxCalls; j++) {
+        const cur = this._routeCache.get(ids[p] + '>' + ids[j]);
+        if (!cur || cur.status !== 'ok') await fetchPair(p, j);
+      }
     }
     this._dropUnreachable(cands);
     matrixCacheSet(opts.cacheKey, this._snapshot(ids));
@@ -355,16 +388,17 @@ class AmapAreaGraph {
   }
 
   /** 写入一对 OD 的正反两条缓存（无向：正反共用距离，折线反向） */
-  _storePair(a, b, eid, distanceM, geometry, physicalSegmentKeys, ok, error) {
+  _storePair(a, b, eid, distanceM, geometry, physicalSegmentKeys, ok, error, steps) {
     if (!ok) {
       const miss = { status: 'unreachable', distanceM: null, nodeIds: [], edgeIds: [], geometry: [], error: error || 'amap route failed' };
       this._routeCache.set(a + '>' + b, miss);
       this._routeCache.set(b + '>' + a, miss);
       return;
     }
-    const base = { status: 'ok', distanceM, nodeIds: [a, b], edgeIds: [eid], geometry, physicalSegmentKeys, repeatDetection: 'geometry-grid-approx', provider: 'amap-walking' };
+    const base = { status: 'ok', distanceM, nodeIds: [a, b], edgeIds: [eid], geometry, physicalSegmentKeys, repeatDetection: 'geometry-grid-approx', provider: 'amap-walking', steps: Array.isArray(steps) && steps.length ? steps : null };
     this._routeCache.set(a + '>' + b, base);
-    this._routeCache.set(b + '>' + a, { ...base, nodeIds: [b, a], geometry: [...geometry].reverse() });
+    // 反向复用同一条折线：高德的文字指令只对正向成立，反向置空，由前端按折线几何合成导引
+    this._routeCache.set(b + '>' + a, { ...base, nodeIds: [b, a], geometry: [...geometry].reverse(), steps: null });
   }
 
   /** 仍不可达的点位剔除（诚实：无真实路由就不参与规划） */
@@ -373,7 +407,14 @@ class AmapAreaGraph {
       const r = this._routeCache.get('am_origin>' + c.id);
       if (!r || r.status !== 'ok') this.nodes.delete(c.id);
     }
+    // 终点自身走不到（起点→终点都没有真实路由）就退回旧行为，不伪造一段路
+    if (this.nodes.has('am_end')) {
+      const r = this._routeCache.get('am_origin>am_end');
+      if (!r || r.status !== 'ok') { this.nodes.delete('am_end'); this.endpoint = null; }
+    }
   }
+  /** 规划器用：图里有没有独立的终点节点 */
+  get endNodeId() { return this.nodes.has('am_end') ? 'am_end' : null; }
 
   _snapshot(ids) {
     const legs = [];
@@ -383,7 +424,7 @@ class AmapAreaGraph {
         if (!r) continue;
         legs.push({
           i, j, ok: r.status === 'ok', eid: (r.edgeIds && r.edgeIds[0]) || null,
-          distanceM: r.distanceM, geometry: r.geometry, physicalSegmentKeys: r.physicalSegmentKeys || null,
+          distanceM: r.distanceM, geometry: r.geometry, physicalSegmentKeys: r.physicalSegmentKeys || null, steps: r.steps || null,
         });
       }
     }
@@ -396,7 +437,7 @@ class AmapAreaGraph {
       if (!ids[L.i] || !ids[L.j]) continue;
       if (L.ok && L.eid) {
         this._edges.set(L.eid, { id: L.eid, from: ids[L.i], to: ids[L.j], lengthM: L.distanceM, walkAllowed: true, stepsKnown: false, steps: null, physicalSegmentKeys: L.physicalSegmentKeys });
-        this._storePair(ids[L.i], ids[L.j], L.eid, L.distanceM, L.geometry, L.physicalSegmentKeys, true);
+        this._storePair(ids[L.i], ids[L.j], L.eid, L.distanceM, L.geometry, L.physicalSegmentKeys, true, null, L.steps);
       } else {
         this._storePair(ids[L.i], ids[L.j], null, null, [], [], false);
       }
@@ -430,28 +471,49 @@ class AmapAreaGraph {
 }
 
 /** 构建真实闲逛"场所包"（结构同演示包，数据来源标注为高德实时查询） */
-async function buildAmapAreaPack(cfg, origin, budgetSec) {
+async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint) {
   // 检索半径=步行可达圈：闲逛者不会把 1.5 小时花在"赶路去 4km 外"上。
   // 此前 (budgetSec/3600)*2500 封顶 4000m——两小时的闲逛也在 4km 半径找点，
   // 候选间实际步行 1-3km，每站光交通就吃掉 15-30 分钟，半天只装得下两三站（2026-10-01 修）。
   const radiusM = Math.min(2500, Math.max(1000, Math.round((budgetSec / 3600) * 700)));
-  const rawCands = await searchAround(cfg, origin, radiusM);
+  const end = endpoint && Number.isFinite(endpoint.lng) && haversineM(origin, endpoint) > END_NODE_MIN_M ? endpoint : null;
+  let rawCands = await searchAround(cfg, origin, radiusM);
+  if (end) {
+    // A→B 型路线：候选不能只围着起点找，否则最后一站必然离终点很远、只能"空走"过去。
+    // 终点较远时再围绕终点检索一次，并按"顺路程度"（绕行椭圆）过滤：顺路经过它多走的距离不超过 detourMax。
+    const odM = haversineM(origin, end);
+    if (odM > radiusM * 0.5) {
+      try {
+        const near = await searchAround(cfg, end, radiusM);
+        const seen = new Set(rawCands.map((c) => c.id));
+        for (const c of near) if (!seen.has(c.id)) { seen.add(c.id); rawCands.push(c); }
+      } catch (e) { /* 终点周边检索失败不影响主流程 */ }
+    }
+    const detourMax = Math.max(radiusM, odM * 0.6);
+    for (const c of rawCands) {
+      c.distanceM = Math.round(haversineM(origin, c));
+      c.detourM = Math.round(detourM(origin, c, end));
+    }
+    rawCands = rawCands.filter((c) => c.detourM <= detourMax);
+  }
   // 粗筛：按类型分桶保证多样性，每桶取最近 4 个，再按预算取前 8~12 进精算（§7.4 评分压缩）。
   // 候选数同时受路由矩阵配额约束：配额必须够抓满"起点 + 候选"的两两组合，
   // 否则末尾的候选拿不到任何 OD 边、永远排不进多站路线（2026-09-30 修）。
   const buckets = new Map();
-  for (const c of rawCands.sort((a, b) => a.distanceM - b.distanceM)) {
+  const nearKey = (c) => (end ? c.detourM : c.distanceM); // 有终点时"近"指顺路，而不是离起点近
+  for (const c of rawCands.sort((a, b) => nearKey(a) - nearKey(b))) {
     const key = c.tags[0];
     if (!buckets.has(key)) buckets.set(key, []);
     if (buckets.get(key).length < 4) buckets.get(key).push(c);
   }
   const capByBudget = budgetSec >= 10800 ? 12 : 8; // 3 小时以上放宽池子，半天不该只有五六个可选点
-  const cap = Math.min(capByBudget, maxCandidatesForQuota(cfg.limits.maxRoutingCalls));
+  // 多一个终点节点就多一行 OD，候选上限相应少 1，保证矩阵仍能抓满
+  const cap = Math.max(1, Math.min(capByBudget, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - (end ? 1 : 0)));
   const cands = [...buckets.values()].flat()
-    .sort((a, b) => b.scenic - a.scenic || a.distanceM - b.distanceM)
+    .sort((a, b) => b.scenic - a.scenic || nearKey(a) - nearKey(b))
     .slice(0, cap);
-  const graph = new AmapAreaGraph(cfg, origin, budgetSec);
-  await graph.init(cands, { cacheKey: matrixCacheKeyOf('area', origin, cands.map((c) => c.id)) });
+  const graph = new AmapAreaGraph(cfg, origin, budgetSec, end);
+  await graph.init(cands, { cacheKey: matrixCacheKeyOf('area', origin, [...(end ? [endKeyOf(end)] : []), ...cands.map((c) => c.id)]) });
   const usable = cands.filter((c) => graph.nodes.has(c.id));
   const pack = {
     venue: {
@@ -459,7 +521,7 @@ async function buildAmapAreaPack(cfg, origin, budgetSec) {
       city: '', timezone: 'Asia/Shanghai', packVersion: 'amap-live-' + new Date().toISOString().slice(0, 10),
       coverageScope: { kind: 'poi', scopeLabel: `周边 ${radiusM}m 内检索到的 ${usable.length} 个候选点` },
       center: { lng: origin.lng, lat: origin.lat, crs: 'GCJ02' },
-      entrances: ['am_origin'], openWindows: [['00:00', '24:00']],
+      entrances: graph.endNodeId ? ['am_origin', 'am_end'] : ['am_origin'], openWindows: [['00:00', '24:00']],
     },
     nodes: [...graph.nodes.values()],
     edges: [...graph._edges.values()].map((e) => ({ ...e, bikeAllowed: false, closed: false, evidenceIds: ['ev_amap_live'] })),
@@ -487,4 +549,4 @@ async function buildAmapAreaPack(cfg, origin, budgetSec) {
   return { pack, graph };
 }
 
-module.exports = { searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };
+module.exports = { detourM, endKeyOf, END_NODE_MIN_M, searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };

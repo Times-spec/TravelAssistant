@@ -98,7 +98,7 @@ class VenueGraph {
 }
 
 /* ================= 推荐层：候选评分（§7.4 / §8.3 软得分归一化） ================= */
-function scoreCandidates(pack, intent, graph, originNodeId) {
+function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
   const interestTags = new Set(intent.interests.map((i) => i.tag));
   const avoid = new Set(intent.hard.avoidPoiIds);
   const out = [];
@@ -112,7 +112,14 @@ function scoreCandidates(pack, intent, graph, originNodeId) {
     const costPenalty = intent.soft.freePreferred && poi.ticketKnown && poi.ticketCny > 0 ? 0.3 : 0;
     const quietBonus = intent.soft.quietPreferred && ['自然', '公园湿地'].some((t) => poi.tags.includes(t)) ? 0.1 : 0;
     const distM = graph.route(originNodeId, poi.entranceNode).distanceM ?? 5000;
-    const distPenalty = clamp(distM / 2000, 0, 1);
+    // A→B 型路线：远近按"顺路程度"算（经过它比直接去终点多走多少），而不是离起点多远——
+    // 否则靠近终点的好点永远被扣分，末站只能落在起点附近，最后空走一大段去终点。
+    let distPenalty = clamp(distM / 2000, 0, 1);
+    if (endNodeId && endNodeId !== originNodeId) {
+      const toEnd = graph.route(poi.entranceNode, endNodeId).distanceM;
+      const direct = graph.route(originNodeId, endNodeId).distanceM;
+      if (toEnd != null && direct != null) distPenalty = clamp(Math.max(0, distM + toEnd - direct) / 2 / 2000, 0, 1);
+    }
     const coverageBonus = intent.objective === 'poi_coverage' ? 0.35 : 0;
     // relax 取向："宁缺毋滥"只惩罚真正低质的兜底点（真实街点 scenic 0.4-0.6 不再被一刀切扣分
     // ——此前的 -0.25 会把整条街区压到收益门槛之下，半天只排得进两三站，2026-10-01 修）
@@ -146,7 +153,7 @@ function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
     }
     const travelSec = Math.round(r.distanceM / speed);
     const arrival = t + travelSec * 1000;
-    legs.push({ fromNodeId: prevNode, toNodeId: nodeId, mode: 'walk', distanceM: r.distanceM, travelSec, edgeIds: r.edgeIds, geometry: r.geometry, physicalSegmentKeys: r.physicalSegmentKeys || null, repeatDetection: r.repeatDetection || 'edge-id-exact', provider: r.provider || null });
+    legs.push({ fromNodeId: prevNode, toNodeId: nodeId, mode: 'walk', distanceM: r.distanceM, travelSec, edgeIds: r.edgeIds, geometry: r.geometry, physicalSegmentKeys: r.physicalSegmentKeys || null, repeatDetection: r.repeatDetection || 'edge-id-exact', provider: r.provider || null, steps: r.steps || null });
     const poi = poiById.get(nodeId);
     if (!poi) { // 途经纯节点（理论上 nodeSeq 都是 POI，防御）
       t = arrival; prevNode = nodeId; continue;
@@ -240,7 +247,7 @@ function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
       problems.push({ nodeId: endNodeId, code: r.code || (traversal.hard.noRepeatedEdges ? 'end_requires_repeated_edge' : 'end_unreachable') });
       return { ok: false, problems, constraintMetrics: traversal.metrics() };
     }
-    endLeg = { fromNodeId: prevNode, toNodeId: endNodeId, mode: 'walk', distanceM: r.distanceM, travelSec: Math.round(r.distanceM / speed), edgeIds: r.edgeIds, geometry: r.geometry, physicalSegmentKeys: r.physicalSegmentKeys || null, repeatDetection: r.repeatDetection || 'edge-id-exact', provider: r.provider || null, isReturnLeg: true };
+    endLeg = { fromNodeId: prevNode, toNodeId: endNodeId, mode: 'walk', distanceM: r.distanceM, travelSec: Math.round(r.distanceM / speed), edgeIds: r.edgeIds, geometry: r.geometry, physicalSegmentKeys: r.physicalSegmentKeys || null, repeatDetection: r.repeatDetection || 'edge-id-exact', provider: r.provider || null, steps: r.steps || null, isReturnLeg: true };
   }
   const endArrivalMs = t + (endLeg ? endLeg.travelSec * 1000 : 0);
 
@@ -337,12 +344,13 @@ function solveOnce(pack, intent, graph, policy) {
       ? intent.endpoint.entranceId
       : (intent.endpoint.poiId && graph.nodeById.has(intent.endpoint.poiId)
         ? intent.endpoint.poiId
-        : graph.nearestNode(intent.endpoint.point).node.id);
+        // 实时路网单独建了终点节点就用它；否则才退回"最近节点"（演示包里终点本身就是路网节点）
+        : (graph.endNodeId || graph.nearestNode(intent.endpoint.point).node.id));
   } else {
     endNodeId = null; // flexible：求解后在候选端口中选总耗时最小者
   }
 
-  const cands = scoreCandidates(pack, intent, graph, startNodeId);
+  const cands = scoreCandidates(pack, intent, graph, startNodeId, endNodeId);
   if (!cands.length) {
     // 零候选但终点可达 → "直接结束/返程"也是合法方案（疲劳提前结束、我要回去了）
     const emptySch = scheduleRoute(pack, intent, graph, [], { startNodeId, endNodeId: endNodeId || startNodeId });
@@ -466,7 +474,7 @@ function solveOnce(pack, intent, graph, policy) {
     //    又会为了少等 15 秒开门而接受"多走 200 米"的换序（2026-09-30 修）。
     //    接受任何一次改进都立刻重开一轮：试算必须始终基于同一个 seq，否则会把旧快照和新序列混起来。
     let bestSch = trySchedule(seq);
-    if (bestSch && seq.length >= 3) {
+    if (bestSch && seq.length >= 2) { // 2 站也要试换序：否则"末站离终点远"在两站路线上永远修不掉
       const budget = Math.max(240, seq.length * seq.length * 4); // 评估次数上限：换序不把规划时间拖长
       let evals = 0;
       const tryMove = (trial) => {
@@ -592,9 +600,25 @@ function validatePlan(pack, intent, graph, solved) {
     const overlapM = returnOverlapM(schedule);
     warnings.push({
       code: 'RETURN_BACKTRACK',
+      // "不重叠"是好消息，不该挂 ⚠：用 level 区分提示与警告，前端据此换图标
+      level: overlapM > 0 ? 'warn' : 'info',
       message: overlapM > 0
         ? `返程约 ${Math.round(schedule.endLeg.distanceM)}m，其中约 ${overlapM}m 沿去程走回（回到起点的必经通勤）`
-        : '返程与去程路段不重叠',
+        : `返程约 ${Math.round(schedule.endLeg.distanceM)}m，走的是一条新路，不与去程重叠`,
+      evidenceIds: [],
+    });
+  } else if (schedule.endLeg && schedule.stops.length) {
+    // A→B 型路线：末站离终点有多远要说清楚。过长时解释原因，而不是让用户在地图上看到"走完最后一站又空走一大段"。
+    const lastName = schedule.stops[schedule.stops.length - 1].poi.name;
+    const endM = Math.round(schedule.endLeg.distanceM);
+    const total = schedule.totals.distanceM || 1;
+    const long = endM > Math.max(800, total * 0.35);
+    warnings.push({
+      code: long ? 'END_APPROACH_LONG' : 'END_APPROACH',
+      level: long ? 'warn' : 'info',
+      message: long
+        ? `末站「${lastName}」到终点还有约 ${endM}m（步行约 ${Math.round(schedule.endLeg.travelSec / 60)} 分钟）：终点附近没有符合偏好且时间装得下的点，这段是去终点的必要通勤`
+        : `末站「${lastName}」离终点约 ${endM}m，逛完顺路就到`,
       evidenceIds: [],
     });
   }
@@ -721,6 +745,7 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
     provider: l.provider || 'demo-venue-network',
     verifiedAt: pack.evidence[0] ? pack.evidence[0].retrievedAt : null,
     isReturnLeg: i === allLegs.length - 1 && !!schedule.endLeg && l === schedule.endLeg,
+    steps: Array.isArray(l.steps) && l.steps.length ? l.steps : undefined, // 高德逐步导引（反向复用的路段没有，前端按几何合成）
   }));
 
   const routeId = id('rt');
@@ -756,6 +781,17 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
     sightRepeatRatio: Math.round(sightRepeat.repeatRatio * 100) / 100,
     sightRepeatedDistanceM: Math.round(sightRepeat.repeatedDistanceM),
     returnOverlapM: returnOverlap,
+    // 末站→终点：前端用它画"回终点"段、在规划页解释最后一段为什么要走
+    endApproach: schedule.endLeg ? {
+      endNodeId: schedule.endLeg.toNodeId,
+      endName: (graph.nodeById.get(schedule.endLeg.toNodeId) || {}).name || null,
+      endCoord: (() => { const n = graph.nodeById.get(schedule.endLeg.toNodeId); return n ? [n.lng, n.lat] : null; })(),
+      fromName: schedule.stops.length ? schedule.stops[schedule.stops.length - 1].poi.name : null,
+      distanceM: Math.round(schedule.endLeg.distanceM),
+      travelSec: schedule.endLeg.travelSec,
+      returnTrip: solved.endNodeId === solved.startNodeId,
+      overlapM: returnOverlap,
+    } : null,
     coverage: {
       kind: 'poi',
       visitedTargetIds,
@@ -977,7 +1013,7 @@ function buildTimeConflict(pack, intent, graph, seq, startNodeId, endNodeId) {
     suggestions.push({ action: 'remove_stop', label: `去掉「${last ? last.name : '最后一站'}」`, effect: '释放约 20-30 分钟' });
   }
   if (intent.endpoint.mode === 'fixed' && pack.venue.entrances.length > 1) {
-    const other = pack.venue.entrances.find((e) => e !== endNodeId);
+    const other = pack.venue.entrances.find((e) => e !== endNodeId && e !== 'am_origin');
     if (other) suggestions.push({ action: 'change_endpoint', label: `改从${graph.nodeById.get(other).name}结束`, effect: '可能缩短返程' });
   }
   suggestions.push({ action: 'extend_time', label: '延后 30 分钟', effect: '预算增加 30 分钟' });

@@ -788,7 +788,10 @@ function nearestNode(pack, pt, proj) {
   return best ? { node: best, distanceM: bestD } : null;
 }
 
-export function drawPackBase(map, pack, proj) {
+// opts.quiet：路线页/游览页用——场所底网弱化、普通点位不出标签（站点标签由路线层负责），
+// 否则底图标签与路线站点标签叠在一起，地图上全是字
+export function drawPackBase(map, pack, proj, opts = {}) {
+  const quiet = !!opts.quiet;
   const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
   for (const n of pack.nodes) {
     const p = proj.toXY(n);
@@ -803,17 +806,17 @@ export function drawPackBase(map, pack, proj) {
     map.el('line', {
       x1: pa.x, y1: pa.y, x2: pb.x, y2: pb.y,
       stroke: e.closed ? '#d97706' : '#b9c8c0', 'stroke-width': e.closed ? 2 : 3,
-      'stroke-dasharray': e.closed ? '6 5' : 'none', 'stroke-linecap': 'round', opacity: 0.8,
+      'stroke-dasharray': e.closed ? '6 5' : 'none', 'stroke-linecap': 'round', opacity: quiet ? 0.55 : 0.8,
     });
   }
   for (const n of pack.nodes) {
     const p = proj.toXY(n);
     if (n.type === 'entrance') {
-      map.el('rect', { x: p.x - 7, y: p.y - 7, width: 14, height: 14, rx: 3, fill: '#0f6f4f' });
-      drawMapLabel(map, p, n.name, -10);
+      map.el('rect', { x: p.x - 6, y: p.y - 6, width: 12, height: 12, rx: 3, fill: quiet ? '#7c9a8c' : '#0f6f4f' });
+      drawMapLabel(map, p, n.name, quiet ? 18 : -10, quiet ? '#5a6a62' : undefined);
     } else if (n.type === 'poi') {
-      map.el('circle', { cx: p.x, cy: p.y, r: 5, fill: '#fff', stroke: '#8aa398', 'stroke-width': 2 });
-      drawMapLabel(map, p, n.name, -9);
+      map.el('circle', { cx: p.x, cy: p.y, r: quiet ? 3.5 : 5, fill: '#fff', stroke: '#8aa398', 'stroke-width': 2 });
+      if (!quiet) drawMapLabel(map, p, n.name, -9);
     }
   }
   map.fit(bounds, 50);

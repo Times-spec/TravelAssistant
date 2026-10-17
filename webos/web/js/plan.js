@@ -1,6 +1,7 @@
 // 路线页：真实阶段进度（SSE）+ 主推荐/备选 + 地图 + 时间轴 + 站点编辑（§9.2/§10）
 import { get, post, subscribeJob } from './api.js';
-import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, fmtMin, fmtKm, fmtClock, loadAmap, AmapRouteMap, svgTurnMarkers } from './ui.js';
+import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, fmtMin, fmtKm, fmtClock, loadAmap, AmapRouteMap } from './ui.js';
+import { legStates, legendEl, renderSvgRoute } from './routeview.js';
 import { state, getVenuePack } from './app.js';
 import { buildIntentPayload } from './home.js';
 import { drawPackBase, drawMapLabel } from './home.js';
@@ -286,7 +287,10 @@ export function renderPlan(view, ctx, planId) {
           + (v.sightRepeatRatio > 0.05 ? `；其中游览段约 ${Math.round(v.sightRepeatRatio * 100)}% 为死胡同/唯一通道等必要重复` : '')
           + (v.returnOverlapM > 50 ? `；返程约 ${fmtKm(v.returnOverlapM)} 沿去程走回（回起点的必经通勤）` : '')) : null,
         tradeoffText(versions, v) ? h('div', { class: 'rc-tradeoff' }, tradeoffText(versions, v)) : null,
-        (v.warnings || []).map((w) => h('div', { class: 'rc-warn' }, '⚠ ' + w.message)));
+        // level=info 的是说明（如"返程走新路不重叠""末站离终点很近"），不该和真正的风险一样挂 ⚠
+        (v.warnings || []).map((w) => w.level === 'info'
+          ? h('div', { class: 'rc-info' }, 'ℹ ' + w.message)
+          : h('div', { class: 'rc-warn' }, '⚠ ' + w.message)));
     };
     routesBox.append(render(versions[0], 0));
     if (versions.length > 1) {
@@ -333,6 +337,20 @@ export function renderPlan(view, ctx, planId) {
     mapWrap.classList.remove('hidden');
     mapWrap.innerHTML = '';
     const isDemoMap = (v.legs[0].provider || '').startsWith('demo');
+    // 规划页 = 全程总览：游览段一种颜色带方向箭头，末站→终点用虚线单独区分；不画转向箭头（那是走起来才需要的）
+    const states = legStates(v, null);
+    const aToB = v.endApproach && !v.endApproach.returnTrip;
+    const legend = (pack) => {
+      const el = legendEl(h, states, [['#0f6f4f', '站点'], ...(aToB ? [['#c2410c', '终点']] : [])]);
+      if (pack && (pack.edges || []).some((e) => e.closed)) el.append(h('span', { class: 'lg-item' }, h('i', { class: 'lg-line', style: 'border-top:2px dashed #d97706' }), '封闭路段'));
+      return el;
+    };
+    const endNote = () => {
+      const ea = v.endApproach;
+      if (!ea || ea.returnTrip || !ea.fromName) return null;
+      return h('div', { class: 'map-endnote' + (ea.distanceM > 800 ? ' far' : '') },
+        `末站「${ea.fromName}」→ 终点「${ea.endName || '终点'}」：步行 ${fmtKm(ea.distanceM)}，约 ${fmtMin(ea.travelSec)}`);
+    };
     // 真实路线：优先高德 JS 底图（§5.5 安全密钥浏览器端配置）；失败回退 SVG 路网渲染
     if (!isDemoMap && state.config.amapJsKey) {
       try {
@@ -340,10 +358,11 @@ export function renderPlan(view, ctx, planId) {
         if (seq !== loadSeq) return;
         if (amapMap) { amapMap.destroy(); amapMap = null; }
         const div = h('div', {});
-        mapWrap.append(div, h('div', { class: 'map-note' }, '高德真实路网 · 可拖动缩放'));
+        mapWrap.append(div);
         const rm = new AmapRouteMap(div, { AMap, height: 300 });
         amapMap = rm;
-        rm.renderRoute(v, {});
+        rm.renderRoute(v, { states, labels: 'all' });
+        mapWrap.append(...[legend(), endNote()].filter(Boolean));
         return;
       } catch (e) {
         mapWrap.innerHTML = '';
@@ -360,33 +379,14 @@ export function renderPlan(view, ctx, planId) {
     const firstPt = v.legs[0].geometry.coordinates[0];
     const center = pack ? pack.venue.center : { lng: firstPt[0], lat: firstPt[1] };
     const proj = makeProjector(center);
-    map = new SvgMap(mapWrap, { height: 300 });
-    const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-    const grow = (p) => { bounds.minX = Math.min(bounds.minX, p.x); bounds.maxX = Math.max(bounds.maxX, p.x); bounds.minY = Math.min(bounds.minY, p.y); bounds.maxY = Math.max(bounds.maxY, p.y); };
-    if (pack) {
-      drawPackBase(map, pack, proj);
-    }
-    // 路线：真实路段几何（§10.2 已走/未走在游览页区分）
-    for (const leg of v.legs) {
-      const pts = leg.geometry.coordinates.map(([lng, lat]) => proj.toXY({ lng, lat }));
-      pts.forEach(grow);
-      const d = pts.map((p, i) => (i ? 'L' : 'M') + p.x + ' ' + p.y).join(' ');
-      map.el('path', { d, fill: 'none', stroke: leg.isReturnLeg ? '#1d4ed8' : '#e8a13c', 'stroke-width': 4.5, 'stroke-linecap': 'round', 'stroke-dasharray': leg.isReturnLeg ? '8 6' : 'none', opacity: 0.95 });
-    }
-    // 起终点与编号站点
-    v.stops.forEach((s, i) => {
-      const p = proj.toXY({ lng: s.coord[0], lat: s.coord[1] });
-      grow(p);
-      map.el('circle', { cx: p.x, cy: p.y, r: 11, fill: '#0f6f4f', stroke: '#fff', 'stroke-width': 2.5 });
-      const t = map.el('text', { x: p.x, y: p.y + 4, 'font-size': 11, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
-      t.textContent = i + 1;
-      drawMapLabel(map, p, s.name, -17);
-    });
+    const svgBox = h('div', { class: 'svg-box' });
+    mapWrap.append(svgBox);
+    map = new SvgMap(svgBox, { height: 300 });
+    if (pack) drawPackBase(map, pack, proj, { quiet: true });
+    const { bounds } = renderSvgRoute(map, v, proj, { states, labels: 'all', drawLabel: drawMapLabel });
     if (!pack) map.fit(bounds, 60);
-    svgTurnMarkers(map, v.legs, proj);
-    const sp = proj.toXY({ lng: firstPt[0], lat: firstPt[1] });
-    drawMapLabel(map, sp, '起点', 22, '#0f6f4f');
-    mapWrap.append(h('div', { class: 'map-note' }, isDemoMap ? '演示地图（虚构场所数据）· 可拖动缩放' : '高德真实路网（示意） · 可拖动缩放'));
+    svgBox.append(h('div', { class: 'map-note' }, isDemoMap ? '演示地图（虚构场所数据）· 可拖动缩放' : '路网示意图 · 可拖动缩放'));
+    mapWrap.append(...[legend(pack), endNote()].filter(Boolean));
   }
 
   async function getIntentOfPlan() {
@@ -429,7 +429,7 @@ export function renderPlan(view, ctx, planId) {
             editMode && !s.locked ? h('button', { class: 'btn btn-danger btn-sm', onclick: () => removeStop(v, s) }, '移除') : null),
           leg && i === 0 ? h('div', { class: 'tl-leg' }, `从起点步行 ${fmtKm(leg.distanceM)} · 约 ${fmtMin(leg.travelSec)}`) : null,
           v.legs[i + 1] && i < v.stops.length - 1 ? h('div', { class: 'tl-leg' }, `去下一站：步行 ${fmtKm(v.legs[i + 1].distanceM)} · 约 ${fmtMin(v.legs[i + 1].travelSec)}`) : null,
-          i === v.stops.length - 1 && v.legs[v.stops.length] ? h('div', { class: 'tl-leg' }, `返回终点：步行 ${fmtKm(v.legs[v.stops.length].distanceM)} · 约 ${fmtMin(v.legs[v.stops.length].travelSec)}（含 ${fmtMin(v.totals.bufferSec)} 机动时间）`) : null));
+          i === v.stops.length - 1 && v.legs[v.stops.length] ? h('div', { class: 'tl-leg' }, `${!v.endApproach ? '返回终点' : v.endApproach.returnTrip ? '返回起点' : '去终点' + (v.endApproach.endName ? '「' + v.endApproach.endName + '」' : '')}：步行 ${fmtKm(v.legs[v.stops.length].distanceM)} · 约 ${fmtMin(v.legs[v.stops.length].travelSec)}（另留 ${fmtMin(v.totals.bufferSec)} 机动时间）`) : null));
       tl.append(item);
     });
     timelineBox.append(card);

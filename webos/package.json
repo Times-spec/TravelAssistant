@@ -13,6 +13,7 @@
     "test": "node scripts/acceptance.js",
     "test:planner-constraints": "node scripts/planner-constraints.js",
     "test:planner-ordering": "node scripts/planner-ordering.js",
+    "test:planner-endpoint": "node scripts/planner-endpoint.js",
     "test:route-strategies": "node scripts/compare-route-strategies.js"
   }
 }

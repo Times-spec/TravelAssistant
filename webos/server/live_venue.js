@@ -8,7 +8,7 @@
  * - 开放时间/门票高德不提供 → 标记 unknown，方案标为条件性；
  * - 路段一律走高德步行路径规划（真实折线），没有真实路由的边标 unreachable，绝不用直线顶替。
  */
-const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf } = require('./amap');
+const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf } = require('./amap');
 const { haversineM } = require('./geo');
 
 const VENUE_TYPECODES = ['110101', '110102', '110103', '110105', '110200', '110202', '141201', '141200'];
@@ -209,14 +209,18 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
 /** 构建真实场所的路网/图（含路由矩阵；起点由调用方给出） */
 async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
   const resolved = await resolveVenue(cfg, venueRef, budgetSec, opts);
+  const endpoint = opts.endpoint || null;
   const originPoint = origin && Number.isFinite(origin.lng) ? origin : { ...resolved.center, label: venueRef.name };
-  const graph = new AmapAreaGraph(cfg, { ...originPoint, label: originPoint.label || '当前位置' }, budgetSec);
+  // 指定了终点（如"从南门进、北门出"）就把终点建成独立节点，末站→终点这段才会参与排序
+  const graph = new AmapAreaGraph(cfg, { ...originPoint, label: originPoint.label || '当前位置' }, budgetSec, endpoint);
+  const hasEnd = !!graph.endpoint;
 
   // 节点 = 起点 + 场内点位（含入口）；入口作为可选"起点/终点"节点
-  const cands = resolved.pois.map((p) => ({
+  let cands = resolved.pois.map((p) => ({
     id: p.id, name: p.shortName, lng: p.lng, lat: p.lat,
   }));
-  await graph.init(cands, { cacheKey: matrixCacheKeyOf('venue:' + venueRef.id, originPoint, cands.map((c) => c.id)) });
+  if (hasEnd) cands = cands.slice(0, Math.max(1, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - 1));
+  await graph.init(cands, { cacheKey: matrixCacheKeyOf('venue:' + venueRef.id, originPoint, [...(hasEnd ? [endKeyOf(graph.endpoint)] : []), ...cands.map((c) => c.id)]) });
 
   const usable = resolved.pois.filter((p) => graph.nodes.has(p.id));
   const venueId = venueRef.id;
@@ -232,7 +236,7 @@ async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
         scopeLabel: `高德在园内检索到的 ${usable.length} 个点位（非园区完整清单）`,
       },
       center: { lng: resolved.center.lng, lat: resolved.center.lat, crs: 'GCJ02' },
-      entrances: ['am_origin'],
+      entrances: graph.endNodeId ? ['am_origin', 'am_end'] : ['am_origin'],
       openWindows: null,
       live: true,
     },

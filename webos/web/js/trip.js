@@ -1,6 +1,7 @@
 // 游览执行页：下一站优先 + 到站确认 + 快捷重排（提议—确认—提交）+ 讲解播放（§11/§12）
 import { get, post, subscribeJob } from './api.js';
-import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, fmtMin, fmtKm, fmtClock, loadAmap, AmapRouteMap, svgTurnMarkers } from './ui.js';
+import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, fmtMin, fmtKm, fmtClock, loadAmap, AmapRouteMap } from './ui.js';
+import { legStates, legendEl, renderSvgRoute, legGuidance, projectOnLeg, activeStepIdx, wgs84ToGcj02, distM, stepIconSvg, roundM } from './routeview.js';
 import { state, getVenuePack } from './app.js';
 import { drawPackBase, drawMapLabel } from './home.js';
 
@@ -12,6 +13,12 @@ export function renderTrip(view, ctx, tripId) {
   let speaking = false;
   let routeMap = null; // 当前高德底图实例：重渲染先销毁旧实例，避免 WebGL 上下文泄漏
   let renderSeq = 0;   // 渲染代际计数：并发 reload（到站/切前台/可见性）时旧渲染作废
+  // 地图视角："本段"只看当前要走的这一段 + 我的位置（默认）；"全程"看整条路线。
+  // 此前地图永远 fit 全程、所有未走路段同色同粗还带满屏转向箭头，"去下一站怎么走"淹没在全局里。
+  let mapMode = 'leg';
+  let lastPos = null;   // { pt:[lng,lat] GCJ-02, acc, at }
+  let liveHooks = [];   // 定位更新时只刷新这些局部（剩余距离、当前步、到站提示），不整页重绘
+  let svgView = null;   // SVG 降级地图的状态（重绘/取景/我的位置）
 
   // 途中调整的可点选项（AI 兜底路径与服务端 cause 一一对应）
   const quick = [
@@ -60,9 +67,16 @@ export function renderTrip(view, ctx, tripId) {
     return route.startNodeId;
   }
 
+  function endNameOf(route) {
+    if (route.endApproach && route.endApproach.endName) return route.endApproach.endName;
+    return String(route.endLabel || '终点').replace(/^终点：|^返回|^顺路结束于/, '') || '终点';
+  }
+
   async function render() {
     const seq = ++renderSeq; // 重渲染代际：await 之后若已有更新的渲染，本轮作废
     root.innerHTML = '';
+    liveHooks = [];
+    svgView = null;
     const route = tripData.route;
     const trip = tripData.trip;
     if (!route) { root.append(h('div', { class: 'card empty' }, '路线数据缺失')); return; }
@@ -72,14 +86,41 @@ export function renderTrip(view, ctx, tripId) {
     }
     const next = nextStop();
     const v = visitedSet(), s = skippedSet();
+    const stopState = (st) => (v.has(st.poiId) ? 'done' : s.has(st.poiId) ? 'skip' : null);
 
-    /* 地图：已走/未走颜色+线型共同区分（§10.2）；真实路线优先高德底图 */
-    const nextIdx0 = next ? route.stops.findIndex((st) => st.poiId === next.poiId) : route.stops.length;
+    // 当前这段 = 通往下一站的那段；全部到站后 = 回终点那段
+    const nextIdx = next ? route.stops.findIndex((st) => st.poiId === next.poiId) : route.stops.length;
+    const curLeg = route.legs[nextIdx] || null;
+    const states = legStates(route, nextIdx);
+    const endName = endNameOf(route);
+    const target = next
+      ? { name: next.name, coord: next.coord, isEnd: false }
+      : curLeg ? { name: endName, coord: curLeg.geometry.coordinates[curLeg.geometry.coordinates.length - 1], isEnd: true } : null;
+
+    /* ① 站点进度条：起 → ✓1 → ●2 → 3 → 终（替代原来的一排 chips） */
+    root.append(progressStrip(route, stopState, next, endName, trip));
+
+    /* ② 地图：本段/全程切换 + 定位 + 图例 */
     const isDemoMap = route.legs.length && (route.legs[0].provider || '').startsWith('demo');
-    const mapWrap = h('div', { class: 'map-wrap' });
+    const mapWrap = h('div', { class: 'map-wrap trip-map' });
+    const mapBox = h('div', { class: 'map-box' });
+    const segLeg = h('button', { class: 'seg-btn' }, '本段');
+    const segAll = h('button', { class: 'seg-btn' }, '全程');
+    const syncSeg = () => { segLeg.classList.toggle('on', mapMode === 'leg'); segAll.classList.toggle('on', mapMode === 'all'); };
+    syncSeg();
+    const locBtn = h('button', { class: 'map-fab', title: '我的位置', 'aria-label': '我的位置' }, '◎');
+    mapWrap.append(mapBox,
+      h('div', { class: 'map-seg' }, segLeg, segAll),
+      locBtn);
     // 高德地图必须在容器挂载进文档后再创建：脱离文档的容器宽高为 0，
     // AMap 会把画布初始化成 0×0，地图从此一片空白（此前游览页地图空白的根因）
-    root.append(mapWrap);
+    const legend = legendEl(h, states, [['#1677ff', '下一站'], ['#8a9a92', '已到访']]);
+    root.append(mapWrap, legend);
+
+    const mapOpts = () => ({
+      states, currentIdx: curLeg ? nextIdx : null, nextPoiId: next ? next.poiId : null, stopState,
+      labels: mapMode === 'leg' ? 'key' : 'all', fit: mapMode === 'leg' && curLeg ? 'leg' : 'all',
+    });
     let usedAmap = false;
     if (!isDemoMap && state.config.amapJsKey) {
       try {
@@ -87,138 +128,236 @@ export function renderTrip(view, ctx, tripId) {
         if (seq !== renderSeq) return;
         if (routeMap) { routeMap.destroy(); routeMap = null; } // 到站/暂停/切回前台会重渲染
         const div = h('div', {});
-        mapWrap.append(div, h('div', { class: 'map-note' }, '高德真实路网 · 虚线=已走过/返程'));
-        const rm = new AmapRouteMap(div, { AMap, height: 260 });
+        mapBox.append(div);
+        const rm = new AmapRouteMap(div, { AMap, height: 300 });
         routeMap = rm;
-        rm.renderRoute(route, {
-          walkedUpto: nextIdx0,
-          nextPoiId: next ? next.poiId : null,
-          stopState: (st) => v.has(st.poiId) ? 'done' : s.has(st.poiId) ? 'skip' : null,
-        });
+        if (lastPos) rm.setUser(lastPos.pt, lastPos.acc);
+        rm.renderRoute(route, mapOpts());
         usedAmap = true;
       } catch (e) {
-        mapWrap.innerHTML = '';
+        mapBox.innerHTML = '';
       }
     }
     if (!usedAmap) {
-    let pack = null;
-    try {
-      const planInfo = await get('/v1/plans/' + route.planId);
-      pack = await getVenuePack({ id: planInfo.plan.venueId, ref: planInfo.plan.venueRef });
-    } catch (e) { /* 真实场所/片区无静态场所包时仅绘制路线 */ }
-    if (seq !== renderSeq) return;
-    const firstPt = route.legs[0].geometry.coordinates[0];
-    const proj = makeProjector(pack ? pack.venue.center : { lng: firstPt[0], lat: firstPt[1] });
-    const map = new SvgMap(mapWrap, { height: 260 });
-    const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-    const grow = (p) => { bounds.minX = Math.min(bounds.minX, p.x); bounds.maxX = Math.max(bounds.maxX, p.x); bounds.minY = Math.min(bounds.minY, p.y); bounds.maxY = Math.max(bounds.maxY, p.y); };
-    if (pack) drawPackBase(map, pack, proj);
-    route.legs.forEach((leg, i) => {
-      const walked = i < nextIdx0;
-      const pts = leg.geometry.coordinates.map(([lng, lat]) => proj.toXY({ lng, lat }));
-      pts.forEach(grow);
-      const d = pts.map((p, j) => (j ? 'L' : 'M') + p.x + ' ' + p.y).join(' ');
-      map.el('path', {
-        d, fill: 'none',
-        stroke: walked ? '#9aa7a1' : (leg.isReturnLeg ? '#1d4ed8' : '#e8a13c'),
-        'stroke-width': walked ? 3 : 4.5, 'stroke-linecap': 'round',
-        'stroke-dasharray': walked ? '3 6' : leg.isReturnLeg ? '8 6' : 'none',
-        opacity: walked ? 0.7 : 0.95,
-      });
-    });
-    route.stops.forEach((st, i) => {
-      const p = proj.toXY({ lng: st.coord[0], lat: st.coord[1] });
-      grow(p);
-      const done = v.has(st.poiId), skip = s.has(st.poiId), isNext = next && st.poiId === next.poiId;
-      map.el('circle', {
-        cx: p.x, cy: p.y, r: isNext ? 13 : 10,
-        fill: skip ? '#9aa7a1' : done ? '#6b7f76' : isNext ? '#e8a13c' : '#0f6f4f',
-        stroke: '#fff', 'stroke-width': 2.5,
-      });
-      const t = map.el('text', { x: p.x, y: p.y + 4, 'font-size': 11, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
-      t.textContent = skip ? '✕' : done ? '✓' : i + 1;
-      drawMapLabel(map, p, st.name, -17);
-    });
-    svgTurnMarkers(map, route.legs, proj, { walkedUpto: nextIdx0 });
-    if (!pack) map.fit(bounds, 60);
-    mapWrap.append(h('div', { class: 'map-note' }, (isDemoMap ? '演示地图（虚构场所数据）' : '高德真实路网（示意）') + ' · 灰色虚线=已走过'));
-    } // end !usedAmap
+      let pack = null;
+      try {
+        const planInfo = await get('/v1/plans/' + route.planId);
+        pack = await getVenuePack({ id: planInfo.plan.venueId, ref: planInfo.plan.venueRef });
+      } catch (e) { /* 真实场所/片区无静态场所包时仅绘制路线 */ }
+      if (seq !== renderSeq) return;
+      if (pack && (pack.edges || []).some((e) => e.closed)) legend.append(h('span', { class: 'lg-item' }, h('i', { class: 'lg-line', style: 'border-top:2px dashed #d97706' }), '封闭路段'));
+      const firstPt = route.legs[0].geometry.coordinates[0];
+      const proj = makeProjector(pack ? pack.venue.center : { lng: firstPt[0], lat: firstPt[1] });
+      const map = new SvgMap(mapBox, { height: 300 });
+      svgView = { map, proj, pack, userEl: null };
+      const draw = () => {
+        map.clear();
+        if (pack) drawPackBase(map, pack, proj, { quiet: true });
+        const r = renderSvgRoute(map, route, proj, { ...mapOpts(), drawLabel: drawMapLabel });
+        svgView.bounds = r.bounds; svgView.legBounds = r.legBounds; svgView.userEl = null;
+        drawSvgUser();
+        fitSvg(mapOpts().fit === 'leg' ? nextIdx : null);
+      };
+      svgView.draw = draw;
+      draw();
+      mapBox.append(h('div', { class: 'map-note' }, isDemoMap ? '演示地图（虚构场所数据）' : '路网示意图'));
+    }
+    const setMode = (m) => {
+      mapMode = m; syncSeg();
+      if (routeMap) routeMap.renderRoute(route, mapOpts());
+      else if (svgView) svgView.draw();
+    };
+    segLeg.onclick = () => setMode('leg');
+    segAll.onclick = () => setMode('all');
+    locBtn.onclick = () => locateMe();
 
-    /* 行程状态条 */
-    // 重排后新版本只含剩余站点，按"当前版本里的已完成数"会显示成"已完成 0/N"（2026-09-30 修）：
-    // 已到访按行程事件累计，剩余按当前版本算，两者分别说明。
-    const visitedTotal = new Set(tripData.events.filter((e) => e.type === 'arrive_confirm').map((e) => e.data.poiId)).size;
-    const remainingCount = route.stops.filter((st) => !v.has(st.poiId) && !s.has(st.poiId)).length;
-    root.append(h('div', { class: 'confirm-bar', style: 'margin-top:10px' },
-      h('span', { class: 'cchip' }, `已到访 ${visitedTotal} 站 · 剩余 ${remainingCount} 站`),
-      h('span', { class: 'cchip' }, `预计 ${fmtClock(route.endArrivalAt)} 到终点`),
-      h('span', { class: 'cchip' }, `路线 v${route.version}`),
-      trip.status === 'paused' ? h('span', { class: 'cchip', style: 'background:var(--warn-bg);color:var(--warn)' }, '已暂停') : null));
-
-    /* 到站提示（§11.5：定位辅助提示 + 一键确认；不自动判定） */
-    const hintBox = h('div', { style: 'margin-top:10px' });
+    /* ③ 到站提示（§11.5：定位辅助提示 + 一键确认；不自动判定） */
+    const hintBox = h('div', {});
     root.append(hintBox);
 
-    /* 下一站卡（导游视角：先说"到了看什么"，再说怎么走） */
+    /* ④ 下一站卡：先说去哪、还有多远，再说到了看什么 */
+    const remainEl = h('div', { class: 'ns-dist' });
+    const setRemain = (remainM, offM) => {
+      const m = remainM ?? (curLeg ? curLeg.distanceM : 0);
+      const sec = curLeg && curLeg.distanceM ? Math.round(curLeg.travelSec * (m / curLeg.distanceM)) : 0;
+      remainEl.innerHTML = '';
+      remainEl.append(...[ // 原生 append 会把 null 变成字符串 "null"，必须先过滤
+        h('b', {}, (remainM != null ? '还剩 ' : '') + fmtKm(m)),
+        ` · 步行约 ${fmtMin(sec)}`,
+        offM != null && offM > 60 ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, `偏离路线约 ${roundM(offM)}`) : null,
+      ].filter(Boolean));
+    };
     if (next) {
-      const legToNext = route.legs[nextIdx0];
+      setRemain(null);
       const teaserSlot = h('div', { class: 'guide-teaser' }, '看点准备中…');
-      const card = h('div', { class: 'card next-stop', style: 'margin-top:10px' },
-        h('p', { class: 'card-title' }, '下一站 · 看点'),
-        h('h3', {}, next.name, next.locked ? h('span', { class: 'tag lock' }, ' 必去') : null),
+      root.append(h('div', { class: 'card next-stop' },
+        h('div', { class: 'ns-kicker' }, `下一站 · 第 ${nextIdx + 1} / ${route.stops.length} 站`,
+          next.locked ? h('span', { class: 'tag lock', style: 'margin-left:6px' }, '必去') : null),
+        h('h3', { class: 'ns-name' }, next.name),
+        curLeg ? remainEl : null,
         teaserSlot,
-        h('div', { class: 'tl-meta', style: 'margin-top:8px' },
-          legToNext ? `走过去 ${fmtKm(legToNext.distanceM)}（约 ${fmtMin(legToNext.travelSec)}） · 建议停留 ${fmtMin(next.dwellSec)}` : `建议停留 ${fmtMin(next.dwellSec)}`),
-        next.openWindows ? h('div', { class: 'tl-meta' }, '开放：' + next.openWindows.map((w) => w.join('-')).join(' / ')) : null,
-        h('div', { class: 'tl-actions', style: 'margin-top:10px' },
-          h('button', { class: 'btn btn-primary btn-sm', style: 'padding:10px 18px', onclick: () => confirmArrive(next) }, '我已到达 ✓'),
+        h('div', { class: 'tl-meta' }, `建议停留 ${fmtMin(next.dwellSec)}`
+          + (next.openWindows ? ' · 开放 ' + next.openWindows.map((w) => w.join('-')).join(' / ') : '')),
+        h('button', { class: 'btn btn-primary btn-block', style: 'margin-top:10px', onclick: () => confirmArrive(next) }, '我已到达 ✓'),
+        h('div', { class: 'ns-actions' },
           h('button', { class: 'btn btn-ghost btn-sm', onclick: () => openGuideCard(next) }, '看讲解'),
           h('button', { class: 'btn btn-ghost btn-sm', onclick: () => askGuide(next) }, '问导游'),
-          h('button', { class: 'btn btn-ghost btn-sm', onclick: () => openExternalNav(next) }, '导航')),
-        h('div', { id: 'guide-slot' }));
-      root.append(card);
+          h('button', { class: 'btn btn-ghost btn-sm', onclick: () => openExternalNav(next) }, '高德导航 ↗')),
+        h('div', { id: 'guide-slot' })));
       loadTeaser(next, teaserSlot);   // 到站前就告诉用户"到了看什么"
-      startArrivalWatch(next, hintBox);
     } else {
-      root.append(h('div', { class: 'card next-stop', style: 'margin-top:10px' },
-        h('h3', {}, '所有站点已完成 🎉'),
-        h('div', { class: 'tl-meta' }, route.legs[route.legs.length - 1] && route.legs[route.legs.length - 1].isReturnLeg
-          ? `返回终点：步行 ${fmtKm(route.legs[route.legs.length - 1].distanceM)}`
-          : '可以结束游览了'),
-        h('div', { class: 'tl-actions', style: 'margin-top:10px' },
-          h('button', { class: 'btn btn-primary btn-sm', onclick: finish }, '结束游览'))));
-      if (watchId != null && navigator.geolocation) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+      if (curLeg) setRemain(null);
+      root.append(h('div', { class: 'card next-stop done' },
+        h('div', { class: 'ns-kicker' }, '所有站点已完成 🎉'),
+        h('h3', { class: 'ns-name' }, curLeg ? `去终点「${endName}」` : '可以结束游览了'),
+        curLeg ? remainEl : null,
+        h('button', { class: 'btn btn-primary btn-block', style: 'margin-top:10px', onclick: finish }, curLeg ? '已到终点，结束游览' : '结束游览'),
+        curLeg && target ? h('div', { class: 'ns-actions' },
+          h('button', { class: 'btn btn-ghost btn-sm', onclick: () => openExternalNav({ name: target.name, coord: target.coord }) }, '高德导航 ↗')) : null));
     }
 
-    /* 途中调整：一句话交给 AI，或用按钮兜底（§12.1） */
-    root.append(h('div', { class: 'card' },
-      h('button', { class: 'btn btn-primary btn-block', onclick: () => openAdjustSheet() }, '调整行程'),
-      h('div', { class: 'tl-meta', style: 'margin-top:6px' }, '可以直接说一句：我累了 / 跳过下一站 / 加一个地方')));
+    /* ⑤ 怎么走：当前这段的逐步导引（定位可用时高亮当前一步） */
+    let guide = null;
+    if (curLeg && target) {
+      guide = legGuidance(curLeg, target.name);
+      const items = guide.steps.map((st, i) => h('li', { class: 'gs-step' + (st.kind === 'arrive' ? ' arrive' : ''), 'data-i': i },
+        (() => { const ic = h('span', { class: 'gs-ico' }); ic.innerHTML = stepIconSvg(st.kind); return ic; })(),
+        h('div', { class: 'gs-body' },
+          h('div', { class: 'gs-title' }, st.title),
+          st.detail ? h('div', { class: 'gs-detail' }, st.detail) : null),
+        st.kind !== 'arrive' && st.kind !== 'start' ? h('span', { class: 'gs-at' }, roundM(st.startM) + ' 处') : null));
+      const list = h('ol', { class: 'gs-list' }, ...items);
+      const markStep = (idx) => items.forEach((li, i) => { li.classList.toggle('active', i === idx); li.classList.toggle('past', i < idx); });
+      markStep(0);
+      root.append(h('div', { class: 'card guide-steps' },
+        h('div', { class: 'row' },
+          h('p', { class: 'card-title', style: 'margin:0' }, `怎么走 · ${roundM(guide.totalM)}`),
+          h('span', { class: 'gs-src' }, guide.source === 'amap' ? '高德步行指引' : '按路线走向生成 · 以现场路牌为准')),
+        list));
+      liveHooks.push((pos) => {
+        const pr = projectOnLeg(curLeg, pos.pt);
+        if (!pr) return;
+        if (pr.offM <= 80) markStep(activeStepIdx(guide, pr.alongM));
+        setRemain(pr.offM <= 80 ? pr.remainM : null, pr.offM);
+      });
+    }
 
-    /* 剩余站点列表 */
-    const restCard = h('div', { class: 'card' },
-      h('p', { class: 'card-title' }, '行程单'),
+    /* 到站 / 到终点的定位提示 */
+    if (target) {
+      arrivalSamples = [];
+      liveHooks.push((pos) => {
+        if (pos.acc > 50) return; // 精度不足不提示（§11.5）
+        const d = distM(pos.pt, target.coord);
+        if (d > 40) { arrivalSamples = []; return; }
+        const now = Date.now();
+        arrivalSamples.push(now);
+        arrivalSamples = arrivalSamples.filter((t) => now - t < 20000); // 持续 20 秒多个合格采样
+        if (arrivalSamples.length < 2 || hintBox.hasChildNodes()) return;
+        hintBox.append(h('div', { class: 'arrive-hint' },
+          target.isEnd ? `📍 你好像已经到终点「${target.name}」附近了` : `📍 你好像已经到「${target.name}」附近了（定位推断，精度约 ${Math.round(pos.acc)}m）`,
+          h('div', { style: 'margin-top:6px' },
+            h('button', { class: 'btn btn-primary btn-sm', onclick: () => (target.isEnd ? finish() : confirmArrive(next, 'inferred')) }, target.isEnd ? '结束游览' : '是的，我到了'),
+            ' ',
+            h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { hintBox.innerHTML = ''; arrivalSamples = []; } }, '还没有'))));
+      });
+    }
+
+    /* ⑥ 行程单：默认折叠，需要时再展开 */
+    const visitedTotal = v.size;
+    root.append(h('details', { class: 'card itin' },
+      h('summary', {}, `行程单 · 共 ${route.stops.length} 站`, h('span', { class: 'itin-sub' }, `预计 ${fmtClock(route.endArrivalAt)} 到终点`)),
       ...route.stops.map((st, i) => {
         const done = v.has(st.poiId), skip = s.has(st.poiId);
-        return h('div', {
-          class: 'poi-result',
-          onclick: () => openGuideCard(st),
-        },
+        return h('div', { class: 'poi-result', onclick: () => openGuideCard(st) },
           h('div', { class: 'n', style: skip ? 'text-decoration:line-through;color:var(--ink-2)' : '' },
             `${i + 1}. ${st.name} `,
-            done ? h('span', { class: 'tag' }, '已到访') : skip ? h('span', { class: 'tag warn' }, '已跳过') : next && st.poiId === next.poiId ? h('span', { class: 'tag lock' }, '下一站') : null),
+            done ? h('span', { class: 'tag' }, '已到访') : skip ? h('span', { class: 'tag warn' }, '已跳过') : next && st.poiId === next.poiId ? h('span', { class: 'tag next' }, '下一站') : null),
           h('div', { class: 'a' }, `${fmtClock(st.visitStartAt)} - ${fmtClock(st.departureAt)} · ${st.tags.join('、')}`));
-      }));
-    root.append(restCard);
+      }),
+      h('div', { class: 'poi-result' },
+        h('div', { class: 'n' }, `终点 · ${endName}`),
+        h('div', { class: 'a' }, `预计 ${fmtClock(route.endArrivalAt)} 到达 · 已到访 ${visitedTotal} 站 · 路线 v${route.version}`))));
 
-    /* 底部操作 */
+    /* 底部操作：调整行程是游览中最常用的动作，放到主按钮位 */
     bottomBar.classList.remove('hidden');
     bottomBar.innerHTML = '';
     bottomBar.append(
       trip.status === 'active'
-        ? h('button', { class: 'btn btn-ghost', onclick: pauseTrip }, '暂停')
-        : h('button', { class: 'btn btn-ghost', onclick: resumeTrip }, '继续'),
-      h('button', { class: 'btn btn-primary', onclick: finish }, '结束游览'));
+        ? h('button', { class: 'btn btn-ghost bb-narrow', onclick: pauseTrip }, '暂停')
+        : h('button', { class: 'btn btn-ghost bb-narrow', onclick: resumeTrip }, '继续'),
+      h('button', { class: 'btn btn-primary', onclick: () => openAdjustSheet() }, '调整行程'),
+      h('button', { class: 'btn btn-ghost bb-narrow', onclick: finish }, '结束'));
+
+    ensureWatch();
+    if (lastPos) liveHooks.forEach((f) => f(lastPos));
+  }
+
+  function progressStrip(route, stopState, next, endName, trip) {
+    const nodes = [h('span', { class: 'pg-node pg-end' }, '起')];
+    route.stops.forEach((st, i) => {
+      const stt = stopState(st);
+      const isNext = next && st.poiId === next.poiId;
+      nodes.push(h('i', { class: 'pg-link' + (stt || isNext ? ' on' : '') }));
+      nodes.push(h('span', { class: 'pg-node' + (stt === 'done' ? ' done' : stt === 'skip' ? ' skip' : isNext ? ' next' : ''), title: st.name },
+        stt === 'done' ? '✓' : stt === 'skip' ? '✕' : String(i + 1)));
+    });
+    nodes.push(h('i', { class: 'pg-link' + (!next ? ' on' : '') }));
+    nodes.push(h('span', { class: 'pg-node pg-end' + (!next ? ' next' : ''), title: endName }, '终'));
+    const remaining = route.stops.filter((st) => !stopState(st)).length;
+    return h('div', { class: 'trip-progress' },
+      h('div', { class: 'pg-track' }, ...nodes),
+      h('div', { class: 'pg-sub' },
+        `剩 ${remaining} 站 · 预计 ${fmtClock(route.endArrivalAt)} 到终点`,
+        trip.status === 'paused' ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '已暂停') : null));
+  }
+
+  /* ---- SVG 降级地图：取景与我的位置 ---- */
+  function fitSvg(legIdx) {
+    if (!svgView) return;
+    const b = legIdx != null && svgView.legBounds[legIdx] ? { ...svgView.legBounds[legIdx] } : svgView.pack ? null : { ...svgView.bounds };
+    if (!b) return; // 演示场所：全程视角沿用场所底图的取景
+    if (legIdx != null && lastPos) {
+      const p = svgView.proj.toXY({ lng: lastPos.pt[0], lat: lastPos.pt[1] });
+      if (Math.hypot(p.x - (b.minX + b.maxX) / 2, p.y - (b.minY + b.maxY) / 2) < 1500) {
+        b.minX = Math.min(b.minX, p.x); b.maxX = Math.max(b.maxX, p.x); b.minY = Math.min(b.minY, p.y); b.maxY = Math.max(b.maxY, p.y);
+      }
+    }
+    svgView.map.fit(b, 50);
+  }
+  function drawSvgUser() {
+    if (!svgView || !lastPos) return;
+    const p = svgView.proj.toXY({ lng: lastPos.pt[0], lat: lastPos.pt[1] });
+    if (!svgView.userEl) {
+      svgView.userHalo = svgView.map.el('circle', { r: 14, fill: '#1677ff', opacity: 0.18 });
+      svgView.userEl = svgView.map.el('circle', { r: 6.5, fill: '#1677ff', stroke: '#fff', 'stroke-width': 2.5 });
+    }
+    for (const el of [svgView.userEl, svgView.userHalo]) { el.setAttribute('cx', p.x); el.setAttribute('cy', p.y); }
+  }
+
+  /* ---- 定位：一个持续 watch 服务地图蓝点、剩余距离、当前步与到站提示 ---- */
+  function onPosition(pos) {
+    const pt = wgs84ToGcj02(pos.coords.longitude, pos.coords.latitude); // 路线是 GCJ-02，设备给的是 WGS84
+    lastPos = { pt, acc: pos.coords.accuracy, at: Date.now() };
+    if (routeMap) routeMap.setUser(pt, lastPos.acc);
+    drawSvgUser();
+    liveHooks.forEach((f) => f(lastPos));
+  }
+  function ensureWatch() {
+    if (watchId != null || !navigator.geolocation) return;
+    // §5.1-7：开始游览后才启动持续定位；离开页面时清理
+    watchId = navigator.geolocation.watchPosition(onPosition, () => {}, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
+  }
+  function locateMe() {
+    if (!navigator.geolocation) { toast('当前环境不支持定位'); return; }
+    if (lastPos && Date.now() - lastPos.at < 30000) {
+      if (routeMap) routeMap.centerUser(); else fitSvg(null);
+      return;
+    }
+    toast('正在定位…', 1500);
+    navigator.geolocation.getCurrentPosition((pos) => {
+      onPosition(pos);
+      if (routeMap) routeMap.centerUser();
+    }, () => toast('无法获取定位，请检查定位权限'), { enableHighAccuracy: true, timeout: 10000 });
   }
 
   /* ---- 到站确认 ---- */
@@ -236,30 +375,6 @@ export function renderTrip(view, ctx, tripId) {
       // 导游行为：到站后直接把讲解端上来，而不是让用户自己找入口
       try { await openGuideCard(stop); } catch (e) { /* 讲解未就绪时静默 */ }
     } catch (e) { toast(e.message); }
-  }
-
-  function startArrivalWatch(stop, hintBox) {
-    hintBox.innerHTML = '';
-    if (watchId != null && navigator.geolocation) navigator.geolocation.clearWatch(watchId);
-    if (!navigator.geolocation) return;
-    // §5.1-7：开始游览后才启动持续定位；离开页面时清理
-    watchId = navigator.geolocation.watchPosition((pos) => {
-      const accuracy = pos.coords.accuracy;
-      if (accuracy > 50) return; // 精度不足不提示（§11.5）
-      const d = haversine(pos.coords.longitude, pos.coords.latitude, stop.coord[0], stop.coord[1]);
-      if (d > 40) { arrivalSamples = []; return; }
-      const now = Date.now();
-      arrivalSamples.push(now);
-      arrivalSamples = arrivalSamples.filter((t) => now - t < 20000); // 持续 20 秒多个合格采样
-      if (arrivalSamples.length >= 2 && !hintBox.hasChildNodes()) {
-        hintBox.append(h('div', { class: 'arrive-hint' },
-          `📍 你好像已经到「${stop.name}」附近了（定位推断，精度约 ${Math.round(accuracy)}m）`,
-          h('div', { style: 'margin-top:6px' },
-            h('button', { class: 'btn btn-primary btn-sm', onclick: () => confirmArrive(stop, 'inferred') }, '是的，我到了'),
-            ' ',
-            h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { hintBox.innerHTML = ''; arrivalSamples = []; } }, '还没有'))));
-      }
-    }, () => {}, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
   }
 
   function openExternalNav(stop) {
@@ -632,11 +747,4 @@ export function renderTrip(view, ctx, tripId) {
 
   reload().catch((e) => root.append(h('div', { class: 'card empty' }, e.message)));
   return () => cleanups.forEach((f) => f());
-}
-
-function haversine(lng1, lat1, lng2, lat2) {
-  const rad = Math.PI / 180;
-  const dLat = (lat2 - lat1) * rad, dLng = (lng2 - lng1) * rad;
-  const s = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLng / 2) ** 2;
-  return 2 * 6371000 * Math.asin(Math.sqrt(s));
 }

@@ -1,3 +1,4 @@
+import { LEG_STYLE, legStates, polylineTurns, turnWord, distM } from './routeview.js';
 // UI 工具：DOM 构建、toast、底部 sheet、SVG 地图组件（平移/缩放只改视图，不改行程 §10.3）
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -205,79 +206,16 @@ export function loadAmap(jsKey, securityCode) {
   return amapLoading;
 }
 
-function stopMarkerContent(text, bg) {
-  return `<div style="width:24px;height:24px;border-radius:50%;background:${bg};color:#fff;
-    display:flex;align-items:center;justify-content:center;font:700 13px/1 sans-serif;
-    border:2.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3)">${text}</div>`;
+function stopMarkerContent(text, bg, big) {
+  const d = big ? 30 : 24;
+  return `<div style="width:${d}px;height:${d}px;border-radius:50%;background:${bg};color:#fff;
+    display:flex;align-items:center;justify-content:center;font:700 ${big ? 14 : 12}px/1 sans-serif;
+    border:2.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3)${big ? ',0 0 0 6px rgba(22,119,255,.18)' : ''}">${text}</div>`;
 }
-
-/* ---------------- 岔路口转向检测 ----------------
- * 把各路段折线拼成连续轨迹，在方向变化超过阈值的顶点放置转向箭头。
- * 阈值/最小段长过滤掉步道自然弯曲，只留真实岔口级转向；近邻合并防曲线连发。 */
-function detectTurns(legs, walkedUpto, { minSegM = 14, turnDeg = 45, bigDeg = 72, mergeM = 30 } = {}) {
-  const raw = [];
-  (legs || []).forEach((leg, li) => {
-    if (li < walkedUpto) return; // 已走过的路段不再提示
-    for (const c of (leg.geometry && leg.geometry.coordinates) || []) raw.push(c);
-  });
-  const pts = [];
-  for (const c of raw) {
-    const last = pts[pts.length - 1];
-    if (!last || Math.abs(last[0] - c[0]) > 1e-9 || Math.abs(last[1] - c[1]) > 1e-9) pts.push(c);
-  }
-  if (pts.length < 3) return [];
-  const cosLat = Math.cos((pts.reduce((s, p) => s + p[1], 0) / pts.length) * Math.PI / 180);
-  const M_LAT = 110940, M_LNG = 111320 * cosLat;
-  const vec = (a, b) => ({ x: (b[0] - a[0]) * M_LNG, y: (b[1] - a[1]) * M_LAT });
-  const turns = [];
-  for (let i = 1; i < pts.length - 1; i++) {
-    const v1 = vec(pts[i - 1], pts[i]), v2 = vec(pts[i], pts[i + 1]);
-    if (Math.hypot(v1.x, v1.y) < minSegM || Math.hypot(v2.x, v2.y) < minSegM) continue;
-    const cross = v1.x * v2.y - v1.y * v2.x;
-    const dot = v1.x * v2.x + v1.y * v2.y;
-    const delta = Math.atan2(cross, dot) * 180 / Math.PI; // >0=左转（地理坐标系逆时针为正）
-    if (Math.abs(delta) < turnDeg) continue;
-    turns.push({
-      coord: pts[i], delta,
-      bearingOut: (Math.atan2(v2.x, v2.y) * 180 / Math.PI + 360) % 360, // 出射方向：北=0 顺时针
-      big: Math.abs(delta) >= bigDeg,
-    });
-  }
-  const merged = [];
-  for (const t of turns) {
-    const prev = merged[merged.length - 1];
-    if (prev && Math.hypot((t.coord[0] - prev.coord[0]) * M_LNG, (t.coord[1] - prev.coord[1]) * M_LAT) < mergeM) {
-      if (Math.abs(t.delta) > Math.abs(prev.delta)) merged[merged.length - 1] = t;
-      continue;
-    }
-    merged.push(t);
-  }
-  return merged.slice(0, 40);
-}
-
-const turnDir = (delta) => (delta > 0 ? '左转' : '右转');
-const turnArrowSvg = () => `<svg width="22" height="22" viewBox="0 0 24 24" style="display:block;filter:drop-shadow(0 0 1.5px rgba(255,255,255,.95))">
-  <path d="M12 3 L20.5 17.5 L12 13.6 L3.5 17.5 Z" fill="#0f6f4f" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
-
-/** SVG 路网渲染的转向标注（plan/trip 的降级路径与演示场所包共用） */
-export function svgTurnMarkers(map, legs, proj, { walkedUpto = -1 } = {}) {
-  for (const t of detectTurns(legs, walkedUpto)) {
-    const p = proj.toXY({ lng: t.coord[0], lat: t.coord[1] });
-    map.el('path', {
-      d: 'M0,-7.5 L5.5,5.5 L0,2.2 L-5.5,5.5 Z', fill: '#0f6f4f',
-      stroke: '#fff', 'stroke-width': 1.4, 'stroke-linejoin': 'round', opacity: 0.95,
-      transform: `translate(${p.x} ${p.y}) rotate(${t.bearingOut})`, class: 'am-turn-arrow',
-    });
-    if (t.big) {
-      const tx = map.el('text', {
-        x: p.x, y: p.y - 12, 'font-size': 11, 'font-weight': 800, fill: '#b4541c',
-        'text-anchor': 'middle', stroke: '#fff', 'stroke-width': 3,
-        'paint-order': 'stroke', 'stroke-linejoin': 'round', class: 'am-turn-text',
-      });
-      tx.textContent = turnDir(t.delta);
-    }
-  }
-}
+const badgeContent = (text, bg) => `<div style="min-width:22px;height:22px;padding:0 5px;border-radius:11px;background:${bg};color:#fff;display:flex;align-items:center;justify-content:center;font:700 12px/1 sans-serif;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3);white-space:nowrap">${text}</div>`;
+const turnArrowSvg = () => `<svg width="20" height="20" viewBox="0 0 24 24" style="display:block">
+  <circle cx="12" cy="12" r="10.5" fill="#fff" stroke="#1677ff" stroke-width="2"/>
+  <path d="M12 5.5 L17 15.5 L12 12.8 L7 15.5 Z" fill="#1677ff"/></svg>`;
 
 export class AmapRouteMap {
   constructor(container, { AMap, height = 300 }) {
@@ -304,68 +242,98 @@ export class AmapRouteMap {
   }
   // AMap 2.0：构造函数创建的覆盖物不会自动上图，必须 map.add（否则路线与标记全部不可见）
   _add(o) { this.overlays.push(o); this.map.add(o); return o; }
-  /** route：路线版本；opts.walkedUpto：已走到的 leg 下标（游览页）；opts.nextPoiId */
+  /**
+   * 路线渲染（规划页 / 游览页共用一套口径，见 routeview.js LEG_STYLE）
+   * opts.states：每段路的状态（legStates 计算）；缺省为规划页口径
+   * opts.currentIdx：当前这段的下标（只有这一段画转向箭头）
+   * opts.nextPoiId / opts.stopState(st)：站点状态；opts.labels: 'all' | 'key'（只标下一站）
+   * opts.fit：'all' | 'leg'（默认 all）
+   */
   renderRoute(route, opts = {}) {
     const AMap = this.AMap;
     this.clear();
-    const walkedUpto = opts.walkedUpto ?? -1;
+    this.route = route;
+    const states = opts.states || legStates(route, null);
+    this.legOverlays = [];
     route.legs.forEach((leg, i) => {
-      const walked = i < walkedUpto;
-      const active = !walked && !leg.isReturnLeg; // 正在走的路段：导航式方向箭头（showDir）
-      this._add(new AMap.Polyline({
+      const st = LEG_STYLE[states[i]];
+      const cur = states[i] === 'current';
+      this.legOverlays[i] = this._add(new AMap.Polyline({
         path: leg.geometry.coordinates.map(([lng, lat]) => new AMap.LngLat(lng, lat)),
-        strokeColor: walked ? '#9aa7a1' : leg.isReturnLeg ? '#1d4ed8' : '#e8a13c',
-        strokeWeight: walked ? 4 : 6,
-        strokeStyle: walked || leg.isReturnLeg ? 'dashed' : 'solid',
-        strokeOpacity: walked ? 0.7 : 0.95,
-        showDir: active,
-        lineJoin: 'round', lineCap: 'round',
-        zIndex: walked ? 10 : leg.isReturnLeg ? 20 : 30, // 当前路段（带箭头）压在返程之上
+        strokeColor: st.color, strokeWeight: st.weight, strokeOpacity: st.opacity,
+        strokeStyle: st.dashed ? 'dashed' : 'solid', strokeDasharray: st.dashed ? [8, 8] : undefined,
+        isOutline: cur, outlineColor: '#ffffff', borderWeight: cur ? 2 : 0,
+        showDir: st.dir, dirColor: '#ffffff',
+        lineJoin: 'round', lineCap: 'round', zIndex: st.z,
       }));
     });
-    // 起点「起」标记（导航风格；终点即最后一个站点，不再重复标「终」）
-    const startPoint = route.legs.length && route.legs[0].geometry.coordinates[0];
-    if (startPoint) {
-      this._add(new AMap.Marker({
-        position: new AMap.LngLat(startPoint[0], startPoint[1]),
-        content: '<div style="min-width:22px;height:22px;padding:0 4px;border-radius:11px;background:#0f6f4f;color:#fff;display:flex;align-items:center;justify-content:center;font:700 12px/1 sans-serif;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3)">起</div>',
-        offset: new AMap.Pixel(-13, -13),
-        title: '起点', zIndex: 45,
-      }));
+    // 起点 / 终点：A→B 路线单独标"终"（此前默认"终点即最后一站"，末站→终点那段因此无从解释）
+    const first = route.legs.length && route.legs[0].geometry.coordinates[0];
+    const last = route.legs[route.legs.length - 1];
+    const endPt = last && last.isReturnLeg ? last.geometry.coordinates[last.geometry.coordinates.length - 1] : null;
+    const sameEnd = first && endPt && distM(first, endPt) < 30;
+    if (first) {
+      this._add(new AMap.Marker({ position: new AMap.LngLat(first[0], first[1]), content: badgeContent(sameEnd ? '起/终' : '起', '#0f6f4f'), anchor: 'center', title: '起点', zIndex: 45 }));
+    }
+    if (endPt && !sameEnd) {
+      this._add(new AMap.Marker({ position: new AMap.LngLat(endPt[0], endPt[1]), content: badgeContent('终', '#c2410c'), anchor: 'center', title: (route.endApproach && route.endApproach.endName) || '终点', zIndex: 45 }));
     }
     route.stops.forEach((s, i) => {
       const isNext = opts.nextPoiId && s.poiId === opts.nextPoiId;
       const state = opts.stopState ? opts.stopState(s) : null;
-      const bg = state === 'skip' ? '#9aa7a1' : state === 'done' ? '#6b7f76' : isNext ? '#e8a13c' : '#0f6f4f';
+      const bg = state === 'skip' ? '#b8c2bd' : state === 'done' ? '#8a9a92' : isNext ? '#1677ff' : '#0f6f4f';
       const text = state === 'skip' ? '✕' : state === 'done' ? '✓' : String(i + 1);
+      const showLabel = opts.labels !== 'key' || isNext;
       this._add(new AMap.Marker({
         position: new AMap.LngLat(s.coord[0], s.coord[1]),
-        content: stopMarkerContent(text, bg),
-        offset: new AMap.Pixel(-14, -14),
-        title: s.name, zIndex: 50,
-        // 无框光晕标签：白描边 halo 保证任何底图上可读，不遮地图内容
-        label: { content: `<div class="am-label-halo${state ? ' dim' : ''}">${s.name}</div>`, direction: 'top' },
+        content: stopMarkerContent(text, bg, isNext),
+        anchor: 'center', title: s.name, zIndex: isNext ? 55 : 50,
+        label: showLabel ? { content: `<div class="am-label-halo${state ? ' dim' : ''}${isNext ? ' next' : ''}">${s.name}</div>`, direction: 'top' } : undefined,
       }));
     });
-    // 岔路口转向提示：箭头指示出射方向，大转角（≥72°）补"左转/右转"文字
-    for (const t of detectTurns(route.legs, walkedUpto)) {
-      this._add(new AMap.Marker({
-        position: new AMap.LngLat(t.coord[0], t.coord[1]),
-        content: turnArrowSvg(),
-        angle: t.bearingOut,
-        offset: new AMap.Pixel(-11, -11),
-        title: turnDir(t.delta), zIndex: 42,
-      }));
-      if (t.big) {
+    // 转向箭头只画当前这段（后续路段的转向此刻用不上，画满屏只会更乱）
+    if (opts.currentIdx != null && route.legs[opts.currentIdx]) {
+      for (const t of polylineTurns(route.legs[opts.currentIdx].geometry.coordinates)) {
         this._add(new AMap.Marker({
-          position: new AMap.LngLat(t.coord[0], t.coord[1]),
-          content: `<div class="am-turn-text">${turnDir(t.delta)}</div>`,
-          offset: new AMap.Pixel(0, -20),
-          zIndex: 43,
+          position: new AMap.LngLat(t.coord[0], t.coord[1]), content: turnArrowSvg(), angle: t.bearingOut,
+          anchor: 'center', title: turnWord(t.delta), zIndex: 62,
         }));
       }
     }
-    if (this.overlays.length) this.map.setFitView(this.overlays, false, [40, 40, 40, 40]);
+    if (opts.fit === 'leg' && opts.currentIdx != null) this.fitLeg(opts.currentIdx);
+    else this.fitAll();
   }
+  fitAll() {
+    if (this.overlays.length) this.map.setFitView(this.overlays.filter((o) => o !== this.userMarker && o !== this.userCircle), false, [48, 40, 40, 40]);
+  }
+  /** 只看当前这段（+ 我的位置）：游览时默认视角 */
+  fitLeg(i) {
+    const o = this.legOverlays && this.legOverlays[i];
+    if (!o) return this.fitAll();
+    const list = [o];
+    // 人离这段路很远（还没到场/定位漂移）时不把人框进来，否则"本段"会被缩成全城视角
+    if (this.userMarker && this.route && this.route.legs[i]) {
+      const cs = this.route.legs[i].geometry.coordinates;
+      const u = this.userMarker.getPosition();
+      if (cs.length && distM([u.lng, u.lat], cs[Math.floor(cs.length / 2)]) < 1500) list.push(this.userMarker);
+    }
+    this.map.setFitView(list, false, [56, 48, 48, 48], 18);
+  }
+  /** 我的位置（GCJ-02）：蓝点 + 精度圈 */
+  setUser(pt, accuracy) {
+    const AMap = this.AMap;
+    if (!pt) return;
+    const pos = new AMap.LngLat(pt[0], pt[1]);
+    if (!this.userMarker) {
+      this.userMarker = new AMap.Marker({ position: pos, anchor: 'center', zIndex: 70, content: '<div class="user-dot"></div>', title: '我的位置' });
+      this.userCircle = new AMap.Circle({ center: pos, radius: Math.min(accuracy || 30, 200), strokeWeight: 0, fillColor: '#1677ff', fillOpacity: 0.12, zIndex: 9 });
+      this.map.add([this.userCircle, this.userMarker]);
+    } else {
+      this.userMarker.setPosition(pos);
+      this.userCircle.setCenter(pos);
+      this.userCircle.setRadius(Math.min(accuracy || 30, 200));
+    }
+  }
+  centerUser() { if (this.userMarker) this.map.setCenter(this.userMarker.getPosition()); }
   destroy() { try { this.map.destroy(); } catch (e) {} }
 }

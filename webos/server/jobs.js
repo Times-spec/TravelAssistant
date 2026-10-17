@@ -12,6 +12,13 @@ const tk = require('./timekit');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 固定终点的坐标（供实时路网单独建终点节点）；回起点/顺路结束返回 null */
+function endpointPointOf(intent) {
+  const ep = intent && intent.endpoint;
+  if (!ep || ep.mode !== 'fixed' || !ep.point || !Number.isFinite(ep.point.lng)) return null;
+  return { lng: ep.point.lng, lat: ep.point.lat, crs: 'GCJ02', label: ep.label || '终点' };
+}
+
 class JobRunner {
   constructor(ctx) {
     this.ctx = ctx; // {store, cfg, packs, sseHub}
@@ -52,7 +59,7 @@ class JobRunner {
     }
     const { buildAmapAreaPack } = require('./amap');
     if (intent.venueId === 'area_amap') {
-      const area = await buildAmapAreaPack(this.ctx.cfg, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec);
+      const area = await buildAmapAreaPack(this.ctx.cfg, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec, endpointPointOf(intent));
       return area;
     }
     if (String(intent.venueId).startsWith('live:')) {
@@ -64,6 +71,8 @@ class JobRunner {
         // 口味偏好决定餐饮/购物的降权；必去点即使不在半径内也要进候选池
         food: (intent.interests || []).some((i) => i.tag === '美食'),
         mustVisitIds: intent.hard.mustVisitIds || [],
+        // 固定终点单独建节点，末站→终点这段参与排序
+        endpoint: endpointPointOf(intent),
       });
       return { pack: live.pack, graph: live.graph };
     }
