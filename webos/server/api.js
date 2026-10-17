@@ -801,9 +801,22 @@ class Api {
         throw E.conflict('LOCKED_STOP_SKIP', `「${stop.name}」是你锁定的必去点，确认放弃该锁定吗？`, { needConfirm: 'unlock_then_skip', poiId: stop.poiId });
       }
     }
+    let currentNodeId = body.currentNodeId || null;
+    if (!currentNodeId) {
+      const arrivals = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'arrive_confirm');
+      // 先按发生时间，时间相同或缺失时按入库顺序；弱网补传旧事件不应让位置倒退。
+      const last = arrivals.map((event, index) => ({ event, index }))
+        .sort((a, b) => (Date.parse(b.event.occurredAt || b.event.receivedAt) || 0) - (Date.parse(a.event.occurredAt || a.event.receivedAt) || 0) || b.index - a.index)[0]?.event;
+      const poiId = last && last.data && last.data.poiId;
+      // 接受过提议后，新路线可能不再包含已到访站，因此也查同一计划的历史版本。
+      const stop = poiId && (base.stops.find((s) => s.poiId === poiId)
+        || store.find('route_versions', (r) => r.planId === trip.planId).slice().reverse()
+          .flatMap((r) => r.stops || []).find((s) => s.poiId === poiId));
+      currentNodeId = stop && stop.entranceNodeId || base.startNodeId;
+    }
     const job = createJob(store, {
       type: 'trip.replan', ownerId: req.user.id, planId: trip.planId, tripId: trip.id,
-      payload: { baseRouteId: base.routeId, cause: body.cause, data: body.data || {}, currentNodeId: body.currentNodeId || null },
+      payload: { baseRouteId: base.routeId, cause: body.cause, data: body.data || {}, currentNodeId },
     });
     return { status: 202, jobId: job.id };
   }
