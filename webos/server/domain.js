@@ -137,6 +137,7 @@ function ruleNLU(text) {
   else if (/少台阶|台阶少/.test(t)) out.soft.stepFewPreferred = true;
   if (/安静|人少/.test(t)) out.soft.quietPreferred = true;
   if (/多休息|歇脚|休息多/.test(t)) out.soft.restPreferred = true;
+  if (/下雨|室内(?:为主|优先)?|不想晒|不晒太阳|怕晒/.test(t)) out.soft.indoorPreferred = true;
   if (/少走回头路|不重复|别绕/.test(t)) out.soft.repeatRoadPenalty = 1;
 
   return out;
@@ -373,6 +374,7 @@ function normalizeIntent(input, packs, preParsed = null) {
     repeatRoadPenalty: allowBacktrack ? 0 : (parsed.soft.repeatRoadPenalty ?? 1),
     restPreferred: !!(form.restPreferred || parsed.soft.restPreferred || pace === 'easy'),
     quietPreferred: !!(form.quietPreferred || parsed.soft.quietPreferred),
+    indoorPreferred: !!(form.indoorPreferred || parsed.soft.indoorPreferred),
     stepFewPreferred: !!parsed.soft.stepFewPreferred,
   };
   if (hard.stepFreeRequired && form.needsText && /少台阶/.test(form.needsText)) {
@@ -430,7 +432,9 @@ function confirmChips(intent) {
   if (intent.hard.stepFreeRequired) chips.push({ field: 'access', label: '轮椅可达（硬条件）' });
   else if (intent.soft.stepFewPreferred) chips.push({ field: 'access', label: '少台阶' });
   if (intent.hard.mustVisitIds.length) chips.push({ field: 'must', label: `必去 ${intent.hard.mustVisitIds.length} 处` });
-  if (intent.hard.noRepeatedEdges) chips.push({ field: 'route', label: '不走重复路段' });
+  if (intent.soft.indoorPreferred) chips.push({ field: 'indoor', label: '室内优先' });
+  if (intent.hard.strictNoRepeat) chips.push({ field: 'route', label: '不走重复路段' });
+  else if (intent.soft.repeatRoadPenalty === 1) chips.push({ field: 'route', label: '少走回头路' });
   return chips;
 }
 

@@ -105,6 +105,21 @@ async function main() {
     const p = await llmNLU(cfg, '从春熙路走到宽窄巷子');
     assert.equal(p.scene, 'wander'); assert.equal(p.venueName, null); assert.equal(p.endPlaceName, '宽窄巷子');
   }));
+  for (const text of ['下雨了', '室内为主', '不想晒太阳']) await check(`T3 室内偏好 ${text}`, () => at('09:00', () => {
+    assert.equal(ruleNLU(text).soft.indoorPreferred, true);
+    const i = intent(text); assert.equal(i.soft.indoorPreferred, true);
+    assert(confirmChips(i).some((c) => c.label === '室内优先'));
+  }));
+  for (const [strict, penalty, label] of [[true, 1, '不走重复路段'], [false, 1, '少走回头路'], [false, 0, null]]) {
+    await check(`T3 确认条 strict=${strict} penalty=${penalty}`, () => at('09:00', () => {
+      const i = intent(''); i.hard.strictNoRepeat = strict; i.soft.repeatRoadPenalty = penalty;
+      assert.equal(confirmChips(i).find((c) => c.field === 'route')?.label || null, label);
+    }));
+  }
+  await check('T3 HTTP 模型室内偏好', () => modelResult({ indoorPreferred: true }, async () => {
+    const p = await llmNLU(cfg, '下雨了，室内为主'); assert.equal(p.soft.indoorPreferred, true);
+    at('09:00', () => assert.equal(intent('下雨了', {}, p).soft.indoorPreferred, true));
+  }));
   console.log(`NLU: ${passed} passed, 0 failed`);
 }
 main().catch((e) => { console.error(e); process.exitCode = 1; });

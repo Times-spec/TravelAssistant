@@ -40,6 +40,7 @@ const NLU_SCHEMA = `{
   "stepFewPreferred": true|false,
   "restPreferred": true|false,
   "quietPreferred": true|false,
+  "indoorPreferred": true|false,
   "repeatRoadPenalty": 0|1
 }`;
 
@@ -53,6 +54,7 @@ async function llmNLU(cfg, text, contextNote = '') {
 - "从A走到B/从A逛到B"是城市闲逛：scene=wander、venueName=null、endPlaceName=B；A是起点，不是场所。"走到X/逛到X/最后到X/去X结束"均填 endPlaceName=X，不得当作顺路结束；
 - "免费优先"是软偏好(freePreferred)，"不收费/零门票/不能花钱"才是硬条件(hardZeroCost)；
 - "少台阶"是 stepFewPreferred，"轮椅/无障碍"才是 stepFreeRequired；
+- "下雨/室内为主/不想晒" → indoorPreferred=true，这是室内优先的软偏好；
 - "想放空/随便逛/散心" → objective=relax；"都逛完/逛全" → poi_coverage；"精华/最值得/有特色" → highlights；
 - 产品有两种模式：景区游玩（用户指定某个公园/景区）与城市闲逛（从起点出发按兴趣逛）——venueName 有值→venue，否则 wander；
 - "回到起点/回南门/原路返回" → endpointMode=return_to_origin；"走到哪算哪/顺路" → flexible；
@@ -103,6 +105,7 @@ ${contextNote}`;
       stepFewPreferred: parsed.stepFewPreferred === true,
       restPreferred: parsed.restPreferred === true,
       quietPreferred: parsed.quietPreferred === true,
+      indoorPreferred: parsed.indoorPreferred === true,
       repeatRoadPenalty: parsed.repeatRoadPenalty ? 1 : 0,
     },
     notes: [],
