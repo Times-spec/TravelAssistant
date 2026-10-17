@@ -1,4 +1,4 @@
-import { LEG_STYLE, legStates, polylineTurns, turnWord, distM } from './routeview.js';
+import { LEG_STYLE, legStates, polylineTurns, turnWord, distM, stopMarkerGroups } from './routeview.js';
 // UI 工具：DOM 构建、toast、底部 sheet、SVG 地图组件（平移/缩放只改视图，不改行程 §10.3）
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -208,8 +208,8 @@ export function loadAmap(jsKey, securityCode) {
 
 function stopMarkerContent(text, bg, big) {
   const d = big ? 30 : 24;
-  return `<div style="width:${d}px;height:${d}px;border-radius:50%;background:${bg};color:#fff;
-    display:flex;align-items:center;justify-content:center;font:700 ${big ? 14 : 12}px/1 sans-serif;
+  return `<div class="route-stop-marker" style="min-width:${d}px;padding:0 5px;height:${d}px;border-radius:${d}px;background:${bg};color:#fff;
+    display:flex;align-items:center;justify-content:center;white-space:nowrap;font:700 ${big ? 14 : 12}px/1 sans-serif;
     border:2.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3)${big ? ',0 0 0 6px rgba(22,119,255,.18)' : ''}">${text}</div>`;
 }
 const badgeContent = (text, bg) => `<div style="min-width:22px;height:22px;padding:0 5px;border-radius:11px;background:${bg};color:#fff;display:flex;align-items:center;justify-content:center;font:700 12px/1 sans-serif;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3);white-space:nowrap">${text}</div>`;
@@ -270,25 +270,25 @@ export class AmapRouteMap {
     // 起点 / 终点：A→B 路线单独标"终"（此前默认"终点即最后一站"，末站→终点那段因此无从解释）
     const first = route.legs.length && route.legs[0].geometry.coordinates[0];
     const last = route.legs[route.legs.length - 1];
-    const endPt = last && last.isReturnLeg ? last.geometry.coordinates[last.geometry.coordinates.length - 1] : null;
+    const endPt = last && last.geometry.coordinates[last.geometry.coordinates.length - 1];
+    const markers = stopMarkerGroups(route, opts);
+    const mergedEnd = markers.some((m) => m.endsHere);
     const sameEnd = first && endPt && distM(first, endPt) < 30;
     if (first) {
-      this._add(new AMap.Marker({ position: new AMap.LngLat(first[0], first[1]), content: badgeContent(sameEnd ? '起/终' : '起', '#0f6f4f'), anchor: 'center', title: '起点', zIndex: 45 }));
+      this._add(new AMap.Marker({ position: new AMap.LngLat(first[0], first[1]), content: badgeContent(sameEnd && !mergedEnd ? '起/终' : '起', '#0f6f4f'), anchor: 'center', title: '起点', zIndex: 45 }));
     }
-    if (endPt && !sameEnd) {
+    if (endPt && !sameEnd && !mergedEnd) {
       this._add(new AMap.Marker({ position: new AMap.LngLat(endPt[0], endPt[1]), content: badgeContent('终', '#c2410c'), anchor: 'center', title: (route.endApproach && route.endApproach.endName) || '终点', zIndex: 45 }));
     }
-    route.stops.forEach((s, i) => {
-      const isNext = opts.nextPoiId && s.poiId === opts.nextPoiId;
-      const state = opts.stopState ? opts.stopState(s) : null;
+    markers.forEach((marker) => {
+      const { isNext, state } = marker;
       const bg = state === 'skip' ? '#b8c2bd' : state === 'done' ? '#8a9a92' : isNext ? '#1677ff' : '#0f6f4f';
-      const text = state === 'skip' ? '✕' : state === 'done' ? '✓' : String(i + 1);
-      const showLabel = opts.labels !== 'key' || isNext;
+      const safeLabel = (marker.label || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
       this._add(new AMap.Marker({
-        position: new AMap.LngLat(s.coord[0], s.coord[1]),
-        content: stopMarkerContent(text, bg, isNext),
-        anchor: 'center', title: s.name, zIndex: isNext ? 55 : 50,
-        label: showLabel ? { content: `<div class="am-label-halo${state ? ' dim' : ''}${isNext ? ' next' : ''}">${s.name}</div>`, direction: 'top' } : undefined,
+        position: new AMap.LngLat(marker.coord[0], marker.coord[1]),
+        content: stopMarkerContent(marker.text, bg, isNext),
+        anchor: 'center', title: marker.title, zIndex: isNext ? 65 : 50,
+        label: isNext ? { content: `<div class="am-label-halo next">${safeLabel}</div>`, direction: 'top' } : undefined,
       }));
     });
     // 转向箭头只画当前这段（后续路段的转向此刻用不上，画满屏只会更乱）

@@ -240,6 +240,34 @@ export function wgs84ToGcj02(lng, lat) {
 }
 
 /* ---------------- SVG 降级渲染（演示场所 / 高德底图不可用） ---------------- */
+// 两种地图共享合并规则；只合并展示编号，不修改站点坐标、顺序或路线。
+export function stopMarkerGroups(route, opts = {}) {
+  const stops = route.stops || [];
+  const parents = stops.map((_, i) => i);
+  const root = (i) => parents[i] === i ? i : (parents[i] = root(parents[i]));
+  for (let i = 0; i < stops.length; i++) for (let j = i + 1; j < stops.length; j++) {
+    if (distM(stops[i].coord, stops[j].coord) < 25) parents[root(j)] = root(i);
+  }
+  const lastLeg = route.legs[route.legs.length - 1];
+  const end = lastLeg && lastLeg.geometry.coordinates.at(-1);
+  const groups = new Map();
+  stops.forEach((stop, index) => {
+    const key = root(index);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ stop, index });
+  });
+  return [...groups.values()].map((members) => {
+    const current = members.find((m) => m.stop.poiId === opts.nextPoiId);
+    const anchor = current || members[0];
+    const states = members.map((m) => opts.stopState ? opts.stopState(m.stop) : null);
+    const state = states.every((s) => s === 'done') ? 'done' : states.every((s) => s === 'skip') ? 'skip' : null;
+    const endsHere = !!(end && members.some((m) => m.index === stops.length - 1 && distM(m.stop.coord, end) < 60));
+    const numbers = members.map((m) => m.index + 1).join('·');
+    const text = endsHere ? numbers + '/终' : members.length > 1 ? numbers : state === 'done' ? '✓' : state === 'skip' ? '✕' : numbers;
+    return { coord: anchor.stop.coord, text, endsHere, state, isNext: !!current, label: current ? current.stop.name : null, title: members.map((m) => `${m.index + 1}. ${m.stop.name}`).join(' / ') };
+  });
+}
+
 /**
  * 与高德底图同一套规则画路线。返回 { bounds, legBounds[] } 供"本段/全程"切换取景。
  * opts: { states, currentIdx, stopState(st), nextPoiId, labels: 'all'|'key', drawLabel(map,p,text,dy,color) }
@@ -275,23 +303,24 @@ export function renderSvgRoute(map, route, proj, opts = {}) {
   // 起点 / 终点
   const first = route.legs[0] && route.legs[0].geometry.coordinates[0];
   const last = route.legs.length && route.legs[route.legs.length - 1];
-  const endPt = last && last.isReturnLeg ? last.geometry.coordinates[last.geometry.coordinates.length - 1] : null;
+  const endPt = last && last.geometry.coordinates[last.geometry.coordinates.length - 1];
+  const markers = stopMarkerGroups(route, opts);
+  const mergedEnd = markers.some((m) => m.endsHere);
   const sameEnd = first && endPt && distM(first, endPt) < 30;
-  if (first) svgBadge(map, proj.toXY({ lng: first[0], lat: first[1] }), sameEnd ? '起/终' : '起', '#0f6f4f', bounds);
-  if (endPt && !sameEnd) svgBadge(map, proj.toXY({ lng: endPt[0], lat: endPt[1] }), '终', '#c2410c', bounds);
+  if (first) svgBadge(map, proj.toXY({ lng: first[0], lat: first[1] }), sameEnd && !mergedEnd ? '起/终' : '起', '#0f6f4f', bounds);
+  if (endPt && !sameEnd && !mergedEnd) svgBadge(map, proj.toXY({ lng: endPt[0], lat: endPt[1] }), '终', '#c2410c', bounds);
   // 站点：下一站最醒目；已到访/跳过弱化；标签只给关键站点，避免互相压字
-  route.stops.forEach((s, i) => {
-    const p = proj.toXY({ lng: s.coord[0], lat: s.coord[1] });
+  markers.forEach((marker) => {
+    const p = proj.toXY({ lng: marker.coord[0], lat: marker.coord[1] });
     grow(bounds, p);
-    const state = opts.stopState ? opts.stopState(s) : null;
-    const isNext = opts.nextPoiId && s.poiId === opts.nextPoiId;
+    const { state, isNext } = marker;
     const fill = state === 'skip' ? '#b8c2bd' : state === 'done' ? '#8a9a92' : isNext ? '#1677ff' : '#0f6f4f';
     if (isNext) map.el('circle', { cx: p.x, cy: p.y, r: 17, fill: '#1677ff', opacity: 0.18 });
-    map.el('circle', { cx: p.x, cy: p.y, r: isNext ? 12 : 9.5, fill, stroke: '#fff', 'stroke-width': 2.5 });
+    const width = Math.max(isNext ? 24 : 20, marker.text.length * 7 + 10);
+    map.el('rect', { x: p.x - width / 2, y: p.y - 11, width, height: 22, rx: 11, fill, stroke: '#fff', 'stroke-width': 2.5, class: 'route-stop-marker' });
     const t = map.el('text', { x: p.x, y: p.y + 4, 'font-size': isNext ? 12 : 10.5, fill: '#fff', 'text-anchor': 'middle', 'font-weight': 700 });
-    t.textContent = state === 'skip' ? '✕' : state === 'done' ? '✓' : String(i + 1);
-    const showLabel = opts.labels !== 'key' || isNext;
-    if (showLabel && opts.drawLabel) opts.drawLabel(map, p, s.name, isNext ? -20 : -16, isNext ? '#0b4fbf' : (state ? '#7a8a82' : undefined));
+    t.textContent = marker.text;
+    if (isNext && opts.drawLabel) opts.drawLabel(map, p, marker.label, -20, '#0b4fbf');
   });
   return { bounds, legBounds };
 }

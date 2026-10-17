@@ -36,6 +36,12 @@ export function renderPlan(view, ctx, planId) {
   const bottomBar = h('div', { class: 'bottom-bar hidden' });
   document.getElementById('app').append(bottomBar);
   cleanupFns.push(() => bottomBar.remove());
+  view.classList.add('plan-view');
+  const syncBottomSpace = () => view.style.setProperty('--plan-bar-height', `${Math.ceil(bottomBar.getBoundingClientRect().height)}px`);
+  const bottomObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(syncBottomSpace) : null;
+  if (bottomObserver) bottomObserver.observe(bottomBar);
+  window.addEventListener('resize', syncBottomSpace);
+  cleanupFns.push(() => { bottomObserver?.disconnect(); window.removeEventListener('resize', syncBottomSpace); view.classList.remove('plan-view'); view.style.removeProperty('--plan-bar-height'); });
 
   let taskFailed = false; // 任务级失败：立即停掉阶段动画，改显示失败卡片
   let agentCollapsed = false; // 决策链可收起（默认展开：等待期它就是进度）
@@ -361,7 +367,7 @@ export function renderPlan(view, ctx, planId) {
         mapWrap.append(div);
         const rm = new AmapRouteMap(div, { AMap, height: 300 });
         amapMap = rm;
-        rm.renderRoute(v, { states, labels: 'all' });
+        rm.renderRoute(v, { states, nextPoiId: v.stops[0]?.poiId, labels: 'key' });
         mapWrap.append(...[legend(), endNote()].filter(Boolean));
         return;
       } catch (e) {
@@ -383,7 +389,7 @@ export function renderPlan(view, ctx, planId) {
     mapWrap.append(svgBox);
     map = new SvgMap(svgBox, { height: 300 });
     if (pack) drawPackBase(map, pack, proj, { quiet: true });
-    const { bounds } = renderSvgRoute(map, v, proj, { states, labels: 'all', drawLabel: drawMapLabel });
+    const { bounds } = renderSvgRoute(map, v, proj, { states, nextPoiId: v.stops[0]?.poiId, labels: 'key', drawLabel: drawMapLabel });
     if (!pack) map.fit(bounds, 60);
     svgBox.append(h('div', { class: 'map-note' }, isDemoMap ? '演示地图（虚构场所数据）· 可拖动缩放' : '路网示意图 · 可拖动缩放'));
     mapWrap.append(...[legend(pack), endNote()].filter(Boolean));
