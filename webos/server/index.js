@@ -101,7 +101,24 @@ const server = http.createServer(async (req, res) => {
       filePath = path.join(WEB_DIR, 'index.html');
     }
     const ext = path.extname(filePath);
-    res.writeHead(200, { 'content-type': MIME[ext] || 'application/octet-stream', 'cache-control': 'no-cache' });
+    // 无构建步骤：静态文件必须"每次校验"，否则部署新版本后浏览器会继续用旧的 JS/CSS。
+    // 配 ETag/Last-Modified 走 304，既保证拿到新代码，又不重复传输未变的文件。
+    const stat = fs.statSync(filePath);
+    const etag = `W/"${stat.size.toString(16)}-${Math.round(stat.mtimeMs).toString(16)}"`;
+    const lastModified = stat.mtime.toUTCString();
+    const inm = req.headers['if-none-match'];
+    const ims = req.headers['if-modified-since'];
+    const notModified = inm ? inm === etag
+      : (ims ? new Date(ims).getTime() >= Math.floor(stat.mtimeMs / 1000) * 1000 : false);
+    if (notModified) {
+      res.writeHead(304, { etag, 'last-modified': lastModified, 'cache-control': 'no-cache' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': MIME[ext] || 'application/octet-stream',
+      'cache-control': 'no-cache', etag, 'last-modified': lastModified, 'content-length': stat.size,
+    });
     fs.createReadStream(filePath).pipe(res);
   } catch (e) {
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
