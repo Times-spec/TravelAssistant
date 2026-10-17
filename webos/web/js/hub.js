@@ -124,6 +124,26 @@ export async function renderTemplate(view, ctx, templateId) {
   );
 }
 
+/** 模板站点 → 真实 POI：逐个按站名搜索，命中的写入必去。
+ *  只收 kind=poi（场所/入口没有对应的候选点位，写进必去反而会对不上包）；单个站名失败不影响其它站。 */
+async function resolveTemplateStops(cityName, stops) {
+  const out = [];
+  const seen = new Set();
+  for (const s of stops || []) {
+    const name = ((s && s.name) || '').trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    try {
+      const qs = new URLSearchParams({ q: name });
+      if (cityName) qs.set('city', cityName);
+      const r = await get('/v1/places/search?' + qs.toString());
+      const hit = (r.results || []).find((x) => x.kind === 'poi' && x.coord);
+      if (hit) out.push({ id: hit.id, name: hit.name });
+    } catch (e) { /* 单站失败不阻断整条模板 */ }
+  }
+  return out;
+}
+
 /** 模板 → 规划向导：预填草稿（热度+1 计入真实使用），起点仍由用户确认 */
 async function useTemplate(ctx, t) {
   try { await post(`/v1/hub/templates/${t.id}/use`); } catch (e) { /* 热度计数失败不阻断 */ }
@@ -137,6 +157,8 @@ async function useTemplate(ctx, t) {
   d.endpointMode = (t.draft && t.draft.endpointMode) || 'return_to_origin';
   d.venueId = null; d.venueRef = null; d.origin = null;
   d.mustVisit = []; d.avoid = [];
+  // 模板途经站点带入"必去"，规划器会强制把它们放进候选池（即使不在检索半径内）
+  d.mustVisit = await resolveTemplateStops(t.cityName, t.stops);
   if (t.scene === 'venue' && t.venueId) {
     // 场所模板：按内容库名称搜真实场所，命中即带入；不中就停在第二步让用户自己选
     try {
@@ -159,10 +181,11 @@ async function useTemplate(ctx, t) {
       return;
     } catch (e) { /* 落到 wander/通用入口 */ }
   }
-  d.step = 3;
+  // 闲逛没有预选场所，必须先由用户在第二步确定出发地
+  d.step = 2;
   ctx.saveDraft();
   location.hash = '#/';
-  toast('已带入模板条件，确认起点后即可生成', 3200);
+  toast('已带入模板条件，请先确定从哪儿出发', 3200);
 }
 
 /* ==================== 全部场所（可筛选） ==================== */

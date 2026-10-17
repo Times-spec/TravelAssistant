@@ -60,7 +60,11 @@ class JobRunner {
         throw Object.assign(new Error('缺少场所信息，无法构建真实场所数据'), { code: 'VENUE_DATA_INSUFFICIENT' });
       }
       const { buildLiveVenue } = require('./live_venue');
-      const live = await buildLiveVenue(this.ctx.cfg, intent.venueRef, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec);
+      const live = await buildLiveVenue(this.ctx.cfg, intent.venueRef, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec, {
+        // 口味偏好决定餐饮/购物的降权；必去点即使不在半径内也要进候选池
+        food: (intent.interests || []).some((i) => i.tag === '美食'),
+        mustVisitIds: intent.hard.mustVisitIds || [],
+      });
       return { pack: live.pack, graph: live.graph };
     }
     const local = this.packOf(intent.venueId);

@@ -221,7 +221,7 @@ function normalizeIntent(input, packs, preParsed = null) {
     // entranceId/poiId：用户在地图上吸附到具体门/点位时由前端写入，planner 优先用它定位（比裸坐标更稳）
     endpoint = { mode: 'fixed', point: form.endpointPoint, poiId: form.endpointPoiId || null, entranceId: form.endpointEntranceId || null, label: form.endpointLabel || '指定终点' };
   } else if (ep === 'named' && parsed.endpointRef && parsed.endpointRef.name && pack) {
-    const g = pack.nodes.find((n) => n.type === 'entrance' && parsed.endpointRef.name.includes(n.name));
+    const g = (pack.nodes || []).find((n) => n.type === 'entrance' && parsed.endpointRef.name.includes(n.name));
     endpoint = g
       ? { mode: 'fixed', point: { lng: g.lng, lat: g.lat, crs: 'GCJ02' }, poiId: null, entranceId: g.id, label: g.name }
       : { mode: 'return_to_origin' };
@@ -287,7 +287,8 @@ function normalizeIntent(input, packs, preParsed = null) {
   if (pack) {
     for (const pid of mustVisitIds) {
       const poi = pack.pois.find((p) => p.id === pid);
-      const node = pack.nodes.find((n) => n.id === pid);
+      // 真实场所的轻量包只带 pois、不带 nodes（未建图）：不能因此崩掉需求解析
+      const node = (pack.nodes || []).find((n) => n.id === pid);
       if (poi && (poi.closedToday || (node && node.status !== 'open'))) {
         unresolved.push({
           field: 'mustVisit',

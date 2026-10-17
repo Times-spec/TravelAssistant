@@ -494,7 +494,10 @@ class Api {
           const intent = store.byId('intents', plan.intentId);
           if (intent.venueRef) {
             const { resolveVenue } = require('./live_venue');
-            const v = await resolveVenue(cfg, intent.venueRef);
+            const v = await resolveVenue(cfg, intent.venueRef, intent.budgetSec, {
+              food: (intent.interests || []).some((i) => i.tag === '美食'),
+              mustVisitIds: intent.hard.mustVisitIds || [],
+            });
             const m = v.pois.find((p) => p.name.includes(parsed.data.poiName) || parsed.data.poiName.includes(p.name));
             if (m) { resolved.poiId = m.id; resolved.poiName = m.shortName; }
           }
