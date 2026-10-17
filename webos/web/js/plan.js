@@ -38,7 +38,9 @@ export function renderPlan(view, ctx, planId) {
   document.getElementById('app').append(bottomBar);
   cleanupFns.push(() => bottomBar.remove());
 
+  let taskFailed = false; // 任务级失败：立即停掉阶段动画，改显示失败卡片
   function renderStages() {
+    if (taskFailed) { progressCard.classList.add('hidden'); return; }
     const labels = {
       intent: '正在理解你的想法…', candidates: '正在查找适合的地点…', route: '正在核对步行时间与开放情况…',
       alt: '正在生成备选方案…', guide: '正在补充沿途讲解…', done: '',
@@ -411,6 +413,33 @@ export function renderPlan(view, ctx, planId) {
       h('button', { class: 'btn btn-ghost btn-block', onclick: () => { location.hash = '#/'; } }, '返回修改条件'));
   }
 
+  /** 任务级失败（数据源/服务异常）：停掉进度动画，给出可执行的两个出口 */
+  function showFailure(message) {
+    taskFailed = true;
+    progressCard.classList.add('hidden');
+    conflictCard.classList.remove('hidden');
+    conflictCard.innerHTML = '';
+    conflictCard.append(
+      h('h3', {}, '⚠ 规划任务失败'),
+      h('div', { style: 'margin-bottom:8px' }, message || '任务执行出错，路线没有生成'),
+      h('div', { class: 'tl-meta', style: 'margin-bottom:8px' }, '多为数据源或网络临时问题，可以直接重试；反复失败可回去调整条件'),
+      h('div', { class: 'chips' },
+        h('button', { class: 'chip', onclick: retryPlan }, '重试'),
+        h('button', { class: 'chip', onclick: () => { location.hash = '#/'; } }, '返回修改条件')));
+  }
+
+  async function retryPlan() {
+    if (!planData || !planData.plan) return;
+    const p = planData.plan;
+    try {
+      toast('正在重试…');
+      const r = await post('/v1/plans', {
+        intentId: p.intentId, revision: p.intentRevision, idempotencyKey: 'plan_' + Date.now(),
+      });
+      location.hash = '#/plan/' + r.planId;
+    } catch (e) { toast(e.message, 3500); }
+  }
+
   async function loadPlan(keepSel, selectRouteId) {
     const seq = ++loadSeq;
     const data = await get('/v1/plans/' + planId);
@@ -423,6 +452,10 @@ export function renderPlan(view, ctx, planId) {
     } else if (!keepSel || !planData.versions.some((v) => v.routeId === selRouteId)) {
       const main = planData.versions.find((v) => v.routeId === planData.plan.mainRouteId) || planData.versions[0];
       selRouteId = main ? main.routeId : null;
+    }
+    if (planData.plan.status === 'failed') {
+      showFailure((planData.plan.error && planData.plan.error.message) || '任务执行出错，路线没有生成');
+      return;
     }
     if (['infeasible', 'needs_clarification'].includes(planData.plan.status) && planData.plan.conflict) {
       showConflict(planData.plan.conflict, planData.plan.status);
@@ -475,10 +508,14 @@ export function renderPlan(view, ctx, planId) {
       } else if (evt.type === 'route.risk_detected') {
         toast(`⚠ 路线风险：${p.name} ${p.reason}`, 5000);
       } else if (evt.type === 'job.failed') {
-        stageState.route = stageState.route === 'done' ? 'done' : 'active';
-        if (p.conflict) showConflict(p.conflict, (p.proposals && p.proposals.length) ? 'needs_clarification' : 'infeasible');
-        else toast(p.message || '规划失败', 4000);
-        renderStages();
+        if (p.conflict) {
+          stageState.route = stageState.route === 'done' ? 'done' : 'active';
+          showConflict(p.conflict, (p.proposals && p.proposals.length) ? 'needs_clarification' : 'infeasible');
+          renderStages();
+        } else {
+          // 任务级异常：停表、显示失败卡片（重试 / 返回修改条件）
+          showFailure(p.message);
+        }
       } else if (evt.type === 'job.completed') {
         Object.keys(stageState).forEach((k) => { if (stageState[k] !== 'done') stageState[k] = 'done'; });
         stageState.done = 'done';

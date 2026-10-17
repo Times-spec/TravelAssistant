@@ -12,6 +12,7 @@
  */
 const { solveAlternatives, solveOnce, buildRoutePlan } = require('./planner');
 const { hardConstraintsOf } = require('./route_constraints');
+const { haversineM } = require('./geo');
 
 const PROBE_POLICY = { name: 'probe', interestW: 1, timeCostW: 0.55, dwellFactor: 1 };
 
@@ -69,11 +70,16 @@ function candidatePlans(pack, intent, graph, planId) {
   });
 }
 
+/** 图的邻接表：已核验路网与真实高德包现在同构；万一适配器没提供，降级为"无拓扑信息"而不是崩溃 */
+function adjOf(graph, nodeId) {
+  return graph.adj ? (graph.adj.get(nodeId) || []) : [];
+}
+
 /** 拓扑连通性诊断：识别死胡同、唯一桥梁与不可避免重复结构 */
 function analyzeTopology(graph, pack) {
   const deadEndPois = new Map();
   for (const poi of pack.pois) {
-    const adj = graph.adj.get(poi.entranceNode) || [];
+    const adj = adjOf(graph, poi.entranceNode);
     if (adj.length === 1) {
       deadEndPois.set(poi.id, { poi, bridgeEdge: adj[0].edge, toNode: adj[0].to });
     }
@@ -92,8 +98,7 @@ function findAlternativePoi(pack, graph, targetPoiId, usedPoiIds, intent) {
     if (avoid.has(p.id)) return false;
     const node = graph.nodeById.get(p.entranceNode);
     if (!node || node.status !== 'open') return false;
-    const edges = graph.adj.get(p.entranceNode) || [];
-    return edges.length > 1; // 仅选择处于环网中的点位
+    return adjOf(graph, p.entranceNode).length > 1; // 仅选择处于环网中的点位
   });
 
   pool.sort((a, b) => {
@@ -260,7 +265,19 @@ class RoutePlanningAgent {
           .map((x) => x.plan)
           .find((plan) => plan.stops?.some((s) => s.poiId === poiId));
         if (repairedRelax) {
-          const meters = deadEndInfo ? Math.round(deadEndInfo.bridgeEdge.lengthM) : Math.round(repairedRelax.repeatedDistanceM || 100);
+          // 桥梁距离：优先用真实步行边长度；边上没有可信距离时降级为两点直线估算（仅用于文案）
+          const meters = (() => {
+            if (deadEndInfo) {
+              const bridge = deadEndInfo.bridgeEdge;
+              if (bridge && Number.isFinite(bridge.lengthM)) return Math.round(bridge.lengthM);
+              const a = graph.nodeById && graph.nodeById.get(poiId);
+              const b = graph.nodeById && graph.nodeById.get(deadEndInfo.toNode);
+              if (a && b && Number.isFinite(a.lng) && Number.isFinite(a.lat) && Number.isFinite(b.lng) && Number.isFinite(b.lat)) {
+                return Math.round(haversineM(a, b));
+              }
+            }
+            return Math.round(repairedRelax.repeatedDistanceM || 100);
+          })();
           proposals.push({
             id: `allow_return_backtrack_${poiId}`,
             action: 'allow_commute_backtrack',

@@ -298,6 +298,7 @@ class AmapAreaGraph {
     if (cached && cached.ids === ids.join('|')) {
       this._restoreMatrix(cached, ids);
       this._dropUnreachable(cands);
+      this._buildAdj();
       return;
     }
 
@@ -337,6 +338,20 @@ class AmapAreaGraph {
     }
     this._dropUnreachable(cands);
     matrixCacheSet(opts.cacheKey, this._snapshot(ids));
+    this._buildAdj();
+  }
+
+  /** 与 VenueGraph 同构的邻接表：真实步行边按无向处理（正反共用同一条边）。
+   *  拓扑预检（死胡同 / 唯一桥梁识别）等只认 graph.adj 的代码，在真实高德包上因此同样可用。 */
+  _buildAdj() {
+    this.adj = new Map();
+    for (const e of this._edges.values()) {
+      if (e.closed || e.walkAllowed === false) continue;
+      if (!this.adj.has(e.from)) this.adj.set(e.from, []);
+      if (!this.adj.has(e.to)) this.adj.set(e.to, []);
+      this.adj.get(e.from).push({ to: e.to, edge: e });
+      this.adj.get(e.to).push({ to: e.from, edge: e });
+    }
   }
 
   /** 写入一对 OD 的正反两条缓存（无向：正反共用距离，折线反向） */

@@ -115,8 +115,17 @@ class JobRunner {
         }
       }
     } catch (e) {
-      store.update('jobs', job.id, { status: 'failed', updatedAt: nowIso(), error: { code: e.code || 'INTERNAL', message: e.message } });
-      this.emit(job, 'job.failed', { code: e.code || 'INTERNAL', message: e.message, retryable: true });
+      const err = { code: e.code || 'INTERNAL', message: e.message };
+      store.update('jobs', job.id, { status: 'failed', updatedAt: nowIso(), error: err });
+      // 规划任务异常（数据源/适配器/代码错误）→ 计划必须落到明确的 failed 终态并带上错误信息，
+      // 否则会永远停在 solving，前端只能一直转圈，用户也看不到失败原因。
+      if (job.type === 'plan.generate' && job.planId) {
+        const plan = store.byId('plans', job.planId);
+        if (plan && ['queued', 'retrieving', 'solving', 'verifying'].includes(plan.status)) {
+          store.update('plans', job.planId, { status: 'failed', error: err, failedAt: nowIso() });
+        }
+      }
+      this.emit(job, 'job.failed', { code: err.code, message: err.message, retryable: true });
     }
   }
 
