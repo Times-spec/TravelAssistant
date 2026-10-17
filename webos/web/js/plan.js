@@ -246,6 +246,7 @@ export function renderPlan(view, ctx, planId) {
           h('span', { class: 'agent-badge' }, isAgent ? '有界智能体' : '算法直解')),
         h('button', { class: 'link-btn', onclick: () => { agentCollapsed = !agentCollapsed; renderStages(); } },
           agentCollapsed ? '展开 ▾' : '收起 ▴')),
+      !allDone && !agentCollapsed ? h('div', { class: 'agent-sub job-progress', role: 'status', 'aria-live': 'polite' }, summary) : null,
       h('div', { class: 'agent-sub' },
         agentCollapsed ? summary : (isAgent
           ? '只编排「约束台账 → 求解 → 独立验证 → 修复提议」，不直接生成道路'
