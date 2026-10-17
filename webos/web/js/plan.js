@@ -232,7 +232,9 @@ export function renderPlan(view, ctx, planId) {
     const activeStep = steps.find((s) => s.state === 'active');
     const summary = allDone
       ? `${steps.length} 步完成${verifier ? ` · 独立验证通过 ${verifier.accepted} 个方案` : ''}`
-      : (activeStep ? `正在${activeStep.label}…` : '准备中…');
+      : stageState.queuePosition > 0
+        ? `前面还有 ${stageState.queuePosition} 个任务 · ${stageState.activePhaseLabel || stageState.phaseLabel || '等待派发'}`
+        : stageState.phaseLabel || (activeStep ? `正在${activeStep.label}…` : '准备中…');
 
     progressCard.classList.remove('hidden');
     progressCard.innerHTML = '';
@@ -692,7 +694,11 @@ export function renderPlan(view, ctx, planId) {
     if (['completed', 'failed', 'cancelled'].includes(planData.plan.jobStatus)) return;
     unsub = subscribeJob(jobId, async (evt) => {
       const p = evt.payload || {};
-      if (evt.type === 'intent.normalized') {
+      if (evt.type === 'job.progress') {
+        stageState.queuePosition = p.queuePosition || 0;
+        stageState.phaseLabel = p.phaseLabel || null;
+        stageState.activePhaseLabel = p.activePhaseLabel || null;
+      } else if (evt.type === 'intent.normalized') {
         stageState.intent = 'done'; stageState.candidates = 'active';
         if (p.chips) {
           stageState.confirmText = p.chips.map((c) => c.label).slice(0, 4).join(' · ');

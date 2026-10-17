@@ -631,6 +631,8 @@ class Api {
     if (body.revision !== intent.revision) {
       throw E.conflict('INTENT_REVISION_CONFLICT', '需求已更新，请基于最新版本提交', { latestRevision: intent.revision });
     }
+    const active = this.activePlanningJob(req.user.id);
+    if (active) return { status: 202, planId: active.planId, jobId: active.id, reused: true };
     const plan = {
       id: id('pln'), ownerId: req.user.id, intentId: intent.intentId, intentRevision: intent.revision,
       venueId: intent.venueId, venueRef: intent.venueRef || null, scene: intent.scene,
@@ -663,6 +665,8 @@ class Api {
     if (!plan) throw E.notFound('计划不存在');
     const base = store.byId('route_versions', body.baseRouteId);
     if (!base || base.planId !== plan.id) throw E.badRequest('基准路线版本无效', { field: 'baseRouteId' });
+    const active = this.activePlanningJob(req.user.id);
+    if (active) return { status: 202, planId: active.planId, jobId: active.id, reused: true };
     const job = createJob(store, {
       type: 'plan.edit', ownerId: req.user.id, planId: plan.id,
       payload: { baseRouteId: base.routeId, edits: body.edits || {} },
@@ -672,12 +676,33 @@ class Api {
   }
 
   /* ---------- 任务与事件 ---------- */
+  activePlanningJob(ownerId) {
+    return this.ctx.store.findOne('jobs', (j) => j.ownerId === ownerId && !j.cancelRequested
+      && ['queued', 'running'].includes(j.status) && ['plan.generate', 'plan.edit', 'trip.replan'].includes(j.type));
+  }
+
+  jobProgress(job) {
+    const { store } = this.ctx;
+    const jobs = store.find('jobs', (j) => !j.cancelRequested && ['queued', 'running'].includes(j.status))
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    const phaseOf = (j) => {
+      if (j.status !== 'running') return j.status;
+      const last = store.find('job_events', (e) => e.jobId === j.id).sort((a, b) => b.seq - a.seq)[0];
+      return ({ 'intent.normalized': 'candidates', 'candidates.ready': 'route', 'route.ready': 'alternatives', 'route.alternative_ready': 'guide', 'guide.text_ready': 'guide', 'guide.audio_ready': 'guide' })[last && last.type] || 'candidates';
+    };
+    const labels = { queued: '等待派发', candidates: '正在检索候选', route: '正在组合路线', alternatives: '正在计算备选', guide: '正在补充讲解', completed: '规划完成', failed: '规划失败', cancelled: '任务已取消' };
+    const phase = phaseOf(job);
+    const ahead = job.status === 'queued' ? Math.max(0, jobs.findIndex((j) => j.id === job.id)) : 0;
+    const active = ahead > 0 ? jobs.slice(0, ahead).find((j) => j.status === 'running') : null;
+    return { queuePosition: ahead, phase, phaseLabel: labels[phase] || '正在处理', activePhaseLabel: active ? labels[phaseOf(active)] || '正在处理' : null };
+  }
+
   async getJob(req, p) {
     const { store } = this.ctx;
     const job = store.findOne('jobs', (j) => j.id === p.id && j.ownerId === req.user.id);
     if (!job) throw E.notFound('任务不存在');
     const lastSeq = store.find('job_events', (e) => e.jobId === job.id).reduce((m, e) => Math.max(m, e.seq), 0);
-    return { job: { ...job, payload: undefined }, lastSeq, retryable: job.status === 'failed' };
+    return { job: { ...job, ...this.jobProgress(job), payload: undefined }, lastSeq, retryable: job.status === 'failed' };
   }
 
   async jobEvents(req, p, query, _body, res) {
@@ -687,13 +712,19 @@ class Api {
     const afterSeq = Number(query.afterSeq || 0);
     const events = store.find('job_events', (e) => e.jobId === job.id && e.seq > afterSeq).sort((a, b) => a.seq - b.seq);
     const wantsSse = (req.headers.accept || '').includes('text/event-stream') && !query.poll;
-    if (!wantsSse) return { events, jobStatus: job.status, lastSeq: events.reduce((m, e) => Math.max(m, e.seq), afterSeq) };
+    if (!wantsSse) return { events, jobStatus: job.status, ...this.jobProgress(job), lastSeq: events.reduce((m, e) => Math.max(m, e.seq), afterSeq) };
     // SSE：先补偿缺失事件，再挂接实时流（§9.3）
     writeSseHead(res);
     for (const e of events) res.write(`id: ${e.seq}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
     const unsub = sseHub.subscribe(job.id, res);
+    const progress = () => {
+      const fresh = store.byId('jobs', job.id);
+      if (fresh) res.write(`event: job.progress\ndata: ${JSON.stringify({ type: 'job.progress', jobId: job.id, payload: { ...this.jobProgress(fresh), jobStatus: fresh.status } })}\n\n`);
+    };
+    progress();
+    const progressTimer = setInterval(() => { try { progress(); } catch (_) {} }, 2000);
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 15000);
-    req.on('close', () => { clearInterval(ping); unsub(); });
+    req.on('close', () => { clearInterval(ping); clearInterval(progressTimer); unsub(); });
     return null; // 已接管响应
   }
 
@@ -845,6 +876,8 @@ class Api {
         throw E.conflict('LOCKED_STOP_SKIP', `「${stop.name}」是你锁定的必去点，确认放弃该锁定吗？`, { needConfirm: 'unlock_then_skip', poiId: stop.poiId });
       }
     }
+    const active = this.activePlanningJob(req.user.id);
+    if (active) return { status: 202, planId: active.planId, jobId: active.id, reused: true };
     let currentNodeId = body.currentNodeId || null;
     if (!currentNodeId) {
       const arrivals = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'arrive_confirm');

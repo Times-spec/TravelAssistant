@@ -1,5 +1,6 @@
 'use strict';
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const { createHarness } = require('./live-test-support');
 let passed = 0;
 async function check(name, fn) { await fn(); console.log(`PASS ${name}`); passed++; }
@@ -64,6 +65,25 @@ async function main() {
       for (let i = 0; i < 59; i++) await api.legSteps(req, {}, { from: '104.06,30.66', to: '104.061,30.661' });
       await assert.rejects(() => api.legSteps(req, {}, { from: '104.06,30.66', to: '104.061,30.661' }), (e) => e.status === 429);
     } finally { amap.walkingRoute = realRoute; }
+  });
+  await check('T8 同用户并发提交只产生一个规划任务', async () => {
+    const { api, req, ctx } = createHarness();
+    ctx.store.insert('intents', { id: 'intent', intentId: 'intent', ownerId: req.user.id, revision: 1 });
+    const results = await Promise.all([api.createPlan(req, {}, {}, { intentId: 'intent', revision: 1 }), api.createPlan(req, {}, {}, { intentId: 'intent', revision: 1 })]);
+    assert.equal(results[0].jobId, results[1].jobId); assert.equal(ctx.store.find('jobs', () => true).length, 1);
+    assert.equal(results[1].reused, true);
+  });
+  await check('T8 SSE和轮询提供相同的排队位置和阶段', async () => {
+    const { api, req, ctx } = createHarness();
+    ctx.store.insert('jobs', { id: 'first', ownerId: 'another-user', type: 'plan.generate', status: 'running', createdAt: '2026-10-18T09:00:00Z' });
+    ctx.store.insert('jobs', { id: 'second', ownerId: req.user.id, type: 'plan.generate', status: 'queued', createdAt: '2026-10-18T09:01:00Z' });
+    const poll = await api.jobEvents(req, { id: 'second' }, { poll: 1 }, {});
+    assert.equal(poll.queuePosition, 1); assert.equal(poll.phase, 'queued'); assert.equal(poll.activePhaseLabel, '正在检索候选');
+    const snapshot = await api.getJob(req, { id: 'second' }); assert.equal(snapshot.job.queuePosition, 1);
+    const streamReq = Object.assign(new EventEmitter(), req, { headers: { accept: 'text/event-stream' } });
+    const chunks = []; const res = { writeHead() {}, write: (chunk) => chunks.push(chunk) };
+    await api.jobEvents(streamReq, { id: 'second' }, {}, {}, res); streamReq.emit('close');
+    const stream = chunks.join(''); assert(stream.includes('event: job.progress')); assert(stream.includes('"queuePosition":1'));
   });
   console.log(`API: ${passed} passed, 0 failed`);
 }
