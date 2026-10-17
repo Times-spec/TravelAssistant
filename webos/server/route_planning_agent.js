@@ -118,14 +118,20 @@ function synthesizeTourRationale(plan, intent) {
   const durMin = Math.round((plan.totals?.totalSec || 0) / 60);
   const distKm = ((plan.totals?.distanceM || 0) / 1000).toFixed(1);
   const isLoop = plan.startNodeId != null && plan.endNodeId === plan.startNodeId;
-  const flowType = isLoop ? '环形闭环' : '单向游览';
+  // 单站谈不上"线路形态"：不足 2 站不写环形闭环/单向游览
+  const flowType = stops.length >= 2 ? (isLoop ? '环形闭环' : '单向游览') : '';
+  const namesText = stops.length > 1 ? `途经${topNames}等核心点位` : `途经${topNames}`;
 
-  let rationale = `已为你规划${stops.length}站${flowType}路线，途经${topNames}等核心点位。`;
+  let rationale = `已为你规划${stops.length}站${flowType}路线，${namesText}。`;
   rationale += `全程预估耗时约 ${durMin} 分钟，步行 ${distKm} 公里。`;
-  if (plan.repeatRatio === 0) {
+  // 有重复距离就不能说"零重复/零回头路"：如实说明有多少米沿原路走回
+  const repeatedM = Math.round(plan.repeatedDistanceM || 0);
+  if (repeatedM > 0) {
+    rationale += isLoop
+      ? `返程有约 ${repeatedM} 米沿原路走回（回起点的必经通勤）；`
+      : `途中有约 ${repeatedM} 米沿原路走回；`;
+  } else {
     rationale += `路线已严格规划为零回头路，完全避免重复行走；`;
-  } else if (plan.warnings?.some((w) => w.code === 'RETURN_BACKTRACK')) {
-    rationale += `游览段保持零重复路段，仅末段返程包含必要通勤衔接；`;
   }
   if (intent.pace === 'easy') {
     rationale += `整体节奏舒缓，预留了充足的休息与观景缓冲。`;
@@ -347,4 +353,4 @@ class RoutePlanningAgent {
   }
 }
 
-module.exports = { RoutePlanningAgent, compileConstraintLedger, verifyRoutePlan };
+module.exports = { RoutePlanningAgent, compileConstraintLedger, verifyRoutePlan, synthesizeTourRationale };

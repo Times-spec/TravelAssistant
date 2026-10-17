@@ -672,15 +672,11 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
   }).map((p) => p.id);
   const visitedTargetIds = schedule.stops.map((s) => s.nodeId).filter((x) => openPoiIds.includes(x));
 
-  // 主题命名
+  // 主题命名：按场所气质选，而不是只看站点标签的众数
   const tagCount = {};
   for (const s of schedule.stops) for (const t of s.poi.tags) tagCount[t] = (tagCount[t] || 0) + 1;
   const topTag = Object.entries(tagCount).sort((a, b) => b[1] - a[1])[0];
-  const isCity = pack.venue.id === 'area_amap';
-  const themes = isCity
-    ? { 自然: '城市绿线', 公园湿地: '公园漫步', 人文: '城市人文漫步', 建筑: '街区建筑巡礼', 美食: '逛吃路线', 街区: '街区闲逛' }
-    : { 自然: '水边慢走', 公园湿地: '湿地观鸟', 人文: '人文漫步', 建筑: '老建筑巡礼', 美食: '逛吃路线', 街区: '街区闲逛' };
-  const title = (topTag && themes[topTag[0]]) || (isCity ? '城市漫步' : '公园漫步');
+  const title = chooseRouteTitle(pack, schedule.stops);
 
   const endLabel = intent.endpoint.mode === 'return_to_origin'
     ? `返回${graph.nodeById.get(solved.startNodeId).name}`
@@ -780,6 +776,45 @@ function buildRoutePlan(pack, intent, graph, solved, versionInfo) {
   };
 }
 
+/** 场所是否为人文/古建类景区（故宫、博物馆、故居、古寺……）。
+ *  名称关键词 + 站点标签占比双重判断：真实场所包没有 venue.tags，只有点位标签可用。 */
+function isCulturalVenue(pack, stops) {
+  const name = (pack.venue && pack.venue.name) || '';
+  if (/故宫|博物院|博物馆|纪念馆|故居|遗址|陵|寺|祠|古城|古镇|文庙|书院|宫|府/.test(name)) return true;
+  const n = stops.length || 0;
+  if (!n) return false;
+  let culture = 0, nature = 0;
+  for (const s of stops) {
+    const tags = (s.poi && s.poi.tags) || [];
+    if (tags.includes('人文') || tags.includes('建筑')) culture++;
+    if (tags.includes('自然') || tags.includes('公园湿地')) nature++;
+  }
+  return culture / n >= 0.6 && nature / n < 0.3;
+}
+
+/** 路线标题：同一套标签在不同场所里说法不同。
+ *  人文景区不该出现"水边慢走/逛吃路线"，城市闲逛保留"逛吃路线"。 */
+function chooseRouteTitle(pack, stops) {
+  const tagCount = {};
+  for (const s of stops) for (const t of ((s.poi && s.poi.tags) || [])) tagCount[t] = (tagCount[t] || 0) + 1;
+  const isCity = pack.venue.id === 'area_amap';
+  const topOf = (filter) => Object.entries(tagCount).filter(filter).sort((a, b) => b[1] - a[1])[0];
+  if (isCity) {
+    const themes = { 自然: '城市绿线', 公园湿地: '公园漫步', 人文: '城市人文漫步', 建筑: '街区建筑巡礼', 美食: '逛吃路线', 街区: '街区闲逛' };
+    const top = topOf(() => true);
+    return (top && themes[top[0]]) || '城市漫步';
+  }
+  if (isCulturalVenue(pack, stops)) {
+    // 人文/古建场所：自然类说"园林"，美食不进标题（故宫不是逛吃路线）
+    const themes = { 人文: '人文寻迹', 建筑: '古建巡礼', 自然: '园林漫步', 公园湿地: '园林漫步', 街区: '街区闲逛' };
+    const top = topOf(([t]) => t !== '美食');
+    return (top && themes[top[0]]) || '人文寻迹';
+  }
+  const themes = { 自然: '水边慢走', 公园湿地: '湿地观鸟', 人文: '人文漫步', 建筑: '老建筑巡礼', 美食: '逛吃路线', 街区: '街区闲逛' };
+  const top = topOf(() => true);
+  return (top && themes[top[0]]) || '公园漫步';
+}
+
 function buildWhy(poi, intent) {
   const reasons = [];
   const hits = poi.tags.filter((t) => intent.interests.some((i) => i.tag === t));
@@ -791,6 +826,45 @@ function buildWhy(poi, intent) {
 }
 
 /* ================= 备选方案（§10.1：真实差异 + 去重） ================= */
+
+/** 预算利用率：排进行程的时间 / 用户给的预算（含缓冲，封顶 1） */
+function budgetUtilization(solved, budgetSec) {
+  const used = (solved && solved.schedule && solved.schedule.totals && solved.schedule.totals.totalSec) || 0;
+  return Math.max(0, Math.min(1, used / Math.max(1, budgetSec)));
+}
+
+/** 路线兴趣分：站点兴趣匹配 + 景观价值取平均（避免"多塞低质点"把总分刷高） */
+function routeInterestScore(solved, interestTags) {
+  const stops = (solved && solved.schedule && solved.schedule.stops) || [];
+  if (!stops.length) return 0;
+  let sum = 0;
+  for (const s of stops) {
+    const tags = (s.poi && s.poi.tags) || [];
+    const hit = interestTags.size ? tags.filter((t) => interestTags.has(t)).length / Math.max(1, tags.length) : 0.3;
+    sum += hit + ((s.poi && s.poi.scenic) ?? 0.5) * 0.8;
+  }
+  return sum / stops.length;
+}
+
+/** 主推荐排序：
+ *  ① 存在利用率 ≥60% 的方案时，利用率 <40% 的方案不得做主推荐（仍保留为备选）；
+ *  ② 其余按 兴趣得分 × 预算利用率 降序——"只逛半小时"的高分方案压不过"用满预算"的方案。 */
+function rankRouteAlternatives(results, intent) {
+  const interestTags = new Set((intent.interests || []).map((i) => i.tag));
+  const scored = results.map((r) => {
+    const utilization = budgetUtilization(r.solved, intent.budgetSec);
+    const interestScore = routeInterestScore(r.solved, interestTags);
+    return { ...r, utilization, interestScore, rankScore: interestScore * utilization };
+  });
+  const hasWellFilled = scored.some((r) => r.utilization >= 0.6);
+  const eligible = hasWellFilled ? scored.filter((r) => r.utilization >= 0.4) : scored;
+  const excluded = scored.filter((r) => !eligible.includes(r));
+  const byRank = (a, b) => b.rankScore - a.rankScore;
+  eligible.sort(byRank);
+  excluded.sort(byRank);
+  return [...eligible, ...excluded].map(({ policy, solved, sig }) => ({ policy, solved, sig }));
+}
+
 function solveAlternatives(pack, intent, graph) {
   const policies = [
     { name: 'balanced', interestW: 1.0, timeCostW: 0.55, dwellFactor: 1 },
@@ -809,7 +883,8 @@ function solveAlternatives(pack, intent, graph) {
     });
     if (!dup && sig.size) results.push({ policy: p, solved: r, sig });
   }
-  return results; // 第一条为主推荐，其余为备选；数据只支持一条时就一条
+  // 第一条为主推荐，其余为备选；选主推荐时兼顾预算利用率，不只是兴趣权重
+  return rankRouteAlternatives(results, intent);
 }
 
 /* ================= 不可行 Conflict（§8.8） ================= */
@@ -935,4 +1010,4 @@ function diffRoutes(oldPlan, newPlan) {
   return lines;
 }
 
-module.exports = { VenueGraph, solveAlternatives, solveOnce, scoreCandidates, scheduleRoute, buildRoutePlan, diffRoutes, validatePlan, closedNowConflict, SOLVER_VERSION, POLICY_VERSION };
+module.exports = { VenueGraph, solveAlternatives, solveOnce, scoreCandidates, scheduleRoute, buildRoutePlan, diffRoutes, validatePlan, closedNowConflict, rankRouteAlternatives, chooseRouteTitle, isCulturalVenue, SOLVER_VERSION, POLICY_VERSION };
