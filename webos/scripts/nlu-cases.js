@@ -5,6 +5,7 @@ const path = require('node:path');
 const { ruleNLU, normalizeIntent, confirmChips } = require('../server/domain');
 const { loadPacks } = require('../server/providers');
 const { llmNLU } = require('../server/llm');
+const { createHarness } = require('./live-test-support');
 const packs = loadPacks(path.join(__dirname, '..'));
 const cfg = { llm: { baseUrl: 'http://llm.test', apiKey: '', model: 'test' }, limits: { maxLlmTokens: 1000 } };
 let passed = 0;
@@ -66,6 +67,43 @@ async function main() {
   });
   await check('T1 模型非法钟点被丢弃', () => modelResult({ startClock: '29:90', latestEndClock: '25:00' }, async () => {
     const p = await llmNLU(cfg, '逛逛'); assert.equal(p.startClock, null); assert.equal(p.latestEndClock, null);
+  }));
+  for (const text of ['从春熙路走到宽窄巷子', '逛到宽窄巷子', '最后到宽窄巷子', '去宽窄巷子结束']) {
+    await check(`T2 规则 ${text}`, () => {
+      const p = ruleNLU(text); assert.equal(p.endPlaceName, '宽窄巷子');
+      if (text.startsWith('从')) { assert.equal(p.scene, 'wander'); assert.equal(p.venueName, null); }
+    });
+  }
+  await check('T2 地理编码选15km内最近点并显示固定终点', async () => {
+    const { api, ctx, req } = createHarness({ providers: { map: 'amap', llm: 'rules' } });
+    const amap = require('../server/amap'); const original = amap.textSearch;
+    let searchedCity;
+    amap.textSearch = async (_cfg, name, city) => {
+      assert.equal(name, '宽窄巷子'); searchedCity = city;
+      return [{ name, coord: { lng: 104.8, lat: 30.9 } }, { name, coord: { lng: 104.06, lat: 30.66 } }];
+    };
+    try {
+      const r = await api.normalizeIntentApi(req, {}, {}, { text: '从春熙路走到宽窄巷子', form: { origin: { lng: 104.065, lat: 30.66, city: '成都' } } });
+      assert.equal(searchedCity, '成都'); assert.equal(r.intent.scene, 'wander');
+      assert.equal(r.intent.endpoint.mode, 'fixed'); assert.equal(r.intent.endpoint.point.lng, 104.06);
+      assert(r.chips.some((c) => c.label === '终点：宽窄巷子')); assert.equal(ctx.store.byId('intents', r.intentId).endpoint.mode, 'fixed');
+    } finally { amap.textSearch = original; }
+  });
+  await check('T2 无近邻终点必须追问', async () => {
+    const { api, req } = createHarness();
+    const r = await api.normalizeIntentApi(req, {}, {}, { text: '走到宽窄巷子', form: { origin: { lng: 104.065, lat: 30.66 } } });
+    assert(r.unresolved.some((u) => u.field === 'endpoint' && u.question.includes('宽窄巷子')));
+  });
+  await check('T2 表单显式终点优先', async () => {
+    const { api, req } = createHarness();
+    const r = await api.normalizeIntentApi(req, {}, {}, { text: '走到宽窄巷子', form: {
+      origin: { lng: 104.065, lat: 30.66 }, endpointTouched: true, endpointMode: 'flexible',
+    } });
+    assert.equal(r.intent.endpoint.mode, 'flexible'); assert.equal(r.unresolved.length, 0);
+  });
+  await check('T2 HTTP 模型目的地字段被保留', () => modelResult({ scene: 'wander', venueName: null, endPlaceName: '宽窄巷子' }, async () => {
+    const p = await llmNLU(cfg, '从春熙路走到宽窄巷子');
+    assert.equal(p.scene, 'wander'); assert.equal(p.venueName, null); assert.equal(p.endPlaceName, '宽窄巷子');
   }));
   console.log(`NLU: ${passed} passed, 0 failed`);
 }

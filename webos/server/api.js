@@ -4,8 +4,8 @@
  * SSE 事件流在 /v1/jobs/{id}/events（Accept: text/event-stream），也支持 ?afterSeq= 轮询补偿。
  */
 const { id, token, nowIso, ApiError, E } = require('./util');
-const { normalizeCoordinate } = require('./geo');
-const { normalizeIntent, confirmChips } = require('./domain');
+const { normalizeCoordinate, haversineM } = require('./geo');
+const { normalizeIntent, confirmChips, ruleNLU } = require('./domain');
 const { searchPlaces, reverseGeocode, buildGuideContent } = require('./providers');
 const { createJob, routeSummary } = require('./jobs');
 const { writeSseHead } = require('./sse');
@@ -335,8 +335,46 @@ class Api {
       } catch (e) { preParsed = null; }
     }
 
-    // 场景：用户没显式选 → 交给 AI 判断（说了具体场所=venue，只说走走=wander）
-    if (!['venue', 'wander'].includes(form.scene)) form.scene = (preParsed && preParsed.scene) || 'wander';
+    const rules = ruleNLU(text);
+    // 明确的 A→B 句式纠正模型把起点识别成场所的情况；表单场景仍优先。
+    if (preParsed && rules.scene === 'wander' && rules.endPlaceName) {
+      preParsed = { ...preParsed, scene: 'wander', venueName: null, endPlaceName: rules.endPlaceName };
+    }
+    const parsed = preParsed || rules;
+    if (!['venue', 'wander'].includes(form.scene)) form.scene = parsed.scene || 'wander';
+
+    let unresolvedEndpoint = null;
+    const endPlaceName = parsed.endPlaceName || rules.endPlaceName;
+    const endpointExplicit = form.endpointTouched || (form.endpointMode === 'fixed' && form.endpointPoint);
+    if (endPlaceName && !endpointExplicit && form.origin) {
+      let pick = null;
+      try {
+        let city = form.origin.city || form.city || parsed.venueCity || (form.venueRef && form.venueRef.city) || '';
+        if (cfg.providers.map === 'amap') {
+          const { textSearch, amapGet } = require('./amap');
+          if (!city) {
+            const geo = await amapGet(cfg, '/v3/geocode/regeo', { location: `${form.origin.lng},${form.origin.lat}`, extensions: 'base' });
+            const address = geo.regeocode && geo.regeocode.addressComponent || {};
+            city = typeof address.city === 'string' && address.city || address.province || '';
+          }
+          const results = await textSearch(cfg, endPlaceName, city);
+          pick = results.filter((p) => p.coord && Number.isFinite(p.coord.lng) && Number.isFinite(p.coord.lat))
+            .map((p) => ({ place: p, distance: haversineM(form.origin, p.coord) }))
+            .filter((p) => p.distance <= 15000).sort((a, b) => a.distance - b.distance)[0]?.place;
+        } else {
+          // 演示模式只用已有场所数据，不捏造地名/POI ID。
+          pick = searchPlaces(this.ctx.packs, endPlaceName, form.venueId).results
+            .filter((p) => p.coord && haversineM(form.origin, p.coord) <= 15000)
+            .sort((a, b) => haversineM(form.origin, a.coord) - haversineM(form.origin, b.coord))[0];
+        }
+      } catch (_) { /* 失败明确追问，不能退成顺路结束 */ }
+      if (pick) {
+        form.endpointMode = 'fixed'; form.endpointPoint = pick.coord; form.endpointLabel = pick.name;
+        form.endpointEntranceId = pick.kind === 'entrance' ? pick.id : null;
+      } else {
+        unresolvedEndpoint = { field: 'endpoint', question: `起点15公里内没有找到「${endPlaceName}」，请搜索并确认终点位置。`, reason: '目的地未能解析到可确认的近邻地点' };
+      }
+    }
 
     // 场所自动识别：一句"想去人民公园"即可直接成路线（§4.2 场所搜索的 AI 路径）
     const autoResolved = { ambiguous: null, resolved: null };
@@ -393,6 +431,8 @@ class Api {
       profile: profile ? { interests: profile.interests, pace: profile.pace } : null,
       venuePack,
     }, this.ctx.packs, preParsed);
+    if (unresolvedEndpoint) intent.unresolved.push(unresolvedEndpoint);
+    else if (endPlaceName && !endpointExplicit && intent.endpoint.mode === 'fixed') intent.fieldEvidence.endpoint = { source: 'text', rawSpan: endPlaceName };
 
     if (autoResolved.resolved) intent.autoResolvedVenue = autoResolved.resolved.name;
     if (autoResolved.ambiguous) {

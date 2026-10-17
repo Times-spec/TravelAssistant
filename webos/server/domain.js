@@ -30,6 +30,7 @@ function cnToNum(s) {
 /* ---------------- 规则 NLU（演示模式的 LLM 替代，输出同一 Schema） ---------------- */
 function ruleNLU(text) {
   const out = {
+    scene: null, venueName: null, venueCity: null, endPlaceName: null,
     objective: null, interests: [], mobility: null, pace: null,
     durationSec: null, startClock: null, latestEndClock: null, endpointRef: null,
     mustVisitNames: [], avoidNames: [],
@@ -118,6 +119,13 @@ function ruleNLU(text) {
   while ((mm = avoidRe.exec(t))) out.avoidNames.push(mm[1].trim());
 
   // 终点
+  const destination = t.match(/(?:走到|逛到|最后到|终点(?:是|为)?)[「“"]?([^，。；！？,;!?]+?)(?:[」”"]?(?:结束|收尾|为终点|作为终点)|[，。；！？,;!?]|$)/)
+    || t.match(/去[「“"]?([^，。；！？,;!?]+?)[」”"]?(?:结束|收尾)/);
+  if (destination && !/哪算哪/.test(destination[1])) {
+    const name = destination[1].replace(/[」”"]$/, '').trim();
+    if (name.length >= 2 && name.length <= 40) out.endPlaceName = name;
+    if (/从.+(?:走到|逛到)/.test(t)) out.scene = 'wander';
+  }
   if (/回到?起点|原路返回|回南门|回到?南门/.test(t)) out.endpointRef = { mode: 'return_to_origin' };
   else if (/回东门|东门出|东门离开/.test(t)) out.endpointRef = { mode: 'named', name: '东门' };
   else if (/顺路|走到哪算哪|不回头/.test(t)) out.endpointRef = { mode: 'flexible' };
@@ -256,7 +264,7 @@ function normalizeIntent(input, packs, preParsed = null) {
 
   // 终点：用户显式选过 → 表单优先；没选过 → 一句话里的终点描述优先（此前默认值总把文字条件盖掉）
   let endpoint;
-  const ep = (form.endpointTouched ? form.endpointMode : null)
+  const ep = ((form.endpointTouched || (form.endpointMode === 'fixed' && form.endpointPoint)) ? form.endpointMode : null)
     || (parsed.endpointRef && parsed.endpointRef.mode)
     || form.endpointMode
     || 'return_to_origin';

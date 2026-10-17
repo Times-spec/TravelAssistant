@@ -23,6 +23,7 @@ const NLU_SCHEMA = `{
   "scene": "venue|wander|null（用户想去某个具体场所=venue；没有目标只是想出去走走=wander）",
   "venueName": "用户想去的公园/景区/校园名称|null",
   "venueCity": "该场所所在城市|null",
+  "endPlaceName": "明确要求走到/逛到/最后到/去那里结束的目的地名|null",
   "objective": "highlights|poi_coverage|relax|null",
   "interests": ["自然|公园湿地|街区|人文|建筑|美食"],
   "mobility": "walk|bike|null",
@@ -49,6 +50,7 @@ async function llmNLU(cfg, text, contextNote = '') {
 规则：
 - 只提取文本中明确表达的信息，没有就给 null/false/空数组；
 - 文本里出现具体地名（如"人民公园""太古里""川大"）→ scene=venue、venueName 填该名称；只说"出去走走/随便逛逛"→ scene=wander、venueName=null；
+- "从A走到B/从A逛到B"是城市闲逛：scene=wander、venueName=null、endPlaceName=B；A是起点，不是场所。"走到X/逛到X/最后到X/去X结束"均填 endPlaceName=X，不得当作顺路结束；
 - "免费优先"是软偏好(freePreferred)，"不收费/零门票/不能花钱"才是硬条件(hardZeroCost)；
 - "少台阶"是 stepFewPreferred，"轮椅/无障碍"才是 stepFreeRequired；
 - "想放空/随便逛/散心" → objective=relax；"都逛完/逛全" → poi_coverage；"精华/最值得/有特色" → highlights；
@@ -81,6 +83,7 @@ ${contextNote}`;
     scene: ['venue', 'wander'].includes(parsed.scene) ? parsed.scene : null,
     venueName: cleanName(parsed.venueName),
     venueCity: cleanName(parsed.venueCity),
+    endPlaceName: cleanName(parsed.endPlaceName),
     objective: ['highlights', 'poi_coverage', 'relax'].includes(parsed.objective) ? parsed.objective : null,
     interests: Array.isArray(parsed.interests) ? parsed.interests.filter((t) => TAGS.includes(t)) : [],
     mobility: ['walk', 'bike'].includes(parsed.mobility) ? parsed.mobility : null,

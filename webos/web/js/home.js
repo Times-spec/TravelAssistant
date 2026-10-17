@@ -744,7 +744,7 @@ export function buildIntentPayload(d) {
       origin: d.origin ? {
         lng: d.origin.lng, lat: d.origin.lat, crs: d.origin.crs || 'GCJ02',
         poiId: d.origin.poiId || null, entranceId: d.origin.entranceId || null,
-        label: d.origin.label, source: d.origin.source,
+        label: d.origin.label, source: d.origin.source, city: d.origin.city || undefined,
       } : null,
       timeMode: d.timeMode, durationSec: d.durationSec, latestEndClock: d.latestEndClock,
       startMode: d.startMode, startAtMs: d.startAtMs,
