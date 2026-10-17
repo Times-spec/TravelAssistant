@@ -193,7 +193,10 @@ function resolveTimes(form, textParsed, tz, evidence) {
   // 双约束并存（"逛两小时，五点前回"）→ 取较紧（上面已是 min 语义：默认推导 vs 截止取更早）
   const byDuration = startMs + durationSec * 1000;
   const textWindow = !!(textParsed.startClock && textParsed.latestEndClock);
-  if (latestEndMs > byDuration && form.timeMode !== 'arriveBy' && (!textWindow || formDuration)) latestEndMs = byDuration;
+  const clockMinutes = (c) => Number(c.slice(0, 2)) * 60 + Number(c.slice(3));
+  const windowSec = textWindow ? ((clockMinutes(textParsed.latestEndClock) - clockMinutes(textParsed.startClock) + 1440) % 1440 || 1440) * 60 : 0;
+  const tighterTextDuration = textWindow && textParsed.durationSec && textParsed.durationSec < windowSec;
+  if (latestEndMs > byDuration && form.timeMode !== 'arriveBy' && (!textWindow || formDuration || tighterTextDuration || windowSec > 8 * 3600)) latestEndMs = byDuration;
   if (latestEndMs < byDuration && (form.timeMode === 'arriveBy' || textParsed.latestEndClock)) {
     // 截止更紧 → 实际预算被截止压缩，确认条需展示
   }
