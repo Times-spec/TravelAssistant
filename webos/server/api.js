@@ -632,7 +632,7 @@ class Api {
       throw E.conflict('INTENT_REVISION_CONFLICT', '需求已更新，请基于最新版本提交', { latestRevision: intent.revision });
     }
     const active = this.activePlanningJob(req.user.id);
-    if (active) return { status: 202, planId: active.planId, jobId: active.id, reused: true };
+    if (active) return this.reusePlanningJob(active, 'plan.generate');
     const plan = {
       id: id('pln'), ownerId: req.user.id, intentId: intent.intentId, intentRevision: intent.revision,
       venueId: intent.venueId, venueRef: intent.venueRef || null, scene: intent.scene,
@@ -666,7 +666,7 @@ class Api {
     const base = store.byId('route_versions', body.baseRouteId);
     if (!base || base.planId !== plan.id) throw E.badRequest('基准路线版本无效', { field: 'baseRouteId' });
     const active = this.activePlanningJob(req.user.id);
-    if (active) return { status: 202, planId: active.planId, jobId: active.id, reused: true };
+    if (active) return this.reusePlanningJob(active, 'plan.edit', plan.id);
     const job = createJob(store, {
       type: 'plan.edit', ownerId: req.user.id, planId: plan.id,
       payload: { baseRouteId: base.routeId, edits: body.edits || {} },
@@ -679,6 +679,13 @@ class Api {
   activePlanningJob(ownerId) {
     return this.ctx.store.findOne('jobs', (j) => j.ownerId === ownerId && !j.cancelRequested
       && ['queued', 'running'].includes(j.status) && ['plan.generate', 'plan.edit', 'trip.replan'].includes(j.type));
+  }
+
+  reusePlanningJob(job, type, planId = null, tripId = null) {
+    if (job.type !== type || (planId && job.planId !== planId) || (tripId && job.tripId !== tripId)) {
+      throw E.conflict('PLANNING_IN_PROGRESS', '已有路线任务正在处理，请完成后再调整', { jobId: job.id, planId: job.planId, jobType: job.type });
+    }
+    return { status: 202, planId: job.planId, jobId: job.id, reused: true };
   }
 
   jobProgress(job) {
@@ -877,7 +884,7 @@ class Api {
       }
     }
     const active = this.activePlanningJob(req.user.id);
-    if (active) return { status: 202, planId: active.planId, jobId: active.id, reused: true };
+    if (active) return this.reusePlanningJob(active, 'trip.replan', trip.planId, trip.id);
     let currentNodeId = body.currentNodeId || null;
     if (!currentNodeId) {
       const arrivals = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'arrive_confirm');

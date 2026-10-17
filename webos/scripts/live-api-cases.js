@@ -78,6 +78,13 @@ async function main() {
     assert.equal(results[0].jobId, results[1].jobId); assert.equal(ctx.store.find('jobs', () => true).length, 1);
     assert.equal(results[1].reused, true);
   });
+  await check('T8 不同类型并发不能复用成错误的提议订阅', async () => {
+    const { api, req, ctx } = tripHarness();
+    ctx.store.insert('jobs', { id: 'generating', ownerId: req.user.id, planId: 'another-plan', type: 'plan.generate', status: 'running' });
+    await assert.rejects(() => api.replanTrip(req, { id: 'trip' }, {}, { cause: 'fatigue_reported' }),
+      (e) => e.status === 409 && e.details.jobId === 'generating');
+    assert.equal(ctx.store.find('jobs', () => true).length, 1);
+  });
   await check('T8 SSE和轮询提供相同的排队位置和阶段', async () => {
     const { api, req, ctx } = createHarness();
     ctx.store.insert('jobs', { id: 'first', ownerId: 'another-user', type: 'plan.generate', status: 'running', createdAt: '2026-10-18T09:00:00Z' });
