@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { ruleNLU, normalizeIntent, confirmChips } = require('../server/domain');
 const { loadPacks } = require('../server/providers');
-const { llmNLU, parseCommand } = require('../server/llm');
+const { llmNLU, parseCommand, ruleCommand } = require('../server/llm');
 const { createHarness } = require('./live-test-support');
 const packs = loadPacks(path.join(__dirname, '..'));
 const cfg = { llm: { baseUrl: 'http://llm.test', apiKey: '', model: 'test' }, limits: { maxLlmTokens: 1000 } };
@@ -158,6 +158,9 @@ async function main() {
     ctx.runner.resolvePackGraph = async () => ({ pack: { pois: [], nodes: [] } });
     const r = await api.aiCommand(req, {}, {}, { tripId: 'trip-command', text: '喝杯咖啡' });
     assert.equal(r.action, 'none'); assert.equal(r.data.poiId, null); assert.doesNotMatch(r.reply, /帮你|已为你|加进|添加|安排/);
+  });
+  await check('T4 否定和询问不能被规则兜底反向执行', () => {
+    for (const text of ['我不想喝咖啡', '我不累了', '喝咖啡要花多少钱']) assert.equal(ruleCommand(text), null);
   });
   console.log(`NLU: ${passed} passed, 0 failed`);
 }

@@ -121,6 +121,8 @@ const COMMAND_CAUSES = ['fatigue_reported', 'rain_reported', 'stop_skipped', 'qu
 // 明确指令也走确定性兜底，避免模型或网络不可用时说了却没有动作。
 function ruleCommand(text) {
   let cause = null, poiName = null;
+  // 只兜底明确的肯定请求，否定句和知识问题交给模型或按钮。
+  if (/不想喝|不要喝|不喝|别.*(?:咖啡|吃)|不累|没(?:有)?累|多少钱|是否|介绍一下/.test(text)) return null;
   if (/累了|太累|走不动|想歇|休息一下/.test(text)) cause = 'fatigue_reported';
   else if (/下雨|天气不好/.test(text)) cause = 'rain_reported';
   else if (/跳过下一站|下一站不去|不想去下一站/.test(text)) { cause = 'stop_skipped'; poiName = '下一站'; }
