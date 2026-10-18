@@ -955,6 +955,17 @@ class Api {
     return route.stops.every((s) => resolved.has(s.poiId));
   }
 
+  /** 计划对应的场所名（实时片区 / 真实场所 / 演示场所包） */
+  venueNameOf(plan) {
+    const { store } = this.ctx;
+    const intent = plan && store.byId('intents', plan.intentId);
+    if (!intent) return null;
+    if (intent.venueId === 'area_amap') return '周边片区（高德实时数据）';
+    if (intent.venueRef && intent.venueRef.name) return intent.venueRef.name;
+    const pk = this.ctx.packs.find((x) => x.venue.id === intent.venueId);
+    return pk ? pk.venue.name : null;
+  }
+
   buildTripSummary(trip) {
     const { store } = this.ctx;
     const plan = store.byId('plans', trip.planId);
@@ -1011,14 +1022,7 @@ class Api {
         };
       }),
       demo: this.ctx.cfg.demoMode,
-      venueName: (() => {
-        const intent = plan && store.byId('intents', plan.intentId);
-        if (!intent) return null;
-        if (intent.venueId === 'area_amap') return '周边片区（高德实时数据）';
-        if (intent.venueRef && intent.venueRef.name) return intent.venueRef.name;
-        const pk = this.ctx.packs.find((x) => x.venue.id === intent.venueId);
-        return pk ? pk.venue.name : null;
-      })(),
+      venueName: this.venueNameOf(plan),
     };
   }
 
@@ -1056,11 +1060,15 @@ class Api {
       .sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''))
       .slice(0, Number(query.limit || 50));
     return {
-      trips: trips.map((t) => ({
-        id: t.id, status: t.status, startedAt: t.startedAt, finishedAt: t.finishedAt,
-        summary: t.finishedAt ? this.buildTripSummary(t) : null,
-        venueName: t.finishedAt ? this.buildTripSummary(t).venueName : null,
-      })),
+      trips: trips.map((t) => {
+        const summary = t.finishedAt ? this.buildTripSummary(t) : null;
+        return {
+          id: t.id, status: t.status, startedAt: t.startedAt, finishedAt: t.finishedAt,
+          summary,
+          // 未结束的行程没有 summary，场所名单独解析（时间线/历史列表都要显示它）
+          venueName: (summary && summary.venueName) || this.venueNameOf(store.byId('plans', t.planId)),
+        };
+      }),
     };
   }
 
@@ -1109,9 +1117,13 @@ class Api {
   async putPreferences(req, _p, _q, body) {
     const { store } = this.ctx;
     const existing = store.findOne('preferences', (x) => x.userId === req.user.id);
+    // 兴趣列表清洗：去空白、去重、单个关键词 ≤8 字、最多 12 个（自定义关键词也存这里）
+    const cleanInterests = (arr) => [...new Set((arr || [])
+      .map((t) => String(t == null ? '' : t).trim())
+      .filter((t) => t && t.length <= 8))].slice(0, 12);
     const patch = {
       enabled: body.enabled !== false,
-      interests: Array.isArray(body.interests) ? body.interests : (existing ? existing.interests : []),
+      interests: Array.isArray(body.interests) ? cleanInterests(body.interests) : (existing ? existing.interests : []),
       pace: body.pace || (existing ? existing.pace : null),
       guideStyle: body.guideStyle || (existing ? existing.guideStyle : 'normal'),
       updatedAt: nowIso(),

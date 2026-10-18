@@ -4,6 +4,7 @@ const assert = require('assert');
 const { corridorT, pickCorridor, END_DUP_M, COMMERCIAL_EXPERIENCE_RE, EXCLUDE_NAME_RE } = require('../server/amap');
 const { pickFatigueDrops } = require('../server/jobs');
 const { diffRoutes } = require('../server/planner');
+const { normalizeIntent, confirmChips } = require('../server/domain');
 const { haversineM } = require('../server/geo');
 let n = 0; const ok = (name, fn) => { fn(); n++; console.log('✓', name); };
 
@@ -43,6 +44,15 @@ ok('差异文案不把已到访站写成"跳过"', () => {
   const prop = { stops: [{ poiId: 'C', name: '丙' }], totals: { distanceM: 900 }, endArrivalAt: '2026-10-18T14:40:00+08:00' };
   const lines = diffRoutes(base, prop, { doneIds: ['A'] });
   assert(lines.some((l) => l.includes('跳过乙')) && !lines.some((l) => l.includes('甲')), lines.join('|'));
+});
+ok('自定义兴趣关键词进需求、不被标签白名单丢弃', () => {
+  const it = normalizeIntent({
+    text: '', timezone: 'Asia/Shanghai',
+    form: { scene: 'wander', origin: { lng: 104.062, lat: 30.659 }, interests: [] },
+    profile: { interests: ['自然', '咖啡'] },
+  }, [], null);
+  assert(it.interests.some((x) => x.tag === '咖啡'), JSON.stringify(it.interests));
+  assert(confirmChips(it).some((c) => c.field === 'interests' && c.label.includes('咖啡')), JSON.stringify(confirmChips(it)));
 });
 void haversineM;
 console.log(`live-fixes: ${n} passed`);

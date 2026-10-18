@@ -321,7 +321,12 @@ function normalizeIntent(input, packs, preParsed = null) {
   } else {
     evidence.interests = { source: (form.interests || []).length ? 'form' : parsed.interests.length ? 'text' : 'default' };
   }
-  const interests = [...interestSet].filter((t) => INTEREST_TAGS.includes(t)).map((tag) => ({ tag, weight: 1 }));
+  // 兴趣既支持标准标签，也支持用户在偏好里自定义的关键词（"咖啡""夜景"这类）。
+  // 标准标签直接进；自定义词做长度/数量清洗后进（§6.2 兴趣字段；评分层按名称/标签包含匹配）。
+  const clean = (t) => String(t == null ? '' : t).trim();
+  const known = [...interestSet].map(clean).filter((t) => INTEREST_TAGS.includes(t));
+  const custom = [...interestSet].map(clean).filter((t) => t && !INTEREST_TAGS.includes(t) && t.length <= 8).slice(0, 10);
+  const interests = [...new Set([...known, ...custom])].map((tag) => ({ tag, weight: 1 }));
 
   // 必去/避开（表单 ID 优先；文本名做实体解析）
   let mustVisitIds = [...(form.mustVisitIds || [])];

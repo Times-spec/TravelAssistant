@@ -98,6 +98,16 @@ class VenueGraph {
 }
 
 /* ================= 推荐层：候选评分（§7.4 / §8.3 软得分归一化） ================= */
+
+/** 单个兴趣词是否命中点位：标准标签按标签相等，自定义关键词（"咖啡""夜景"）再按名称/标签包含 */
+function interestMatched(poi, tag) {
+  const t = String(tag || '');
+  if (!t) return false;
+  if ((poi.tags || []).includes(t)) return true;
+  if (String(poi.name || '').includes(t)) return true;
+  return (poi.tags || []).some((x) => String(x).includes(t));
+}
+
 function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
   const interestTags = new Set(intent.interests.map((i) => i.tag));
   const avoid = new Set(intent.hard.avoidPoiIds);
@@ -106,8 +116,8 @@ function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
     if (avoid.has(poi.id)) continue;
     const node = graph.nodeById.get(poi.entranceNode);
     if (!node || node.status !== 'open') continue; // 关闭点不进入候选（必去点另行追问）
-    const interestHit = poi.tags.filter((t) => interestTags.has(t)).length;
-    const interestScore = interestTags.size ? interestHit / Math.max(1, poi.tags.length) : 0.3;
+    const interestHit = intent.interests.filter((i) => interestMatched(poi, i.tag)).length;
+    const interestScore = interestTags.size ? Math.min(1, interestHit / Math.max(1, poi.tags.length)) : 0.3;
     const scenic = poi.scenic ?? 0.5;
     const costPenalty = intent.soft.freePreferred && poi.ticketKnown && poi.ticketCny > 0 ? 0.3 : 0;
     const quietBonus = intent.soft.quietPreferred && ['自然', '公园湿地'].some((t) => poi.tags.includes(t)) ? 0.1 : 0;
@@ -881,7 +891,7 @@ function chooseRouteTitle(pack, stops) {
 
 function buildWhy(poi, intent) {
   const reasons = [];
-  const hits = poi.tags.filter((t) => intent.interests.some((i) => i.tag === t));
+  const hits = intent.interests.map((i) => i.tag).filter((t) => interestMatched(poi, t));
   if (hits.length) reasons.push(`符合你的${hits.join('、')}偏好`);
   if (poi.scenic >= 0.8) reasons.push('园内景观价值最高的点位之一');
   if (intent.hard.mustVisitIds.includes(poi.id)) reasons.push('你指定的必去点');
