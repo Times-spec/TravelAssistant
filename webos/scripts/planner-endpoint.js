@@ -35,6 +35,16 @@ global.fetch = async (url, opts) => {
     });
     return J({ count: String(pois.length), pois });
   }
+  if (u.pathname.includes('/place/detail')) {
+    const id = q.get('id');
+    if (id === 'MUST1') {
+      return J({ count: '1', pois: [{
+        id: 'MUST1', name: '指定必去点', typecode: '110200', type: '风景名胜', address: '必去路1号',
+        location: '104.012,30.0', distance: '0', cityname: '成都市', adname: '锦江区',
+      }] });
+    }
+    return J({ count: '0', pois: [] });
+  }
   if (u.pathname.includes('/direction/walking')) {
     const a = q.get('origin'), b = q.get('destination');
     const [x1, y1] = a.split(',').map(Number), [x2, y2] = b.split(',').map(Number);
@@ -88,6 +98,9 @@ function intentOf(endpoint) {
     assert(route.endApproach && route.endApproach.endNodeId === 'am_end' && !route.endApproach.returnTrip);
     assert(route.legs[route.legs.length - 1].isReturnLeg);
     assert(route.legs.some((l) => Array.isArray(l.steps) && l.steps[0].instruction), '正向路段应带高德逐步导引');
+    assert(route.endApproach.distanceM < 600, '有终点附近候选时末段不应空走 ' + route.endApproach.distanceM + 'm');
+    assert(/前\/中\/后段/.test(pack.venue.coverageScope.scopeLabel), '走廊候选应分段统计');
+    assert(!pack.pois.some((p) => haversineM(graph.nodes.get(p.id), E) < 60), '离终点 <60m 的点不应作为候选');
     console.log('  固定终点：', stops.map((n) => `${n.name}(距终点${Math.round(dEnd(n))}m)`).join(' → '), `→ 终点 ${route.endApproach.distanceM}m`);
   }
   /* ---------- 4. 回起点不受影响 ---------- */
@@ -99,6 +112,29 @@ function intentOf(endpoint) {
     assert.equal(solved.status, 'ok');
     assert.equal(solved.schedule.endLeg.toNodeId, 'am_origin');
   }
-  console.log('✅ 终点回归通过：独立终点节点 / 末站靠近终点 / endApproach 与逐步导引 / 回起点不变');
+  /* ---------- 5. 顺路结束：在末站直接结束，不再走回起点 ---------- */
+  {
+    const intent = intentOf({ mode: 'flexible' });
+    const { graph, pack } = await buildAmapAreaPack(cfg, O, intent.budgetSec, null);
+    const solved = solveOnce(pack, intent, graph, policy);
+    assert.equal(solved.status, 'ok');
+    assert(!solved.schedule.endLeg, '顺路结束不应有返程段');
+    const route = buildRoutePlan(pack, intent, graph, solved, { version: 1, planId: 'p' });
+    assert(route.endLabel.startsWith('顺路结束于') && !route.endLabel.includes('起点'), route.endLabel);
+    assert(!route.endApproach);
+  }
+  /* ---------- 6. 必去点不在检索结果里也要进候选池（否则硬约束直接判 infeasible） ---------- */
+  {
+    const intent = intentOf({ mode: 'return_to_origin' });
+    intent.hard.mustVisitIds = ['am_MUST1'];
+    const { pack, graph } = await buildAmapAreaPack(cfg, O, intent.budgetSec, null, { mustVisitIds: intent.hard.mustVisitIds });
+    assert(pack.pois.some((p) => p.id === 'am_MUST1'), '必去点应按 id 取详情补进候选池');
+    const solved = solveOnce(pack, intent, graph, policy);
+    assert.equal(solved.status, 'ok', JSON.stringify(solved.conflict || {}));
+    const route = buildRoutePlan(pack, intent, graph, solved, { version: 1, planId: 'p' });
+    assert(route.stops.some((s) => s.poiId === 'am_MUST1'), '路线必须包含必去点');
+    assert.equal(route.constraints.find((c) => c.key === 'must_visit_present').result, 'pass');
+  }
+  console.log('✅ 终点回归通过：独立终点节点 / 末站靠近终点 / endApproach 与逐步导引 / 回起点不变 / 顺路结束在末站 / 末段不空走 / 必去点强制入池');
   process.exit(0);
 })().catch((e) => { console.error('❌', e.message); process.exit(1); });

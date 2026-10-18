@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const BASE = 'http://localhost:8090';
+let BASE = 'http://localhost:8090';
 let passed = 0, failed = 0;
 const results = [];
 
@@ -64,11 +64,36 @@ async function makePlan(token, form, text = '') {
 async function main() {
   // 每次验收使用新目录，绝不删除或写入产品数据库。
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smart-tour-acceptance-'));
+  // 内容库同样隔离：模板热度用例会写 route_templates.json，不能改到产品内容文件（2026-10-18 审计）
+  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smart-tour-content-'));
+  const srcContent = path.join(__dirname, '..', 'data', 'content');
+  // 逐个复制（不用 cpSync：该实现在部分受限环境会被静默中断）
+  for (const f of fs.readdirSync(srcContent)) {
+    const p = path.join(srcContent, f);
+    if (fs.statSync(p).isFile()) fs.copyFileSync(p, path.join(contentDir, f));
+  }
+  // 随机端口 + 就绪探测：固定 8090 可能撞上别的服务，连过去就会得到假结果
+  const port = 8100 + Math.floor(Math.random() * 700);
+  BASE = `http://127.0.0.1:${port}`;
+  let exited = null;
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
-    env: { ...process.env, PORT: '8090', DATA_DIR: dataDir }, stdio: 'pipe',
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, CONTENT_DIR: contentDir }, stdio: 'pipe',
   });
   srv.stderr.on('data', (d) => process.stdout.write('[srv-err] ' + d));
-  await new Promise((r) => setTimeout(r, 1000));
+  srv.on('exit', (code) => { exited = code; });
+  let ready = false;
+  for (let i = 0; i < 40 && exited === null; i++) {
+    try {
+      const r = await fetch(BASE + '/v1/config');
+      if (r.ok) { ready = true; break; }
+    } catch (e) { /* 还没起来 */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!ready) {
+    console.error(exited === null ? '服务启动超时，验收中止' : `服务启动失败（exit ${exited}），验收中止`);
+    try { srv.kill(); } catch (e) {}
+    process.exit(1);
+  }
 
   try {
     const sess = await api('POST', '/v1/sessions/guest');

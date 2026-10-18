@@ -3,7 +3,7 @@
 //       → ③ 怎么安排（只排路线：时长/玩法/节奏，不再改地点）→ 生成路线。
 // AI 不再是入口，而是每一步都能调用的助手（"一句话帮我填"）与游览中的导游（见 trip.js）。
 import { post, get } from './api.js';
-import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, loadAmap } from './ui.js';
+import { h, toast, openSheet, closeSheet, locateBlockedReason, SvgMap, makeProjector, loadAmap } from './ui.js';
 import { saveDraft, state, getVenuePack } from './app.js';
 
 const INTERESTS = ['自然', '公园湿地', '街区', '人文', '建筑', '美食'];
@@ -122,6 +122,8 @@ export function renderHome(view) {
     box.innerHTML = '<div class="empty">正在获取位置…</div>';
     try {
       const pos = await new Promise((res, rej) => {
+        const blocked = locateBlockedReason();
+        if (blocked) return rej(new Error(blocked));
         if (!navigator.geolocation) return rej(new Error('当前环境不支持定位'));
         navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 });
       });
@@ -178,7 +180,7 @@ export function renderHome(view) {
       h('div', { class: 'chips' }, DURATION_PRESETS.map(([sec, label]) =>
         h('button', {
           class: 'chip' + (d.timeMode === 'duration' && d.durationSec === sec ? ' sel' : ''),
-          onclick: () => { d.timeMode = 'duration'; d.durationSec = sec; saveDraft(); rerender(); },
+          onclick: () => { d.timeMode = 'duration'; d.durationSec = sec; d.durationTouched = true; d.durationTouchedAt = Date.now(); saveDraft(); rerender(); },
         }, label)),
         d.timeMode === 'arriveBy' ? h('span', { class: 'chip sel' }, d.latestEndClock + ' 前到终点') : null)),
     isVenueScene
@@ -234,12 +236,13 @@ export function renderHome(view) {
       h('textarea', {
         class: 'ai-input', style: 'min-height:64px;margin-top:6px',
         placeholder: '例如：人民公园，两小时，精华打卡；或：从学校出发逛半天，想看人文和美食',
-        oninput: (ev) => { d.text = ev.target.value; saveDraft(); },
+        oninput: (ev) => { d.text = ev.target.value; d.textAt = Date.now(); saveDraft(); },
       }, d.text || ''),
       h('button', { class: 'btn btn-ghost btn-block', onclick: submitWithText }, '让 AI 帮我填好并规划')));
   async function submitWithText() {
     if (!(d.text || '').trim()) { toast('先说一句想怎么逛'); return; }
-    await doSubmit();
+    // "让 AI 帮我填好并规划"：一句话就是用户最新的表达，里面写的时长优先于草稿里旧的 chip 选择
+    await doSubmit({ textOverrides: true });
   }
 
   /* ================= 底部按钮 ================= */
@@ -272,7 +275,7 @@ export function renderHome(view) {
   }
 
   /* ================= 提交 ================= */
-  async function doSubmit() {
+  async function doSubmit(submitOpts = {}) {
     if (state.config.setupRequired) { toast('服务端未配置地图服务，请按提示配置后使用', 4000); return; }
     if (d.scene === 'venue' && !d.venueId && !d.venueRef) { goStep(2); toast('先选定一个地方'); return; }
     if (d.scene === 'wander' && !d.origin) { goStep(2); toast('先在第二步确定从哪儿出发'); return; }
@@ -283,15 +286,23 @@ export function renderHome(view) {
     const old = primary.textContent;
     primary.textContent = '正在规划…';
     try {
-      const ni = await post('/v1/intents/normalize', buildIntentPayload(d));
-      if (ni.unresolved && ni.unresolved.length) { showClarification(ni, buildIntentPayload(d)); return; }
+      const payload = buildIntentPayload(d, submitOpts);
+      const ni = await post('/v1/intents/normalize', payload);
+      if (ni.unresolved && ni.unresolved.length) { showClarification(ni, payload); return; }
+      // 一句话里的时长生效后回填到表单，避免下次提交又被旧 chip 覆盖；时长取舍有提示时明确告诉用户
+      const ev = ni.intent.fieldEvidence || {};
+      if (ev.durationSec && ev.durationSec.source === 'text' && d.timeMode === 'duration' && ni.intent.budgetSec) {
+        d.durationSec = ni.intent.budgetSec; d.durationTouched = true; d.durationTouchedAt = Date.now(); saveDraft();
+      }
+      const timeNotice = (ni.notices || []).find((n) => /^(DURATION_|WINDOW_)/.test(n.code || ''));
+      if (timeNotice && !ni.intent.originApproach) toast(timeNotice.message, 5000);
       if (ni.intent.autoResolvedVenue && !d.venueRef) {
         d.venueId = ni.intent.venueId; d.venueRef = ni.intent.venueRef; d.scene = 'venue'; saveDraft();
       }
       if (ni.intent.originApproach) {
         d.origin = { lng: ni.intent.origin.point.lng, lat: ni.intent.origin.point.lat, crs: 'GCJ02', label: ni.intent.origin.label, source: 'venue' };
         saveDraft();
-        toast((ni.notices && ni.notices[0] && ni.notices[0].message) || '起点已改到场所入口', 5000);
+        toast((ni.notices || []).map((n) => n.message).join('；') || '起点已改到场所入口', 6000);
       }
       const plan = await post('/v1/plans', { intentId: ni.intentId, revision: ni.revision, idempotencyKey: 'plan_' + Date.now() });
       location.hash = '#/plan/' + plan.planId;
@@ -418,12 +429,12 @@ export function renderHome(view) {
       if (d.timeMode === 'duration') {
         body.append(h('div', { class: 'field-label' }, '逛多久'),
           h('div', { class: 'chips' }, DURATION_PRESETS.map(([sec, label]) =>
-            h('button', { class: 'chip' + (d.durationSec === sec ? ' sel' : ''), onclick: () => { d.durationSec = sec; saveDraft(); refresh(); } }, label)),
+            h('button', { class: 'chip' + (d.durationSec === sec ? ' sel' : ''), onclick: () => { d.durationSec = sec; d.durationTouched = true; d.durationTouchedAt = Date.now(); saveDraft(); refresh(); } }, label)),
             h('label', { class: 'chip' }, '自定义 ',
               h('input', {
                 type: 'number', min: 30, max: 480, value: Math.round(d.durationSec / 60),
                 style: 'width:58px;border:0;outline:0;background:transparent;font:inherit',
-                onchange: (e) => { d.durationSec = Math.max(30, Math.min(480, Number(e.target.value) || 120)) * 60; saveDraft(); },
+                onchange: (e) => { d.durationSec = Math.max(30, Math.min(480, Number(e.target.value) || 120)) * 60; d.durationTouched = true; d.durationTouchedAt = Date.now(); saveDraft(); },
               }), ' 分钟')));
       } else {
         body.append(h('div', { class: 'field-label' }, '最晚几点到终点'),
@@ -434,12 +445,12 @@ export function renderHome(view) {
       body.append(...[
         h('div', { class: 'field-label', style: 'margin-top:10px' }, '开始时间'),
         h('div', { class: 'chips' },
-          h('button', { class: 'chip' + (d.startMode === 'now' ? ' sel' : ''), onclick: () => { d.startMode = 'now'; d.startAtMs = null; saveDraft(); refresh(); } }, '现在出发'),
-          h('button', { class: 'chip' + (d.startMode === 'later' ? ' sel' : ''), onclick: () => { d.startMode = 'later'; saveDraft(); refresh(); } }, '稍后出发')),
+          h('button', { class: 'chip' + (d.startMode === 'now' ? ' sel' : ''), onclick: () => { d.startMode = 'now'; d.startAtMs = null; d.startTouched = true; saveDraft(); refresh(); } }, '现在出发'),
+          h('button', { class: 'chip' + (d.startMode === 'later' ? ' sel' : ''), onclick: () => { d.startMode = 'later'; d.startTouched = true; saveDraft(); refresh(); } }, '稍后出发')),
         d.startMode === 'later' ? h('input', {
           class: 'input', type: 'datetime-local', style: 'margin-top:8px',
           value: d.startAtMs ? toLocalInput(d.startAtMs) : '',
-          onchange: (e) => { d.startAtMs = e.target.value ? new Date(e.target.value).getTime() : null; saveDraft(); },
+          onchange: (e) => { d.startAtMs = e.target.value ? new Date(e.target.value).getTime() : null; d.startTouched = true; saveDraft(); },
         }) : null,
       ].filter(Boolean));
     }
@@ -472,6 +483,8 @@ export function renderHome(view) {
 
   /* ================= 定位 / 搜索 / 地图选点 ================= */
   async function locateMe() {
+    const blocked = locateBlockedReason();
+    if (blocked) { toast(blocked, 4000); return; }
     if (!navigator.geolocation) { toast('当前环境不支持定位，请搜索或地图选点'); return; }
     toast('正在定位…');
     navigator.geolocation.getCurrentPosition(async (pos) => {
@@ -736,7 +749,9 @@ export function endLabel(dd) {
     : dd.endpointMode === 'flexible' ? '顺路结束'
       : (dd.endpointLabel || '指定终点');
 }
-export function buildIntentPayload(d) {
+export function buildIntentPayload(d, opts = {}) {
+  // 文字比 chip 改得更晚（或从 AI 按钮提交）→ 一句话里的时长优先；否则表单优先（服务端会提示冲突）
+  const textOverrides = !!(opts.textOverrides || ((d.text || '').trim() && (d.textAt || 0) > (d.durationTouchedAt || 0)));
   return {
     form: {
       scene: d.scene === 'auto' ? undefined : d.scene,
@@ -744,10 +759,11 @@ export function buildIntentPayload(d) {
       origin: d.origin ? {
         lng: d.origin.lng, lat: d.origin.lat, crs: d.origin.crs || 'GCJ02',
         poiId: d.origin.poiId || null, entranceId: d.origin.entranceId || null,
-        label: d.origin.label, source: d.origin.source,
+        label: d.origin.label, source: d.origin.source, city: d.origin.city || undefined,
       } : null,
       timeMode: d.timeMode, durationSec: d.durationSec, latestEndClock: d.latestEndClock,
       startMode: d.startMode, startAtMs: d.startAtMs,
+      startTouched: !!d.startTouched, durationTouched: !!d.durationTouched, textOverrides,
       endpointMode: d.endpointMode,
       // 只有用户显式选过终点才把表单值当强约束；否则一句话里的"顺路结束/从东门出"应能生效
       endpointTouched: !!d.endpointTouched,

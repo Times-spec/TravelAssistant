@@ -29,6 +29,21 @@ class Market {
       title: `${city.name} ${Number(snapshot.days) || dayList.length} 日行程`,
       status: 'planned',
       payment: null,
+      // 保存当时的完整结果：重新打开行程单必须与保存时逐日一致（内容库或算法更新不得改变已保存结果）
+      snapshot: {
+        cityId: city.id, cityName: city.name,
+        days: Number(snapshot.days) || dayList.length,
+        people: Number(body.people) || Number(snapshot.people) || 2,
+        pace: snapshot.pace || null,
+        budget: snapshot.budget || null,
+        interests: Array.isArray(snapshot.interests) ? snapshot.interests : [],
+        dayList,
+        totals: snapshot.totals || null,
+        notices: Array.isArray(snapshot.notices) ? snapshot.notices : [],
+        template: snapshot.template || null,
+        algorithm: snapshot.algorithm || null,
+        generatedAt: snapshot.generatedAt || null,
+      },
       createdAt: nowIso(), updatedAt: nowIso(),
     };
     store.insert('orders', order);

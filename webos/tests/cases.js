@@ -1,0 +1,17 @@
+module.exports = (O, P) => [
+  { id: 'W1', name: '成都春熙路 3h 回起点', form: { scene: 'wander', origin: O(104.0807, 30.6573, '春熙路', '成都市'), durationSec: 10800 } },
+  { id: 'W2', name: '成都春熙路→宽窄巷子 3h', form: { scene: 'wander', origin: O(104.0807, 30.6573, '春熙路', '成都市'), durationSec: 10800, endpointMode: 'fixed', endpointPoint: P(104.0556, 30.6697), endpointLabel: '宽窄巷子' } },
+  { id: 'W3', name: '成都春熙路 3h 顺路结束', form: { scene: 'wander', origin: O(104.0807, 30.6573, '春熙路', '成都市'), durationSec: 10800, endpointMode: 'flexible' } },
+  { id: 'W4', name: '成都春熙路 1h 回起点', form: { scene: 'wander', origin: O(104.0807, 30.6573, '春熙路', '成都市'), durationSec: 3600 } },
+  { id: 'W5', name: '成都春熙路 半天5h 回起点', form: { scene: 'wander', origin: O(104.0807, 30.6573, '春熙路', '成都市'), durationSec: 18000 } },
+  { id: 'W6', name: '杭州湖滨→断桥 2h', form: { scene: 'wander', origin: O(120.163, 30.258, '湖滨', '杭州市'), durationSec: 7200, endpointMode: 'fixed', endpointPoint: P(120.152, 30.2595), endpointLabel: '断桥残雪' } },
+  { id: 'W7', name: '西安钟楼→大雁塔 4h', form: { scene: 'wander', origin: O(108.9474, 34.2610, '钟楼', '西安市'), durationSec: 14400, endpointMode: 'fixed', endpointPoint: P(108.9642, 34.2183), endpointLabel: '大雁塔' } },
+  { id: 'W8', name: '上海人民广场 3h 回起点', form: { scene: 'wander', origin: O(121.4752, 31.2304, '人民广场', '上海市'), durationSec: 10800 } },
+  { id: 'W9', name: '成都犀浦 西南交大 3h 回起点（非景区）', form: { scene: 'wander', origin: O(103.9867, 30.7637, '西南交通大学犀浦校区', '成都市'), durationSec: 10800 } },
+  { id: 'W10', name: '北京王府井→天安门 3h', form: { scene: 'wander', origin: O(116.4108, 39.9148, '王府井', '北京市'), durationSec: 10800, endpointMode: 'fixed', endpointPoint: P(116.3975, 39.9087), endpointLabel: '天安门' } },
+  { id: 'W11', name: '广州北京路 2h 美食 顺路结束', form: { scene: 'wander', origin: O(113.2690, 23.1252, '北京路步行街', '广州市'), durationSec: 7200, endpointMode: 'flexible', interests: ['美食'] } },
+  { id: 'W12', name: '成都春熙路 一句话3h（表单30min已点过）', textOnly: false, text: '我有3h想要出去转转', textOverrides: true, form: { scene: 'wander', origin: O(104.0807, 30.6573, '春熙路', '成都市'), durationSec: 1800 } },
+  { id: 'W13', name: '成都 太古里→杜甫草堂 5km 2h（偏短）', form: { scene: 'wander', origin: O(104.0838, 30.6545, '太古里', '成都市'), durationSec: 7200, endpointMode: 'fixed', endpointPoint: P(104.0285, 30.6600), endpointLabel: '杜甫草堂' } },
+  { id: 'V1', name: '故宫 午门→神武门 3h', form: { scene: 'venue', venueId: 'live:B000A8UIN8', venueRef: { id: 'live:B000A8UIN8', name: '故宫博物院', lng: 116.397029, lat: 39.917839, city: '北京市', district: '东城区' }, origin: O(116.397, 39.9155, '午门', '北京市'), durationSec: 10800, endpointMode: 'fixed', endpointPoint: P(116.3971, 39.9240), endpointLabel: '神武门' } },
+  { id: 'V2', name: '成都人民公园 2h 回起点', form: { scene: 'venue', venueId: 'live:B001C7X8QA', venueRef: { id: 'live:B001C7X8QA', name: '人民公园', lng: 104.057641, lat: 30.65699, city: '成都市', district: '青羊区' }, origin: O(104.0592, 30.6566, '人民公园东门', '成都市'), durationSec: 7200 } },
+];

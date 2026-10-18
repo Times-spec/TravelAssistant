@@ -30,27 +30,64 @@ function cnToNum(s) {
 /* ---------------- 规则 NLU（演示模式的 LLM 替代，输出同一 Schema） ---------------- */
 function ruleNLU(text) {
   const out = {
+    scene: null, venueName: null, venueCity: null, endPlaceName: null,
     objective: null, interests: [], mobility: null, pace: null,
-    durationSec: null, latestEndClock: null, endpointRef: null,
+    durationSec: null, startClock: null, latestEndClock: null, endpointRef: null,
     mustVisitNames: [], avoidNames: [],
     hard: {}, soft: {}, notes: [],
   };
   if (!text || !text.trim()) return out;
   const t = text.trim();
 
-  // 时长：半小时/两小时/2小时/90分钟/半天
-  let m = t.match(/(半|一|两|二|三|四|五|六|七|八|九|\d+)\s*(?:个)?\s*半?\s*(?:小时|钟头)/);
-  if (m) {
-    let h = cnToNum(m[1]) || 0;
-    if (/半\s*(?:小时|钟头)/.test(t) && m[0].includes('半') && m[1] !== '半') h += 0.5;
-    if (m[1] === '半') h = 0.5;
-    out.durationSec = Math.round(h * 3600);
+  // 时长：半小时/两小时/2小时/2.5小时/3h/1.5h/90分钟/90min/半天
+  // （规则兜底此前不认"3h""2.5小时""90min"，LLM 不可用时会退回默认时长）
+  let m = t.match(/(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)(?![a-z])/i);
+  if (m && Number(m[1]) > 0) out.durationSec = Math.round(Number(m[1]) * 3600);
+  if (!out.durationSec) {
+    m = t.match(/(\d+\.\d+)\s*(?:个)?\s*(?:小时|钟头|个钟)/);
+    if (m) out.durationSec = Math.round(Number(m[1]) * 3600);
   }
   if (!out.durationSec) {
-    m = t.match(/(\d+)\s*分钟/);
+    m = t.match(/(半|一|两|二|三|四|五|六|七|八|九|十|\d+)\s*(?:个)?\s*半?\s*(?:小时|钟头|个钟)/);
+    if (m) {
+      let h = cnToNum(m[1]) || 0;
+      if (/半\s*(?:小时|钟头|个钟)/.test(t) && m[0].includes('半') && m[1] !== '半') h += 0.5;
+      if (m[1] === '半') h = 0.5;
+      out.durationSec = Math.round(h * 3600);
+      const extra = t.slice(m.index + m[0].length).match(/^\s*(?:零)?\s*(\d+|[一二两三四五六七八九十]+)\s*分/);
+      if (extra && !m[0].includes('半')) out.durationSec += (cnToNum(extra[1]) || 0) * 60;
+    }
+  }
+  if (!out.durationSec) {
+    m = t.match(/(\d+)\s*(?:分钟|min|mins|minutes)(?![a-z])/i);
     if (m) out.durationSec = Number(m[1]) * 60;
   }
   if (!out.durationSec && /半天/.test(t)) out.durationSec = 4 * 3600;
+
+  // 时间窗的两端必须一起保留；第二个钟点可沿用第一个的上午/下午。
+  const clockPattern = '(上午|中午|下午|晚上|傍晚|今晚|早上|凌晨)?\\s*(\\d{1,2}|[一二两三四五六七八九十]+)\\s*(?:[:：](\\d{2})|点\\s*(半|[一二两三四五六七八九十\\d]+分?)?)';
+  const clockOf = (parts, inheritedPeriod) => {
+    const period = parts[1] || inheritedPeriod;
+    let hour = cnToNum(parts[2]);
+    const minute = parts[3] != null ? Number(parts[3]) : parts[4] === '半' ? 30 : cnToNum((parts[4] || '').replace(/分$/, '')) || 0;
+    if (hour == null || hour > 23 || minute > 59) return null;
+    if (['下午', '晚上', '傍晚', '今晚', '中午'].includes(period) && hour < 12) hour += 12;
+    if (period === '凌晨' && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  };
+  const range = t.match(new RegExp(clockPattern + '\\s*(?:到|至|[-—~～])\\s*' + clockPattern));
+  if (range) {
+    out.startClock = clockOf(range.slice(0, 5));
+    out.latestEndClock = clockOf([null, ...range.slice(5, 9)], range[1]);
+    if (out.startClock && out.latestEndClock && !out.durationSec) {
+      const minutes = (c) => Number(c.slice(0, 2)) * 60 + Number(c.slice(3));
+      const span = (minutes(out.latestEndClock) - minutes(out.startClock) + 1440) % 1440;
+      if (span) out.durationSec = span * 60;
+    }
+  } else {
+    const start = t.match(new RegExp(clockPattern + '\\s*(?:以后|之后|后|出发|开始)'));
+    if (start) out.startClock = clockOf(start);
+  }
 
   // 截止：五点前/17:00前/下午5点前/6点半前
   m = t.match(/(上午|中午|下午|晚上|傍晚|今晚)?\s*(\d{1,2}|[一二两三四五六七八九十]+)\s*[点:：]\s*(半|\d{1,2})?\s*(?:前|之前)/);
@@ -93,6 +130,13 @@ function ruleNLU(text) {
   while ((mm = avoidRe.exec(t))) out.avoidNames.push(mm[1].trim());
 
   // 终点
+  const destination = t.match(/(?:走到|逛到|最后到|终点(?:是|为)?)[「“"]?([^，。；！？,;!?]+?)(?:[」”"]?(?:结束|收尾|为终点|作为终点)|[，。；！？,;!?]|$)/)
+    || t.match(/去[「“"]?([^，。；！？,;!?]+?)[」”"]?(?:结束|收尾)/);
+  if (destination && !/哪算哪/.test(destination[1])) {
+    const name = destination[1].replace(/[」”"]$/, '').trim();
+    if (name.length >= 2 && name.length <= 40) out.endPlaceName = name;
+    if (/从.+(?:走到|逛到)/.test(t)) out.scene = 'wander';
+  }
   if (/回到?起点|原路返回|回南门|回到?南门/.test(t)) out.endpointRef = { mode: 'return_to_origin' };
   else if (/回东门|东门出|东门离开/.test(t)) out.endpointRef = { mode: 'named', name: '东门' };
   else if (/顺路|走到哪算哪|不回头/.test(t)) out.endpointRef = { mode: 'flexible' };
@@ -104,6 +148,7 @@ function ruleNLU(text) {
   else if (/少台阶|台阶少/.test(t)) out.soft.stepFewPreferred = true;
   if (/安静|人少/.test(t)) out.soft.quietPreferred = true;
   if (/多休息|歇脚|休息多/.test(t)) out.soft.restPreferred = true;
+  if (/下雨|室内(?:为主|优先)?|不想晒|不晒太阳|怕晒/.test(t)) out.soft.indoorPreferred = true;
   if (/少走回头路|不重复|别绕/.test(t)) out.soft.repeatRoadPenalty = 1;
 
   return out;
@@ -121,15 +166,32 @@ function resolveTimes(form, textParsed, tz, evidence) {
     startMs = Number(form.startAtMs);
     if (startMs < nowMs - 60000) throw E.badRequest('开始时间早于当前时间，请修正日期或时间', { field: 'startAt' });
     mark('startAt', 'form');
+  } else if (textParsed.startClock && !form.startTouched) {
+    const requested = tk.zonedTimeToMs(now.dateStr, textParsed.startClock, tz);
+    startMs = Math.max(nowMs, requested);
+    mark('startAt', 'text', textParsed.startClock);
   } else {
     startMs = nowMs;
     mark('startAt', 'default', '现在');
   }
 
-  // 时长：表单优先；文本补充
-  let durationSec = form.durationSec || textParsed.durationSec || 2 * 3600;
+  // 时长：用户"最后一次表达"优先。
+  // 旧逻辑是"表单优先"：草稿持久化在本地，用户以前点过一次 30 分钟 chip（durationTouched=true）后，
+  // 再在一句话里写"我有3h想出去转转"会被静默按 30 分钟编排（2026-10-18 线上实测）。
+  // 现在：前端在文字晚于 chip 修改时带 textOverrides=true（AI 按钮提交恒为 true），文本时长胜出；
+  // 若文本时长仍被表单覆盖，返回 notice 明确告知，不再静默。
+  const formDurationRaw = form.durationTouched !== false && form.durationSec;
+  const textWins = !!(textParsed.durationSec && (form.textOverrides || !formDurationRaw));
+  const formDuration = textWins ? 0 : formDurationRaw;
+  let durationSec = (textWins ? textParsed.durationSec : 0) || formDuration || textParsed.durationSec || form.durationSec || 2 * 3600;
   durationSec = clamp(durationSec, 30 * 60, 8 * 3600); // 文档 §2.2：30 分钟～8 小时
-  mark('durationSec', form.durationSec ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : '2 小时');
+  mark('durationSec', textWins ? 'text' : formDuration ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : tk.fmtDuration(durationSec));
+  let timeNotice = null;
+  if (textParsed.durationSec && !textWins && formDuration && Math.abs(formDuration - textParsed.durationSec) >= 60) {
+    timeNotice = { code: 'DURATION_FORM_WINS', message: `你在描述里提到 ${tk.fmtDuration(textParsed.durationSec)}，但表单时长是 ${tk.fmtDuration(formDuration)}，本次按表单规划；如需改用描述里的时长，请在时长处修改` };
+  } else if (textWins && formDurationRaw && Math.abs(formDurationRaw - textParsed.durationSec) >= 60) {
+    timeNotice = { code: 'DURATION_FROM_TEXT', message: `已按你描述里的 ${tk.fmtDuration(durationSec)} 规划（表单原为 ${tk.fmtDuration(formDurationRaw)}）` };
+  }
 
   // 截止：表单 arrive-by 模式 or 文本"几点前"
   let latestEndMs = startMs + durationSec * 1000;
@@ -137,7 +199,10 @@ function resolveTimes(form, textParsed, tz, evidence) {
   const parseClock = (clock, source) => {
     const z = tk.msToZoned(startMs, tz);
     let end = tk.zonedTimeToMs(z.dateStr, clock, tz);
-    if (end <= startMs) end += 24 * 3600 * 1000; // 用户说"明天五点前"类语义按次日顺延一次
+    // 跨午夜只按原文本时间窗判断，不能把已经截止的当日时间窗悄悄推到明天。
+    if (source === 'text' && textParsed.startClock) {
+      if (clock <= textParsed.startClock) end += 24 * 3600 * 1000;
+    } else if (end <= startMs) end += 24 * 3600 * 1000;
     deadlineSource = source;
     return end;
   };
@@ -150,14 +215,25 @@ function resolveTimes(form, textParsed, tz, evidence) {
   }
   // 双约束并存（"逛两小时，五点前回"）→ 取较紧（上面已是 min 语义：默认推导 vs 截止取更早）
   const byDuration = startMs + durationSec * 1000;
-  if (latestEndMs > byDuration && !form.timeMode?.startsWith('arriveBy')) latestEndMs = byDuration;
+  const textWindow = !!(textParsed.startClock && textParsed.latestEndClock);
+  const clockMinutes = (c) => Number(c.slice(0, 2)) * 60 + Number(c.slice(3));
+  const windowSec = textWindow ? ((clockMinutes(textParsed.latestEndClock) - clockMinutes(textParsed.startClock) + 1440) % 1440 || 1440) * 60 : 0;
+  const tighterTextDuration = textWindow && textParsed.durationSec && textParsed.durationSec < windowSec;
+  if (latestEndMs > byDuration && form.timeMode !== 'arriveBy' && (!textWindow || formDuration || tighterTextDuration || windowSec > 8 * 3600)) latestEndMs = byDuration;
   if (latestEndMs < byDuration && (form.timeMode === 'arriveBy' || textParsed.latestEndClock)) {
     // 截止更紧 → 实际预算被截止压缩，确认条需展示
   }
   if (latestEndMs <= startMs) {
     throw E.badRequest('开始时间已晚于截止时间，请修正日期或时间', { field: 'latestEndAt' });
   }
-  return { startMs, latestEndMs, durationSec: Math.floor((latestEndMs - startMs) / 1000), dualConstraint: deadlineSource != null && latestEndMs < byDuration };
+  // "下午2点到5点"在 16:37 说出：开始被推到现在，剩余时间远小于原时间窗 → 明确告知而不是静默压缩成 20 多分钟。
+  if (textWindow && textParsed.startClock && startMs > tk.zonedTimeToMs(now.dateStr, textParsed.startClock, tz) + 5 * 60000) {
+    const leftMin = Math.round((latestEndMs - startMs) / 60000);
+    if (windowSec && leftMin * 60 < windowSec * 0.7) {
+      timeNotice = { code: 'WINDOW_ALREADY_STARTED', message: `你说的 ${textParsed.startClock}–${textParsed.latestEndClock} 已经开始，按现在出发只剩约 ${leftMin} 分钟；如果是指明天，请在出发时间里改为"稍后出发"` };
+    }
+  }
+  return { startMs, latestEndMs, durationSec: Math.floor((latestEndMs - startMs) / 1000), dualConstraint: deadlineSource != null && latestEndMs < byDuration, notice: timeNotice };
 }
 
 /* ---------------- 实体解析：文本地名 → 已知 POI/节点 ID（模型不创造 ID） ---------------- */
@@ -222,7 +298,7 @@ function normalizeIntent(input, packs, preParsed = null) {
 
   // 终点：用户显式选过 → 表单优先；没选过 → 一句话里的终点描述优先（此前默认值总把文字条件盖掉）
   let endpoint;
-  const ep = (form.endpointTouched ? form.endpointMode : null)
+  const ep = ((form.endpointTouched || (form.endpointMode === 'fixed' && form.endpointPoint)) ? form.endpointMode : null)
     || (parsed.endpointRef && parsed.endpointRef.mode)
     || form.endpointMode
     || 'return_to_origin';
@@ -275,7 +351,12 @@ function normalizeIntent(input, packs, preParsed = null) {
   } else {
     evidence.interests = { source: (form.interests || []).length ? 'form' : parsed.interests.length ? 'text' : 'default' };
   }
-  const interests = [...interestSet].filter((t) => INTEREST_TAGS.includes(t)).map((tag) => ({ tag, weight: 1 }));
+  // 兴趣既支持标准标签，也支持用户在偏好里自定义的关键词（"咖啡""夜景"这类）。
+  // 标准标签直接进；自定义词做长度/数量清洗后进（§6.2 兴趣字段；评分层按名称/标签包含匹配）。
+  const clean = (t) => String(t == null ? '' : t).trim();
+  const known = [...interestSet].map(clean).filter((t) => INTEREST_TAGS.includes(t));
+  const custom = [...interestSet].map(clean).filter((t) => t && !INTEREST_TAGS.includes(t) && t.length <= 8).slice(0, 10);
+  const interests = [...new Set([...known, ...custom])].map((tag) => ({ tag, weight: 1 }));
 
   // 必去/避开（表单 ID 优先；文本名做实体解析）
   let mustVisitIds = [...(form.mustVisitIds || [])];
@@ -331,6 +412,7 @@ function normalizeIntent(input, packs, preParsed = null) {
     repeatRoadPenalty: allowBacktrack ? 0 : (parsed.soft.repeatRoadPenalty ?? 1),
     restPreferred: !!(form.restPreferred || parsed.soft.restPreferred || pace === 'easy'),
     quietPreferred: !!(form.quietPreferred || parsed.soft.quietPreferred),
+    indoorPreferred: !!(form.indoorPreferred || parsed.soft.indoorPreferred),
     stepFewPreferred: !!parsed.soft.stepFewPreferred,
   };
   if (hard.stepFreeRequired && form.needsText && /少台阶/.test(form.needsText)) {
@@ -355,6 +437,7 @@ function normalizeIntent(input, packs, preParsed = null) {
     latestEndAtMs: times.latestEndMs,
     budgetSec: times.durationSec,
     dualConstraint: times.dualConstraint,
+    timeNotice: times.notice || null,
     timezone: tz,
     mobility,
     pace,
@@ -388,7 +471,9 @@ function confirmChips(intent) {
   if (intent.hard.stepFreeRequired) chips.push({ field: 'access', label: '轮椅可达（硬条件）' });
   else if (intent.soft.stepFewPreferred) chips.push({ field: 'access', label: '少台阶' });
   if (intent.hard.mustVisitIds.length) chips.push({ field: 'must', label: `必去 ${intent.hard.mustVisitIds.length} 处` });
-  if (intent.hard.noRepeatedEdges) chips.push({ field: 'route', label: '不走重复路段' });
+  if (intent.soft.indoorPreferred) chips.push({ field: 'indoor', label: '室内优先' });
+  if (intent.hard.strictNoRepeat) chips.push({ field: 'route', label: '不走重复路段' });
+  else if (intent.soft.repeatRoadPenalty === 1) chips.push({ field: 'route', label: '少走回头路' });
   return chips;
 }
 

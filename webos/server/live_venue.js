@@ -8,7 +8,7 @@
  * - 开放时间/门票高德不提供 → 标记 unknown，方案标为条件性；
  * - 路段一律走高德步行路径规划（真实折线），没有真实路由的边标 unreachable，绝不用直线顶替。
  */
-const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf } = require('./amap');
+const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf, isJunkPoi, candidateCapFor, resolveMatrixMode } = require('./amap');
 const { haversineM } = require('./geo');
 
 const VENUE_TYPECODES = ['110101', '110102', '110103', '110105', '110200', '110202', '141201', '141200'];
@@ -89,8 +89,9 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
   const radiusM = radiusForBudget(budgetSec);
   const mustIds = [...new Set((opts.mustVisitIds || []).filter(Boolean))];
   const foodWanted = !!opts.food;
+  const nominated = (Array.isArray(opts.nominated) ? opts.nominated : []).filter((n) => n && n.id && Number.isFinite(n.lng) && Number.isFinite(n.lat));
   // 半径/口味偏好/必去集合都会改变结果，必须进缓存键，否则同场所不同条件会互相污染
-  const key = `venue:${venueRef.id}:r${radiusM}:f${foodWanted ? 1 : 0}:m${mustIds.slice().sort().join(',')}`;
+  const key = `venue:${venueRef.id}:r${radiusM}:f${foodWanted ? 1 : 0}:m${mustIds.slice().sort().join(',')}:n${nominated.map((n) => n.id).sort().join(',')}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
@@ -120,7 +121,7 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
     } catch (e) { /* 补搜失败不影响主检索 */ }
   }
 
-  const pois = [];
+  let pois = [];
   const seenProvider = new Set();
   for (const { p, supplement } of raw) {
     if (!p || !p.id || p.id === venueRef.providerPoiId) continue; // 场所本身不作为游览点
@@ -131,6 +132,19 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
     if (poi.distanceM < 25) continue; // 与场所中心重合的噪声
     // 补搜结果限制在场所周边（半径外放宽到 2km），避免把城市里同名景点都拉进来
     if (supplement && poi.distanceM > Math.max(radiusM, 2000)) continue;
+    pois.push(poi);
+  }
+
+  // 智能体提名的场内景点（大模型知识 + 高德地理编码核实、离场所中心距离已过滤）：已在池里的只打标记，否则补进来
+  for (const n of nominated) {
+    const pid = providerIdOf(n.id);
+    const hit = pois.find((p) => p.providerPoiId === pid);
+    if (hit) { hit.nominated = true; hit.agentReason = hit.agentReason || n.reason || null; continue; }
+    if (pid === venueRef.providerPoiId) continue;
+    const poi = toVenuePoi({ id: pid, name: n.name, location: `${n.lng},${n.lat}`, typecode: n.typecode || '110200', address: n.address || '' }, center);
+    if (!poi) continue;
+    poi.nominated = true;
+    poi.agentReason = n.reason || null;
     pois.push(poi);
   }
 
@@ -148,6 +162,22 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
       pois.push(poi);
       byProvider.set(pid, poi);
     } catch (e) { /* 取不到就保持缺失，由需求层如实提示，不编造 */ }
+  }
+
+  // 场所围栏（2026-10-18 线上实测故宫：700m 圈内混进灯市口小学、南池子大街、园外餐厅）：
+  // ① 学校/医院等名称黑名单一律剔除；② 名称或地址带场所核心名（"故宫"）视为园内；
+  // ③ 园内点足够多（≥6）时，园外点只保留离中心 ≤300m 的，街道/胡同名一律不作为游览点。
+  // 用户明确加入的必去点不参与围栏剔除（需求层已承诺"必去点即使不在半径内也进候选池"）。
+  const core = String(venueRef.name || '').replace(/[（(][^）)]*[）)]/g, '').replace(/(博物院|博物馆|风景名胜区|风景区|旅游区|景区|公园)$/, '');
+  const insideOf = (p) => core.length >= 2 && (p.name.includes(core) || (p.address || '').includes(core));
+  const isMust = (p) => p.mustForce || mustPid.has(p.providerPoiId) || p.nominated;
+  // 无价值判定与闲逛同口径（机构/培训/连锁快餐/路口/外送…）；园内点只剔除设施类
+  const facilityRe = /(卫生间|厕所|公厕|停车场|售票处|检票口|地铁站|公交站|外送|外卖|自提点|服务中心|管理处)/;
+  pois = pois.filter((p) => (p.mustForce || mustPid.has(p.providerPoiId))
+    || (!(isJunkPoi(p.name, p.typecode, { nominated: true }) && (!insideOf(p) || facilityRe.test(p.name)))
+      && (isMust(p) || !(/(大街|胡同|路|街|巷)$/.test(p.name) && !insideOf(p)))));
+  if (core.length >= 2 && pois.filter(insideOf).length >= 6) {
+    pois = pois.filter((p) => isMust(p) || insideOf(p) || p.distanceM <= 300);
   }
 
   // 分桶保多样性（打卡点/文化/餐饮/其他各取最近若干），再取前 10 进精算
@@ -172,6 +202,7 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
     p.quality = (p.scenic || 0.5) + insideSignal + nameBonus(p.name) - Math.min(0.3, p.distanceM / 2000);
     // 兴趣里没有"美食"时，餐饮/购物（05/06）整体降权 0.4，避免半天行程被茶馆/商店占满
     if (!foodWanted && /^(05|06)/.test(String(p.typecode || ''))) p.quality -= 0.4;
+    if (p.nominated) p.quality += 0.6;
   }
   const buckets = new Map();
   const seenCore = new Set();
@@ -186,7 +217,11 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
     seenCore.add(core);
     buckets.get(b).push(p);
   }
-  const cap = Math.min(12, maxCandidatesForQuota(cfg.limits.maxRoutingCalls));
+  // 距离矩阵模式下园内点位放宽到 12/16/20（按预算）；两两模式仍受路由配额约束
+  const matrixMode = await resolveMatrixMode(cfg, center);
+  const cap = matrixMode === 'distance'
+    ? Math.min(budgetSec >= 10800 ? 20 : budgetSec >= 7200 ? 16 : 12, candidateCapFor(cfg, budgetSec, 2, 'distance').cap)
+    : Math.min(12, maxCandidatesForQuota(cfg.limits.maxRoutingCalls));
   const picked = [...buckets.values()].flat()
     .sort((a, b) => b.quality - a.quality)
     // 半天预算装得下更多点；上限同时受路由矩阵配额约束（候选 + 起点两两成对都要抓得到），
@@ -196,6 +231,10 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
   // 必去点不受分桶上限/质量排序影响：先保必去，再用质量排序补满
   const chosen = new Map();
   for (const p of pois.filter((x) => x.mustForce)) chosen.set(p.id, p);
+  // 提名点不受类型分桶配额限制（故宫的殿/门/园在高德里大多同属"风景名胜"一桶），但至多占约 60% 名额
+  const nomKeep = pois.filter((x) => x.nominated && !x.mustForce).sort((a, b) => b.quality - a.quality)
+    .slice(0, Math.max(0, Math.ceil(cap * 0.6) - chosen.size));
+  for (const p of nomKeep) chosen.set(p.id, p);
   for (const p of picked) {
     if (chosen.size >= cap && !chosen.has(p.id)) continue;
     chosen.set(p.id, p);
@@ -204,6 +243,30 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
 
   const value = { venueRef, center, pois: finalPois, entrances: finalPois.filter((p) => p.isEntrance) };
   return cacheSet(key, value);
+}
+
+const WALLED_VENUE_RE = /(故宫|博物院|紫禁城|皇城|宫殿|行宫|王府|宫$|陵$|陵园$|寺$|庙$|府$|坛$|天坛|地坛|颐和园|圆明园)/;
+function markVenueEstimates(graph, center, radiusM) {
+  const nodes = [...graph.nodes.values()].filter((n) => haversineM(center, n) <= Math.max(800, radiusM * 1.2));
+  let changed = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      const r = graph._routeCache.get(a.id + '>' + b.id);
+      if (!r || r.status !== 'ok' || r.venueEstimate) continue;
+      const straight = haversineM(a, b);
+      if (!(r.distanceM > Math.max(straight * 2.2, straight + 500))) continue;
+      const geometry = [[a.lng, a.lat], [b.lng, b.lat]];
+      const eid = (r.edgeIds && r.edgeIds[0]) || ('ame_v' + i + '_' + j);
+      const d = Math.round(straight * 1.3);
+      const edge = graph._edges.get(eid);
+      if (edge) { edge.lengthM = d; edge.physicalSegmentKeys = null; }
+      graph._storePair(a.id, b.id, eid, d, geometry, null, true, null, null, { venueEstimate: true, estimated: true, provider: 'venue-estimate' });
+      changed++;
+    }
+  }
+  graph.venueEstimates = changed;
+  return changed;
 }
 
 /** 构建真实场所的路网/图（含路由矩阵；起点由调用方给出） */
@@ -219,8 +282,22 @@ async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
   let cands = resolved.pois.map((p) => ({
     id: p.id, name: p.shortName, lng: p.lng, lat: p.lat,
   }));
-  if (hasEnd) cands = cands.slice(0, Math.max(1, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - 1));
-  await graph.init(cands, { cacheKey: matrixCacheKeyOf('venue:' + venueRef.id, originPoint, [...(hasEnd ? [endKeyOf(graph.endpoint)] : []), ...cands.map((c) => c.id)]) });
+  const matrixMode = await resolveMatrixMode(cfg, originPoint);
+  if (hasEnd) cands = cands.slice(0, Math.max(1, candidateCapFor(cfg, budgetSec, 2, matrixMode).cap));
+  // 点位已定、路网矩阵还没抓：交给调用方提前评审（与矩阵抓取并行）
+  if (typeof opts.onCandidates === 'function') {
+    const ids = new Set(cands.map((c) => c.id));
+    try {
+      opts.onCandidates(resolved.pois.filter((p) => ids.has(p.id)).map((p) => ({
+        id: p.id, name: p.shortName, typecode: p.typecode || '', tags: p.tags || [], nominated: !!p.nominated, address: p.address || '',
+      })));
+    } catch (e) { /* 回调失败不影响建包 */ }
+  }
+  await graph.init(cands, { matrixMode, cacheKey: matrixCacheKeyOf('venue:' + venueRef.id, originPoint, [...(hasEnd ? [endKeyOf(graph.endpoint)] : []), ...cands.map((c) => c.id)]) });
+
+  // 围墙内的宫殿/寺庙/陵园：高德步行路网没有园内道路，两点间路线会绕到园外（故宫午门→神武门 3km）。
+  // 路由距离远超直线（>2.2 倍且多出 500m 以上）的园内点对改为直线 ×1.3 估算，并如实标注"园内路线为估算"。
+  if (WALLED_VENUE_RE.test(venueRef.name || '')) markVenueEstimates(graph, resolved.center, radiusForBudget(budgetSec));
 
   const usable = resolved.pois.filter((p) => graph.nodes.has(p.id));
   const venueId = venueRef.id;
@@ -252,7 +329,8 @@ async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
       openWindows: null,            // 高德不提供营业时间 → 校验层标 unknown（诚实）
       ticketCny: null, ticketKnown: false, costNote: '门票/消费未核验',
       reservation: 'unknown', hoursEvidenceIds: ['ev_amap_live'],
-      providerPoiId: p.providerPoiId, address: p.address, isEntrance: p.isEntrance,
+      providerPoiId: p.providerPoiId, address: p.address, isEntrance: p.isEntrance, typecode: p.typecode || '',
+      nominated: !!p.nominated, agentReason: p.agentReason || null,
       guide: null,                  // 真实内容由 LLM 生成并标注未核验，或等待资料管线
     })),
     evidence: [{

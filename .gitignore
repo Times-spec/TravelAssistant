@@ -28,3 +28,6 @@ webos/android/app/build/
 .DS_Store
 Thumbs.db
 .zcode/
+
+# 测试产物（多场景线上实测输出）
+webos/tests/out/

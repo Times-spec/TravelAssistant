@@ -1,6 +1,6 @@
 // 游览执行页：下一站优先 + 到站确认 + 快捷重排（提议—确认—提交）+ 讲解播放（§11/§12）
 import { get, post, subscribeJob } from './api.js';
-import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, fmtMin, fmtKm, fmtClock, loadAmap, AmapRouteMap } from './ui.js';
+import { h, toast, openSheet, closeSheet, locateBlockedReason, SvgMap, makeProjector, fmtMin, fmtKm, fmtClock, loadAmap, AmapRouteMap } from './ui.js';
 import { legStates, legendEl, renderSvgRoute, legGuidance, projectOnLeg, activeStepIdx, wgs84ToGcj02, distM, stepIconSvg, roundM } from './routeview.js';
 import { state, getVenuePack } from './app.js';
 import { drawPackBase, drawMapLabel } from './home.js';
@@ -19,6 +19,8 @@ export function renderTrip(view, ctx, tripId) {
   let lastPos = null;   // { pt:[lng,lat] GCJ-02, acc, at }
   let liveHooks = [];   // 定位更新时只刷新这些局部（剩余距离、当前步、到站提示），不整页重绘
   let svgView = null;   // SVG 降级地图的状态（重绘/取景/我的位置）
+  const stepRequests = new Map(); // 每个方向的一段只请求一次；失败保留几何导引。
+  cleanups.push(() => { renderSeq++; stepRequests.clear(); });
 
   // 途中调整的可点选项（AI 兜底路径与服务端 cause 一一对应）
   const quick = [
@@ -72,13 +74,35 @@ export function renderTrip(view, ctx, tripId) {
     return String(route.endLabel || '终点').replace(/^终点：|^返回|^顺路结束于/, '') || '终点';
   }
 
+  /**
+   * 延迟开始游览时，服务端会按当前时间重排并给出 adjustedTimeline（校正时间表）。
+   * 页面显示一律以校正后为准，否则顶栏/行程单/终点时间仍显示规划时的旧时间（2026-10-18 审计发现）。
+   */
+  function effectiveRoute(route, trip) {
+    const tl = trip && trip.adjustedTimeline;
+    if (!Array.isArray(tl) || !tl.length || !route || !route.stops) return route;
+    const byNode = new Map(tl.map((x) => [x.nodeId, x]));
+    const stops = route.stops.map((st) => {
+      const a = byNode.get(st.entranceNodeId);
+      return a ? { ...st, arrivalAt: a.arrivalAt, visitStartAt: a.visitStartAt, departureAt: a.departureAt } : st;
+    });
+    let endArrivalAt = route.endArrivalAt;
+    const lastAdj = tl[tl.length - 1];
+    const oldLast = route.stops[route.stops.length - 1];
+    if (lastAdj && oldLast && route.endArrivalAt) {
+      const gap = new Date(route.endArrivalAt).getTime() - new Date(oldLast.departureAt).getTime();
+      if (Number.isFinite(gap) && gap >= 0) endArrivalAt = new Date(new Date(lastAdj.departureAt).getTime() + gap).toISOString();
+    }
+    return { ...route, stops, endArrivalAt, timelineAdjusted: true };
+  }
+
   async function render() {
     const seq = ++renderSeq; // 重渲染代际：await 之后若已有更新的渲染，本轮作废
     root.innerHTML = '';
     liveHooks = [];
     svgView = null;
-    const route = tripData.route;
     const trip = tripData.trip;
+    const route = effectiveRoute(tripData.route, trip);
     if (!route) { root.append(h('div', { class: 'card empty' }, '路线数据缺失')); return; }
     if (trip.status !== 'active' && trip.status !== 'paused') {
       location.hash = '#/finish/' + tripId;
@@ -90,7 +114,35 @@ export function renderTrip(view, ctx, tripId) {
 
     // 当前这段 = 通往下一站的那段；全部到站后 = 回终点那段
     const nextIdx = next ? route.stops.findIndex((st) => st.poiId === next.poiId) : route.stops.length;
-    const curLeg = route.legs[nextIdx] || null;
+    let curLeg = route.legs[nextIdx] || null;
+    if (curLeg && !curLeg.steps?.length && (curLeg.provider || '').startsWith('amap')) {
+      const points = curLeg.geometry.coordinates;
+      if (points.length >= 2) {
+        const key = `${points[0].join(',')}>${points.at(-1).join(',')}`;
+        if (!stepRequests.has(key)) {
+          stepRequests.set(key, get(`/v1/legs/steps?from=${encodeURIComponent(points[0].join(','))}&to=${encodeURIComponent(points.at(-1).join(','))}`)
+            .then((result) => {
+              // 只补充同一条步行路径的指令；若高德另选道路，继续按既有折线导引。
+              const supplement = { geometry: { coordinates: result.geometry || [] }, distanceM: result.distanceM };
+              const aligned = result.geometry?.length >= 2 && result.geometry.every((p) => (projectOnLeg(curLeg, p)?.offM ?? Infinity) <= 50)
+                && points.every((p) => (projectOnLeg(supplement, p)?.offM ?? Infinity) <= 50);
+              if (result.steps?.length && aligned) {
+                stepRequests.set(key, result);
+                if (seq === renderSeq) return render();
+              } else stepRequests.set(key, null);
+            }).catch(() => { stepRequests.set(key, null); }));
+        }
+        const result = stepRequests.get(key);
+        if (result && Array.isArray(result.steps)) {
+          curLeg = { ...curLeg, steps: result.steps.map((step) => {
+            const p = result.geometry[step.startIdx || 0];
+            let startIdx = 0;
+            for (let i = 1; i < points.length; i++) if (p && distM(p, points[i]) < distM(p, points[startIdx])) startIdx = i;
+            return { ...step, startIdx };
+          }) };
+        }
+      }
+    }
     const states = legStates(route, nextIdx);
     const endName = endNameOf(route);
     const target = next
@@ -308,6 +360,7 @@ export function renderTrip(view, ctx, tripId) {
       h('div', { class: 'pg-track' }, ...nodes),
       h('div', { class: 'pg-sub' },
         `剩 ${remaining} 站 · 预计 ${fmtClock(route.endArrivalAt)} 到终点`,
+        route.timelineAdjusted ? h('span', { class: 'tag', style: 'margin-left:6px', title: '开始游览时按当前时间重排过' }, '已按开始时间校正') : null,
         trip.status === 'paused' ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '已暂停') : null));
   }
 
@@ -348,6 +401,8 @@ export function renderTrip(view, ctx, tripId) {
     watchId = navigator.geolocation.watchPosition(onPosition, () => {}, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
   }
   function locateMe() {
+    const blocked = locateBlockedReason();
+    if (blocked) { toast(blocked, 4000); return; }
     if (!navigator.geolocation) { toast('当前环境不支持定位'); return; }
     if (lastPos && Date.now() - lastPos.at < 30000) {
       if (routeMap) routeMap.centerUser(); else fitSvg(null);

@@ -1,0 +1,13 @@
+{
+  "navigationSteps": "passed",
+  "stepsRequests": 1,
+  "fallback": "geometry",
+  "failedStepsRequests": 1,
+  "locationClick": "passed",
+  "queueText": "前面还有 2 个任务 · 正在检索候选",
+  "expandedAndCollapsed": true,
+  "sse": true,
+  "polling": true,
+  "consoleErrors": [],
+  "failedResponses": []
+}

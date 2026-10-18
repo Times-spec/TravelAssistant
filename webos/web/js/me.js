@@ -1,6 +1,6 @@
 // 结束回顾 / 我的（历史·汇总·偏好）/ 数据后台
 import { get, post, put, del } from './api.js';
-import { h, toast, openSheet, closeSheet, fmtMin, fmtKm, fmtClock } from './ui.js';
+import { h, toast, openSheet, closeSheet, fmtMin, fmtKm, zoned, fmtClock, fmtDateTime } from './ui.js';
 import { state } from './app.js';
 
 /* ================= 结束回顾（§13.1/§13.2） ================= */
@@ -22,11 +22,11 @@ export function renderFinish(view, ctx, tripId) {
       h('div', { class: 'card', style: 'text-align:center' },
         h('div', { style: 'font-size:34px' }, trip.status === 'completed' ? '🎉' : '👋'),
         h('h3', {}, trip.status === 'completed' ? '游览小结' : '这次先逛到这儿'),
-        h('div', { class: 'tl-meta' }, [s.venueName, s.startedAt ? s.startedAt.slice(5, 16).replace('T', ' ') : ''].filter(Boolean).join(' · '))),
+        h('div', { class: 'tl-meta' }, [s.venueName, fmtDateTime(s.startedAt)].filter(Boolean).join(' · '))),
       highlights.length ? h('div', { class: 'card' },
         h('p', { class: 'card-title' }, `这一趟走过的地方（${highlights.length} 处）`),
         ...highlights.map((v, i) => h('div', { class: 'highlight-item' },
-          h('div', { class: 'h-name' }, `${i + 1}. ${v.name}`, h('span', { class: 'tag', style: 'margin-left:6px' }, v.at ? v.at.slice(11, 16) : '')),
+          h('div', { class: 'h-name' }, `${i + 1}. ${v.name}`, h('span', { class: 'tag', style: 'margin-left:6px' }, fmtClock(v.at))),
           v.teaser ? h('div', { class: 'h-teaser' }, v.teaser) : h('div', { class: 'h-teaser' }, '（该点位暂无已核验讲解）'),
           v.note ? h('div', { class: 'h-note' }, '✎ ' + v.note) : null))) : null,
       (s.looseNotes && s.looseNotes.length) ? h('div', { class: 'card' },
@@ -34,14 +34,25 @@ export function renderFinish(view, ctx, tripId) {
         ...s.looseNotes.map((n) => h('div', { class: 'highlight-item' },
           h('div', { class: 'h-name' }, n.name || '路上'),
           h('div', { class: 'h-note' }, '✎ ' + n.text)))) : null,
-      h('div', { class: 'card' },
-        h('p', { class: 'card-title' }, '过程记录（计划与实际分开）'),
-        statRow('用时', s.actualDurationSec ? fmtMin(s.actualDurationSec) : '未知'),
-        statRow('跳过', s.skippedStops.length ? s.skippedStops.map((x) => x.name).join('、') : '无'),
-        statRow('原计划', s.plannedStops.join('、')),
-        s.replanCount > 0 ? statRow('途中调整', `${s.replanCount} 次重排（共 ${s.versionCount} 个路线版本）`) : null,
-        statRow('距离', `${fmtKm(s.distanceM)}（${s.distanceNote}）`),
-        h('div', { class: 'tl-meta', style: 'margin-top:6px;color:var(--warn)' }, s.dataCompleteness.note),
+      h('div', { class: 'card proc-card' },
+        h('p', { class: 'card-title' }, '过程记录'),
+        h('div', { class: 'proc-sub' }, `${fmtClock(s.startedAt)} 出发 → ${s.finishedAt ? fmtClock(s.finishedAt) : '—'} 结束 · 计划与实际分开记录`),
+        h('div', { class: 'proc-stats' },
+          procStat('用时', s.actualDurationSec == null ? '未知' : s.actualDurationSec < 60 ? '<1 分钟' : fmtMin(s.actualDurationSec), s.plannedDurationSec ? `计划约 ${fmtMin(s.plannedDurationSec)}` : ''),
+          procStat('到访', `${(s.confirmedVisits || []).length} 站`, s.skippedStops.length ? `跳过 ${s.skippedStops.length} 站` : '全部走到'),
+          procStat('途中调整', s.replanCount ? `${s.replanCount} 次` : '无', s.replanCount ? `共 ${s.versionCount} 个路线版本` : ''),
+          procStat('规划距离', fmtKm(s.distanceM), '无实际轨迹')),
+        h('div', { class: 'proc-block' },
+          h('div', { class: 'proc-label' }, `原计划 · ${s.plannedStops.length} 站`),
+          h('div', { class: 'proc-chips' }, s.plannedStops.map((name, i) =>
+            h('span', { class: 'proc-chip' }, h('i', {}, String(i + 1)), name)))),
+        s.skippedStops.length ? h('div', { class: 'proc-block' },
+          h('div', { class: 'proc-label' }, `实际 · 跳过 ${s.skippedStops.length} 站`),
+          h('div', { class: 'proc-chips' }, s.skippedStops.map((x) =>
+            h('span', { class: 'proc-chip skip' }, x.name)))) : null,
+        h('div', { class: 'proc-note' },
+          h('span', { class: 'proc-note-i' }, 'i'),
+          h('span', {}, s.distanceNote)),
         h('button', { class: 'btn btn-ghost btn-block', style: 'margin-top:10px', onclick: () => copySummary(s, highlights) }, '复制小结分享给朋友')),
       buildFeedback(tripId),
       h('div', { class: 'chips', style: 'justify-content:center' },
@@ -84,11 +95,16 @@ export function renderFinish(view, ctx, tripId) {
   function buildFeedback(tid) {
     let rating = 0;
     const reasons = new Set();
-    const stars = h('div', { class: 'stars' }, [1, 2, 3, 4, 5].map((n) =>
+    const stars = h('div', { class: 'stars', role: 'group', 'aria-label': '给这条路线评分' }, [1, 2, 3, 4, 5].map((n) =>
       h('button', {
-        onclick: (e) => {
+        'aria-label': `${n} 星`,
+        'aria-pressed': 'false',
+        onclick: () => {
           rating = n;
-          stars.querySelectorAll('button').forEach((b, i) => b.classList.toggle('on', i < n));
+          stars.querySelectorAll('button').forEach((btn, i) => {
+            btn.classList.toggle('on', i < n);
+            btn.setAttribute('aria-pressed', String(i < n));
+          });
         },
       }, '★')));
     const reasonChips = h('div', { class: 'chips' }, ['太赶', '太累', '内容一般', '讲解有趣', '路线顺'].map((r) =>
@@ -100,7 +116,7 @@ export function renderFinish(view, ctx, tripId) {
           e.currentTarget.classList.toggle('sel', !on);
         },
       }, r)));
-    return h('div', { class: 'card' },
+    const card = h('div', { class: 'card' },
       h('p', { class: 'card-title' }, '这条路线合你心意吗？（可跳过，不影响保存记录）'),
       stars,
       h('div', { style: 'margin:8px 0' }, reasonChips),
@@ -111,21 +127,33 @@ export function renderFinish(view, ctx, tripId) {
             if (!rating) { toast('点个星星再提交，或直接跳过'); return; }
             try {
               await post('/v1/feedback', { tripId: tid, targetType: 'route', rating, reasons: [...reasons] });
+              card.innerHTML = '';
+              card.append(
+                h('p', { class: 'card-title' }, '已收到你的反馈'),
+                h('div', { class: 'tl-meta' }, `评分 ${rating} 星${reasons.size ? ' · ' + [...reasons].join('、') : ''}，会用于改进后续路线。`));
               toast('感谢反馈！');
             } catch (e) { toast(e.message); }
           },
         }, '提交反馈'),
-        h('button', { class: 'btn btn-ghost btn-sm' }, '跳过')));
+        h('button', {
+          class: 'btn btn-ghost btn-sm',
+          onclick: () => {
+            card.remove();
+            toast('已跳过评价，游览记录已保存');
+          },
+        }, '跳过')));
+    return card;
   }
 
   boot().catch((e) => root.append(h('div', { class: 'card empty' }, e.message)));
   return () => {};
 }
 
-function statRow(k, v) {
-  return h('div', { class: 'row', style: 'padding:5px 0;border-bottom:1px dashed var(--line)' },
-    h('span', { class: 'tl-meta', style: 'flex:none;width:76px' }, k),
-    h('span', { style: 'font-size:14px' }, v));
+function procStat(k, v, sub) {
+  return h('div', { class: 'proc-stat' },
+    h('span', { class: 'proc-stat-k' }, k),
+    h('b', {}, v),
+    sub ? h('span', { class: 'proc-stat-s' }, sub) : null);
 }
 
 /* ================= 我的 ================= */
@@ -139,110 +167,214 @@ export function renderMe(view) {
       get('/v1/me/trips'), get('/v1/me/summaries?period=week'), get('/v1/me/preferences'),
       get('/v1/orders?type=itinerary&status=planned'),
     ]);
+    const trips = [...(tripsResp.trips || [])].sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
 
-    /* 本周汇总 */
-    root.append(h('div', { class: 'card' },
-      h('p', { class: 'card-title' }, '本周回顾'),
-      h('div', { class: 'rc-stats' },
-        h('span', {}, `完成 ${sumResp.completedTrips} 次`),
-        h('span', {}, `提前结束 ${sumResp.endedEarlyTrips} 次`),
-        h('span', {}, `确认到访 ${sumResp.confirmedVisitCount} 站`),
-        h('span', {}, `不同地点 ${sumResp.distinctPlaceCount} 个`),
-        h('span', {}, `规划距离合计 ${fmtKm(sumResp.knownDistanceM)}`)),
-      h('div', { class: 'tl-meta', style: 'margin-top:6px;color:var(--warn)' }, sumResp.dataCompleteness.note)));
+    /* 本周回顾 */
+    root.append(weekCard(sumResp, trips));
 
-    /* 偏好（§13.3/§13.5：可查看、修改、关闭） */
-    const p = prefResp.preferences;
-    const INTERESTS = ['自然', '公园湿地', '街区', '人文', '建筑', '美食'];
-    const prefCard = h('div', { class: 'card' },
-      h('p', { class: 'card-title' }, '个性化偏好'),
-      h('div', { class: 'row', style: 'margin-bottom:8px' },
-        h('span', { style: 'font-size:14px' }, '启用个性化'),
-        h('button', {
-          class: 'chip' + (p.enabled ? ' sel' : ''), style: 'flex:none',
-          onclick: async () => { await put('/v1/me/preferences', { enabled: !p.enabled }); boot(); },
-        }, p.enabled ? '已开启' : '已关闭')),
-      h('div', { class: 'field-label' }, '兴趣（显式设置优先于系统推断）'),
-      h('div', { class: 'chips' }, INTERESTS.map((t) =>
-        h('button', {
-          class: 'chip' + ((p.interests || []).includes(t) ? ' sel' : ''),
-          onclick: async () => {
-            const cur = new Set(p.interests || []);
-            if (cur.has(t)) cur.delete(t); else cur.add(t);
-            await put('/v1/me/preferences', { interests: [...cur] });
-            boot();
-          },
-        }, t))),
-      h('div', { class: 'field-label', style: 'margin-top:8px' }, '默认强度'),
-      h('div', { class: 'chips' }, [['easy', '轻松'], ['normal', '适中'], ['active', '多走走']].map(([v, name]) =>
-        h('button', {
-          class: 'chip' + (p.pace === v ? ' sel' : ''),
-          onclick: async () => { await put('/v1/me/preferences', { pace: v }); boot(); },
-        }, name))),
-      h('div', { class: 'tl-meta', style: 'margin-top:8px' }, prefResp.note));
-    root.append(prefCard);
+    /* 偏好（§13.3/§13.5：可查看、修改、关闭；支持自定义关键词） */
+    root.append(prefCard(prefResp, boot));
 
-    /* 行程单（保存的多日行程，与"历史行程"分开） */
-    const savedItins = (ordResp.orders || []).filter((o) => o.type === 'itinerary');
-    const itinCard = h('div', { class: 'card' }, h('p', { class: 'card-title' }, '我的行程单'));
-    if (!savedItins.length) {
-      itinCard.append(h('div', { class: 'empty' }, '还没有保存的行程，去发现页排一个吧'));
-    }
-    for (const o of savedItins) {
-      itinCard.append(h('div', { class: 'poi-result' },
-        h('div', { class: 'n' }, `${o.title} `, h('span', { class: 'tag' }, '行程单')),
-        h('div', { class: 'a' }, `${o.days} 天 · ${o.people} 人` + (o.totalEstimateCny ? ` · 预估 ¥${o.totalEstimateCny}` : '') + ` · 保存于 ${(o.createdAt || '').slice(0, 10)}`),
-        h('div', { class: 'tl-actions' },
-          h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { location.hash = '#/itinerary?city=' + o.cityId; } }, '再排一次'),
-          h('button', {
-            class: 'btn btn-danger btn-sm',
-            onclick: () => {
-              openSheet('删除这份行程单？', h('div', {},
-                h('p', {}, `「${o.title}」将从你的记录中移除。`),
-                h('button', {
-                  class: 'btn btn-danger btn-block',
-                  onclick: async () => { await post(`/v1/orders/${o.id}/cancel`, { reason: '用户删除' }); closeSheet(); toast('已删除'); boot(); },
-                }, '确认删除'),
-                h('button', { class: 'btn btn-ghost btn-block', onclick: closeSheet }, '取消')));
-            },
-          }, '删除'))));
-    }
-    root.append(itinCard);
-
-    /* 历史记录 */
-    const listCard = h('div', { class: 'card' }, h('p', { class: 'card-title' }, '历史行程'));
-    if (!tripsResp.trips.length) {
-      listCard.append(h('div', { class: 'empty' }, '还没有游览记录，去规划第一条路线吧'));
-    }
-    for (const t of tripsResp.trips) {
-      const s = t.summary;
-      listCard.append(h('div', { class: 'poi-result' },
-        h('div', { class: 'n' },
-          `${(t.startedAt || '').slice(5, 16).replace('T', ' ')} · ${t.venueName || s?.venueName || '游览'} `,
-          t.status === 'completed' ? h('span', { class: 'tag' }, '完成') : t.status === 'ended_early' ? h('span', { class: 'tag warn' }, '提前结束') : h('span', { class: 'tag lock' }, '进行中')),
-        s ? h('div', { class: 'a' }, `到访 ${s.confirmedVisits.length} 站 · 规划距离 ${fmtKm(s.distanceM || 0)}`) : null,
-        h('div', { class: 'tl-actions' },
-          t.status === 'active' || t.status === 'paused'
-            ? h('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/trip/' + t.id; } }, '继续游览')
-            : h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { location.hash = '#/finish/' + t.id; } }, '查看回顾'),
-          h('button', {
-            class: 'btn btn-danger btn-sm',
-            onclick: () => {
-              openSheet('删除这条记录？', h('div', {},
-                h('p', {}, '将同时清理关联的反馈与偏好证据；共享的公共讲解不受影响（§13.5）'),
-                h('button', {
-                  class: 'btn btn-danger btn-block',
-                  onclick: async () => { await del('/v1/me/trips/' + t.id); closeSheet(); toast('已删除'); boot(); },
-                }, '确认删除'),
-                h('button', { class: 'btn btn-ghost btn-block', onclick: closeSheet }, '取消')));
-            },
-          }, '删除'))));
-    }
-    root.append(listCard);
+    root.append(savedOrdersCard(ordResp, boot), historyCard(trips, boot));
   }
 
   boot().catch((e) => root.append(h('div', { class: 'card empty' }, e.message)));
   return () => {};
+}
+
+/* ================= 「我的」组件 ================= */
+const WEEKDAY_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+const WEEKDAY_CH = ['日', '一', '二', '三', '四', '五', '六'];
+const PRESET_INTERESTS = ['自然', '公园湿地', '街区', '人文', '建筑', '美食'];
+
+/** 本周回顾：两个大数字 + 7 天活动条 + 完成/提前结束小计 */
+function weekCard(s, trips) {
+  // 按产品时区（上海）算"最近 7 天"，与服务端统计口径一致；否则跨时区会漏掉当天的行程
+  const today = zoned(new Date().toISOString());
+  const [Y, M, D] = today.dateStr.split('-').map(Number);
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const dt = new Date(Date.UTC(Y, M - 1, D - (6 - i)));
+    return { dateStr: dt.toISOString().slice(0, 10), dow: dt.getUTCDay() };
+  });
+  const counts = days.map((d) => trips.filter((t) => t.startedAt && (zoned(t.startedAt) || {}).dateStr === d.dateStr).length);
+  const peak = Math.max(1, ...counts);
+  const md = (s) => s.slice(5).replace('-', '-').replace(/^0/, '');
+  const range = `${md(days[0].dateStr)} ~ ${md(days[6].dateStr)}`;
+  return h('div', { class: 'card wk-card' },
+    h('div', { class: 'sec-head' },
+      h('span', { class: 'sec-title' }, '本周回顾'),
+      h('span', { class: 'sec-meta' }, range)),
+    h('div', { class: 'wk-stats' },
+      h('div', { class: 'wk-stat' },
+        h('b', {}, String(s.confirmedVisitCount), h('small', {}, '站')),
+        h('span', {}, '确认到访'),
+        h('em', {}, `${s.distinctPlaceCount} 个不同地点`)),
+      h('div', { class: 'wk-stat' },
+        h('b', {}, fmtKm(s.knownDistanceM)),
+        h('span', {}, '规划距离'),
+        h('em', {}, `${s.completedTrips} 次完成`))),
+    h('div', { class: 'wk-days' }, ...days.map((d, i) =>
+      h('div', { class: 'wk-day' + (counts[i] ? ' on' : '') + (i === 6 ? ' today' : '') },
+        h('i', { style: `height:${counts[i] ? 10 + Math.round((counts[i] / peak) * 16) : 6}px;animation-delay:${i * 55}ms` }),
+        h('span', {}, WEEKDAY_CH[d.dow])))),
+    h('div', { class: 'wk-sum' },
+      h('span', {}, `完成 ${s.completedTrips} 次`),
+      h('i', { class: 'wk-sep' }),
+      h('span', {}, `提前结束 ${s.endedEarlyTrips} 次`)),
+    h('div', { class: 'foot-note' }, s.dataCompleteness.note));
+}
+
+/** 个性化偏好：开关 + 标准标签 + 自定义关键词（增删）+ 强度分段 */
+function prefCard(resp, reload) {
+  const p = resp.preferences || {};
+  const list = p.interests || [];
+  const custom = list.filter((t) => !PRESET_INTERESTS.includes(t));
+  const save = async (patch) => {
+    try { await put('/v1/me/preferences', patch); reload(); } catch (e) { toast(e.message); }
+  };
+  const toggle = (t) => save({ interests: list.includes(t) ? list.filter((x) => x !== t) : [...list, t] });
+  const input = h('input', {
+    class: 'pref-input', placeholder: '自定义关键词，如 咖啡、夜景', maxlength: '8',
+    onkeydown: (e) => { if (e.key === 'Enter') add(); },
+  });
+  function add() {
+    const v = input.value.trim();
+    if (!v) { toast('先输入一个关键词'); return; }
+    if (list.includes(v)) { toast('这个词已在列表里'); return; }
+    if (list.length >= 12) { toast('最多 12 个兴趣词'); return; }
+    save({ interests: [...list, v] });
+  }
+  return h('div', { class: 'card' },
+    h('div', { class: 'sec-head' },
+      h('div', {},
+        h('span', { class: 'sec-title' }, '个性化偏好'),
+        h('div', { class: 'sec-sub' }, '来自你的设置与历史推断，可随时修改或关闭')),
+      h('button', {
+        class: 'switch' + (p.enabled ? ' on' : ''), 'aria-pressed': String(!!p.enabled), 'aria-label': '启用个性化',
+        onclick: () => save({ enabled: !p.enabled }),
+      }, h('i', {}))),
+    !p.enabled ? h('div', { class: 'pref-off' }, '已关闭：规划时不会带入以下偏好，历史记录照常保留') : null,
+    h('div', { class: 'pref-label' }, '兴趣标签'),
+    h('div', { class: 'chips' }, PRESET_INTERESTS.map((t) =>
+      h('button', { class: 'chip' + (list.includes(t) ? ' sel' : ''), onclick: () => toggle(t) }, t))),
+    h('div', { class: 'pref-label' },
+      h('span', {}, '自定义关键词'),
+      h('span', { class: 'pref-hint' }, '按点位名称/标签包含匹配')),
+    custom.length ? h('div', { class: 'chips', style: 'margin-bottom:8px' }, custom.map((t) =>
+      h('button', { class: 'chip sel custom', title: '点击移除', onclick: () => toggle(t) }, t, h('span', { class: 'chip-x' }, '×')))) : null,
+    h('div', { class: 'pref-input-row' }, input, h('button', { class: 'pref-add', onclick: add }, '添加')),
+    h('div', { class: 'pref-label' }, '默认强度'),
+    h('div', { class: 'seg' }, [['easy', '轻松'], ['normal', '适中'], ['active', '多走走']].map(([v, name]) =>
+      h('button', { class: 'seg-btn' + (p.pace === v ? ' on' : ''), onclick: () => save({ pace: v }) }, name))),
+    h('div', { class: 'foot-note' }, resp.note));
+}
+
+/** 行程单（保存的多日行程，与"历史行程"分开） */
+function savedOrdersCard(ordResp, reload) {
+  const savedItins = (ordResp.orders || []).filter((o) => o.type === 'itinerary');
+  const card = h('div', { class: 'card' },
+    h('div', { class: 'sec-head' },
+      h('span', { class: 'sec-title' }, '我的行程单'),
+      savedItins.length ? h('span', { class: 'sec-meta' }, `${savedItins.length} 份`) : null));
+  if (!savedItins.length) {
+    card.append(h('div', { class: 'empty' }, '还没有保存的行程，去发现页排一个吧'));
+    return card;
+  }
+  for (const o of savedItins) {
+    card.append(h('div', { class: 'poi-result' },
+      h('div', { class: 'n' }, `${o.title} `, h('span', { class: 'tag' }, '行程单')),
+      h('div', { class: 'a' }, `${o.days} 天 · ${o.people} 人` + (o.totalEstimateCny ? ` · 预估 ¥${o.totalEstimateCny}` : '') + ` · 保存于 ${fmtDateTime(o.createdAt) || '—'}`),
+      h('div', { class: 'tl-actions' },
+        h('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/itinerary?order=' + o.id; } }, '查看行程单'),
+        h('button', {
+          class: 'btn btn-ghost btn-sm',
+          onclick: () => { location.hash = `#/itinerary?city=${o.cityId}&days=${o.days}&people=${o.people}`; },
+        }, '按这份重排'),
+        h('button', {
+          class: 'btn btn-danger btn-sm',
+          onclick: () => {
+            openSheet('删除这份行程单？', h('div', {},
+              h('p', {}, `「${o.title}」将从你的记录中移除。`),
+              h('button', {
+                class: 'btn btn-danger btn-block',
+                onclick: async () => { await post(`/v1/orders/${o.id}/cancel`, { reason: '用户删除' }); closeSheet(); toast('已删除'); reload(); },
+              }, '确认删除'),
+              h('button', { class: 'btn btn-ghost btn-block', onclick: closeSheet }, '取消')));
+          },
+        }, '删除'))));
+  }
+  return card;
+}
+
+/** 历史行程：按月分组的时间线，第 3 个月起折叠为「更早的记录」 */
+function historyCard(trips, reload) {
+  const card = h('div', { class: 'card hist-card' },
+    h('div', { class: 'sec-head' },
+      h('span', { class: 'sec-title' }, '历史行程'),
+      trips.length ? h('span', { class: 'sec-meta' }, `共 ${trips.length} 次`) : null));
+  if (!trips.length) {
+    card.append(h('div', { class: 'empty' }, '还没有游览记录，去规划第一条路线吧'));
+    return card;
+  }
+  const months = new Map();
+  for (const t of trips) {
+    const z = zoned(t.startedAt);
+    const key = z ? `${z.y} 年 ${Number(z.m)} 月` : '日期未知';
+    if (!months.has(key)) months.set(key, []);
+    months.get(key).push(t);
+  }
+  const entries = [...months.entries()];
+  for (const [label, list] of entries.slice(0, 2)) card.append(monthBlock(label, list, reload));
+  if (entries.length > 2) {
+    const rest = entries.slice(2);
+    const n = rest.reduce((a, [, l]) => a + l.length, 0);
+    card.append(h('details', { class: 'hist-more' },
+      h('summary', {}, `更早的记录（${n} 次）`),
+      ...rest.map(([label, list]) => monthBlock(label, list, reload))));
+  }
+  return card;
+}
+
+function monthBlock(label, list, reload) {
+  const dist = list.reduce((a, t) => a + ((t.summary && t.summary.distanceM) || 0), 0);
+  return h('div', { class: 'hist-month' },
+    h('div', { class: 'hist-month-head' },
+      h('span', { class: 'hist-month-name' }, label),
+      h('span', { class: 'hist-month-meta' }, `${list.length} 次 · ${fmtKm(dist)}`)),
+    h('div', { class: 'hist-rail' }, ...list.map((t) => tlItem(t, reload))));
+}
+
+function tlItem(t, reload) {
+  const z = zoned(t.startedAt);
+  const when = z ? `${z.md} ${z.week}` : '日期未知';
+  const s = t.summary;
+  const running = t.status === 'active' || t.status === 'paused';
+  return h('div', { class: 'hist-item ' + (t.status === 'completed' ? 'done' : running ? 'running' : 'early') },
+    h('i', { class: 'hist-dot' }),
+    h('div', { class: 'hist-body' },
+      h('div', { class: 'hist-line' },
+        h('b', {}, when),
+        h('span', { class: 'hist-venue' }, t.venueName || (s && s.venueName) || '游览'),
+        t.status === 'completed' ? h('span', { class: 'tag done' }, '完成')
+          : t.status === 'ended_early' ? h('span', { class: 'tag warn' }, '提前结束')
+          : h('span', { class: 'tag lock' }, '进行中')),
+      s ? h('div', { class: 'hist-meta' }, `到访 ${s.confirmedVisits.length} 站 · 规划 ${fmtKm(s.distanceM || 0)}`) : null,
+      h('div', { class: 'tl-actions' },
+        running
+          ? h('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/trip/' + t.id; } }, '继续游览')
+          : h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { location.hash = '#/finish/' + t.id; } }, '查看回顾'),
+        h('button', {
+          class: 'btn btn-danger btn-sm',
+          onclick: () => {
+            openSheet('删除这条记录？', h('div', {},
+              h('p', {}, '将同时清理关联的反馈与偏好证据；公共讲解不受影响'),
+              h('button', {
+                class: 'btn btn-danger btn-block',
+                onclick: async () => { await del('/v1/me/trips/' + t.id); closeSheet(); toast('已删除'); reload(); },
+              }, '确认删除'),
+              h('button', { class: 'btn btn-ghost btn-block', onclick: closeSheet }, '取消')));
+          },
+        }, '删除'))));
 }
 
 /* ================= 数据后台（§7.2 轻量运营视图） ================= */

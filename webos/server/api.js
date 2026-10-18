@@ -4,8 +4,8 @@
  * SSE 事件流在 /v1/jobs/{id}/events（Accept: text/event-stream），也支持 ?afterSeq= 轮询补偿。
  */
 const { id, token, nowIso, ApiError, E } = require('./util');
-const { normalizeCoordinate } = require('./geo');
-const { normalizeIntent, confirmChips } = require('./domain');
+const { normalizeCoordinate, haversineM } = require('./geo');
+const { normalizeIntent, confirmChips, ruleNLU } = require('./domain');
 const { searchPlaces, reverseGeocode, buildGuideContent } = require('./providers');
 const { createJob, routeSummary } = require('./jobs');
 const { writeSseHead } = require('./sse');
@@ -15,6 +15,8 @@ class Api {
   constructor(ctx) {
     this.ctx = ctx; // {store, cfg, packs, sseHub, runner}
     this.routes = [];
+    this.legStepCache = new Map();
+    this.legStepRates = new Map();
     const R = (method, pattern, handler, opts = {}) => {
       const keys = [];
       const rx = new RegExp('^' + pattern.replace(/\{(\w+)\}/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
@@ -26,6 +28,7 @@ class Api {
     R('GET', '/v1/venues', this.listVenues.bind(this));
     R('GET', '/v1/venues/{id}', this.getVenue.bind(this));
     R('GET', '/v1/places/search', this.searchPlaces.bind(this));
+    R('GET', '/v1/legs/steps', this.legSteps.bind(this));
     R('GET', '/v1/places/nearby-venues', this.nearbyVenues.bind(this));
     R('POST', '/v1/ai/ask', this.aiAsk.bind(this));
     R('POST', '/v1/locations/normalize', this.normalizeLocation.bind(this));
@@ -96,6 +99,47 @@ class Api {
   }
 
   /* ---------- 基础 ---------- */
+  async legSteps(req, _p, query) {
+    const parsePoint = (value) => {
+      const parts = String(value || '').split(',');
+      if (parts.length !== 2 || parts.some((p) => !p.trim())) throw E.badRequest('请提供from/to的经纬度');
+      const [lng, lat] = parts.map(Number);
+      if (!Number.isFinite(lng) || !Number.isFinite(lat) || Math.abs(lng) > 180 || Math.abs(lat) > 90) throw E.badRequest('经纬度无效');
+      return { lng, lat };
+    };
+    const from = parsePoint(query.from), to = parsePoint(query.to);
+    const now = Date.now();
+    const owner = req.user.id;
+    for (const [key, rate] of this.legStepRates) if (now - rate.since >= 60000) this.legStepRates.delete(key);
+    const rate = this.legStepRates.get(owner) || { since: now, count: 0 };
+    if (rate.count >= 60) throw new ApiError('RATE_LIMITED', '导航步骤请求过于频繁，请稍后再试', { status: 429, retryable: true });
+    rate.count++; this.legStepRates.set(owner, rate);
+    const cell = (p) => {
+      const row = Math.round(p.lat * 110940 / 50);
+      const lat = row * 50 / 110940;
+      return `${Math.round(p.lng * 111320 * Math.cos(lat * Math.PI / 180) / 50)},${row}`;
+    };
+    const key = `${cell(from)}>${cell(to)}`;
+    for (const [k, entry] of this.legStepCache) if (entry.expiresAt <= now) this.legStepCache.delete(k);
+    const cached = this.legStepCache.get(key);
+    if (cached) return { ...await cached.promise, cached: true };
+    if (this.ctx.cfg.providers.map !== 'amap') return { steps: [], available: false, cached: false };
+    const entry = { expiresAt: now + 30 * 60000 };
+    entry.promise = (async () => {
+      try {
+        // walkingRoute 自带高德全局限速门；本接口再按用户限制请求次数。
+        const route = await require('./amap').walkingRoute(this.ctx.cfg, from, to);
+        return { steps: route.steps || [], geometry: route.geometry, distanceM: route.distanceM, provider: route.provider, available: !!route.steps?.length };
+      } catch (_) {
+        if (this.legStepCache.get(key) === entry) this.legStepCache.delete(key);
+        return { steps: [], available: false };
+      }
+    })();
+    if (this.legStepCache.size >= 512) this.legStepCache.delete(this.legStepCache.keys().next().value);
+    this.legStepCache.set(key, entry);
+    return { ...await entry.promise, cached: false };
+  }
+
   async getConfig() {
     const { cfg } = this.ctx;
     return {
@@ -335,8 +379,54 @@ class Api {
       } catch (e) { preParsed = null; }
     }
 
-    // 场景：用户没显式选 → 交给 AI 判断（说了具体场所=venue，只说走走=wander）
-    if (!['venue', 'wander'].includes(form.scene)) form.scene = (preParsed && preParsed.scene) || 'wander';
+    const rules = ruleNLU(text);
+    // 明确的 A→B 句式纠正模型把起点识别成场所的情况；表单场景仍优先。
+    if (preParsed && rules.scene === 'wander' && rules.endPlaceName) {
+      preParsed = { ...preParsed, scene: 'wander', venueName: null, endPlaceName: rules.endPlaceName };
+    }
+    const parsed = preParsed || rules;
+    if (!['venue', 'wander'].includes(form.scene)) form.scene = parsed.scene || 'wander';
+
+    let unresolvedEndpoint = null;
+    const endPlaceName = parsed.endPlaceName || rules.endPlaceName;
+    const endpointExplicit = form.endpointTouched || (form.endpointMode === 'fixed' && form.endpointPoint);
+    // "五点前回南门"而起点正是南门 → 语义就是回到起点，不该再按具名地点另建一个终点
+    // （模型是否抽出 endPlaceName 不稳定，会时而是 return_to_origin、时而是 fixed，2026-10-18 复现）
+    const originLabel = String((form.origin && form.origin.label) || '');
+    const sameAsOrigin = !!(endPlaceName && originLabel
+      && (originLabel === endPlaceName || originLabel.includes(endPlaceName) || endPlaceName.includes(originLabel)));
+    if (endPlaceName && !endpointExplicit && form.origin && sameAsOrigin) {
+      form.endpointMode = 'return_to_origin';
+      if (!form.endpointTouched) form.endpointPoint = null;
+    } else if (endPlaceName && !endpointExplicit && form.origin) {
+      let pick = null;
+      try {
+        let city = form.origin.city || form.city || parsed.venueCity || (form.venueRef && form.venueRef.city) || '';
+        if (cfg.providers.map === 'amap') {
+          const { textSearch, amapGet } = require('./amap');
+          if (!city) {
+            const geo = await amapGet(cfg, '/v3/geocode/regeo', { location: `${form.origin.lng},${form.origin.lat}`, extensions: 'base' });
+            const address = geo.regeocode && geo.regeocode.addressComponent || {};
+            city = typeof address.city === 'string' && address.city || address.province || '';
+          }
+          const results = await textSearch(cfg, endPlaceName, city);
+          pick = results.filter((p) => p.coord && Number.isFinite(p.coord.lng) && Number.isFinite(p.coord.lat))
+            .map((p) => ({ place: p, distance: haversineM(form.origin, p.coord) }))
+            .filter((p) => p.distance <= 15000).sort((a, b) => a.distance - b.distance)[0]?.place;
+        } else {
+          // 演示模式只用已有场所数据，不捏造地名/POI ID。
+          pick = searchPlaces(this.ctx.packs, endPlaceName, form.venueId).results
+            .filter((p) => p.coord && haversineM(form.origin, p.coord) <= 15000)
+            .sort((a, b) => haversineM(form.origin, a.coord) - haversineM(form.origin, b.coord))[0];
+        }
+      } catch (_) { /* 失败明确追问，不能退成顺路结束 */ }
+      if (pick) {
+        form.endpointMode = 'fixed'; form.endpointPoint = pick.coord; form.endpointLabel = pick.name;
+        form.endpointEntranceId = pick.kind === 'entrance' ? pick.id : null;
+      } else {
+        unresolvedEndpoint = { field: 'endpoint', question: `起点15公里内没有找到「${endPlaceName}」，请搜索并确认终点位置。`, reason: '目的地未能解析到可确认的近邻地点' };
+      }
+    }
 
     // 场所自动识别：一句"想去人民公园"即可直接成路线（§4.2 场所搜索的 AI 路径）
     const autoResolved = { ambiguous: null, resolved: null };
@@ -393,6 +483,8 @@ class Api {
       profile: profile ? { interests: profile.interests, pace: profile.pace } : null,
       venuePack,
     }, this.ctx.packs, preParsed);
+    if (unresolvedEndpoint) intent.unresolved.push(unresolvedEndpoint);
+    else if (endPlaceName && !endpointExplicit && intent.endpoint.mode === 'fixed') intent.fieldEvidence.endpoint = { source: 'text', rawSpan: endPlaceName };
 
     if (autoResolved.resolved) intent.autoResolvedVenue = autoResolved.resolved.name;
     if (autoResolved.ambiguous) {
@@ -427,6 +519,7 @@ class Api {
         });
       }
     }
+    if (intent.timeNotice) notices.push(intent.timeNotice);
     intent.notices = notices;
 
     // 同一用户同场景同场所 → revision 递增（§6.2）
@@ -454,66 +547,79 @@ class Api {
     const trip = body.tripId ? store.findOne('trips', (t) => t.id === body.tripId && t.ownerId === req.user.id) : null;
     let context = {};
     let route = null;
+    let nextStop = null;
     if (trip) {
       route = store.byId('route_versions', trip.activeRouteVersionId);
       const visited = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'arrive_confirm').map((e) => e.data.poiId);
       const skipped = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'stop_skipped').map((e) => e.data.poiId);
       const remaining = route ? route.stops.filter((s) => !visited.includes(s.poiId) && !skipped.includes(s.poiId)) : [];
       const next = remaining[0];
+      nextStop = next || null;
       context = {
         venue: trip.venueName || null,
         nextStop: next ? next.name : null,
         remaining: remaining.map((s) => s.name),
         locked: remaining.filter((s) => s.locked).map((s) => s.name),
         endLabel: route ? route.endLabel : null,
-        plannedEnd: route ? route.endArrivalAt.slice(11, 16) : null,
+        plannedEnd: route && route.endArrivalAt ? route.endArrivalAt.slice(11, 16) : null,
       };
-    }
-    if (cfg.providers.llm !== 'http') {
-      return { action: 'none', cause: null, data: {}, reply: '当前未配置 AI 服务，请用下面的按钮调整行程' };
     }
     const { parseCommand } = require('./llm');
     const parsed = await parseCommand(cfg, text, context);
 
-    // 把 AI 解析出的人名/地名解析成系统内真实点位 ID（模型不创造 ID §6.2）
+    // 模型只给名字；最终动作必须有真实行程与点位支持。
     const resolved = { poiId: null, poiName: parsed.data.poiName || null };
+    const matchName = (name, candidate) => name && candidate && (candidate.includes(name) || name.includes(candidate));
+    if (parsed.action === 'replan' && (!trip || !route || !['active', 'paused'].includes(trip.status))) {
+      parsed.action = 'none'; parsed.reply = '请先开始一条游览路线，再提出调整需求';
+    }
     if (parsed.action === 'replan') {
-      const byName = (name) => {
-        if (!name || !route) return null;
-        const all = route.stops.find((s) => s.name.includes(name) || name.includes(s.name));
-        if (all) return { poiId: all.poiId, poiName: all.name };
-        const skippedStop = route.stops.find((s) => s.name.includes(name));
-        return skippedStop ? { poiId: skippedStop.poiId, poiName: skippedStop.name } : null;
-      };
-      const hit = byName(parsed.data.poiName);
-      if (hit) { resolved.poiId = hit.poiId; resolved.poiName = hit.poiName; }
-      else if (parsed.data.poiName && parsed.cause === 'stop_add_requested') {
-        // 想加的地方：在场所内检索真实点位
+      let hit = null;
+      if (parsed.cause === 'stop_add_requested') {
+        // 与规划使用同一候选包，避免只支持 live 场所、却漏掉城市闲逛与演示包。
         try {
           const plan = store.byId('plans', trip.planId);
           const intent = store.byId('intents', plan.intentId);
-          if (intent.venueRef) {
-            const { resolveVenue } = require('./live_venue');
-            const v = await resolveVenue(cfg, intent.venueRef, intent.budgetSec, {
-              food: (intent.interests || []).some((i) => i.tag === '美食'),
-              mustVisitIds: intent.hard.mustVisitIds || [],
-            });
-            const m = v.pois.find((p) => p.name.includes(parsed.data.poiName) || parsed.data.poiName.includes(p.name));
-            if (m) { resolved.poiId = m.id; resolved.poiName = m.shortName; }
+          const { pack } = await this.ctx.runner.resolvePackGraph(intent);
+          const inRoute = new Set(route.stops.map((s) => s.poiId));
+          const excluded = new Set(intent.hard && intent.hard.avoidPoiIds || []);
+          const candidates = pack.pois.filter((p) => !inRoute.has(p.id) && !excluded.has(p.id) && p.status !== 'closed');
+          const name = parsed.data.poiName || '';
+          let matches = candidates.filter((p) => matchName(name, p.name) || matchName(name, p.shortName));
+          if (!matches.length) {
+            if (/咖啡|cafe|coffee/i.test(name)) matches = candidates.filter((p) => /咖啡|cafe|coffee/i.test(p.name) || (p.tags || []).includes('美食'));
+            else if (/吃|美食|餐|饭/.test(name)) matches = candidates.filter((p) => (p.tags || []).includes('美食'));
+            else if (/坐|休息|歇/.test(name)) matches = candidates.filter((p) => /茶|咖啡|休息|驿站|长椅|cafe|coffee/i.test(p.name) || p.restArea === true);
           }
-        } catch (e) { /* 检索失败：让用户直接用按钮添加 */ }
+          const target = nextStop && nextStop.coord ? { lng: nextStop.coord[0], lat: nextStop.coord[1] } : intent.origin.point;
+          const pointOf = (p) => p.coord && !Array.isArray(p.coord) ? p.coord : (pack.nodes || []).find((n) => n.id === p.entranceNode);
+          hit = matches.map((p) => ({ poi: p, point: pointOf(p) })).filter((p) => p.point && Number.isFinite(p.point.lng) && Number.isFinite(p.point.lat))
+            .sort((a, b) => haversineM(target, a.point) - haversineM(target, b.point))[0]?.poi;
+          if (hit) { resolved.poiId = hit.id; resolved.poiName = hit.name; }
+        } catch (_) { /* 无候选就如实说明，不作执行承诺 */ }
+      } else if (['stop_skipped', 'closure_reported', 'queue_reported'].includes(parsed.cause)) {
+        const name = parsed.data.poiName;
+        hit = !name || /^(?:下一站|下个点|下一个地方)$/.test(name) ? nextStop
+          : route.stops.find((s) => matchName(name, s.name));
+        if (hit) { resolved.poiId = hit.poiId; resolved.poiName = hit.name; }
       }
-      parsed.data.poiId = resolved.poiId;
-      if ((parsed.cause === 'stop_skipped' || parsed.cause === 'closure_reported' || parsed.cause === 'stop_add_requested')
-        && parsed.data.poiName && !resolved.poiId) {
-        parsed.reply = `没找到「${parsed.data.poiName}」，换个别名试试，或直接用按钮选择`;
-        parsed.action = 'none';
+      if (['stop_skipped', 'closure_reported', 'stop_add_requested'].includes(parsed.cause) && !resolved.poiId) {
+        parsed.action = 'none'; parsed.reply = `当前候选中没有找到「${resolved.poiName || '目标点位'}」，请用按钮选择地点`;
+      } else {
+        const replies = {
+          stop_add_requested: `找到「${resolved.poiName}」，可生成加站提议，确认后生效`,
+          stop_skipped: `可生成跳过「${resolved.poiName}」的提议，确认后生效`,
+          fatigue_reported: '可生成轻松节奏的调整提议，确认后生效',
+          rain_reported: '可生成优先室内的调整提议，确认后生效',
+        };
+        parsed.reply = replies[parsed.cause] || '可生成调整提议，确认后生效';
       }
     }
+    if (parsed.action !== 'replan' && /帮你|已为你|加进|添加|安排/.test(parsed.reply || '')) parsed.reply = '当前没有可执行的调整，请说明具体需求或用按钮选择';
     return {
-      action: parsed.action, cause: parsed.cause,
+      action: parsed.action, cause: parsed.action === 'replan' ? parsed.cause : null,
       data: {
-        poiId: resolved.poiId,
+        poiId: parsed.action === 'replan' ? resolved.poiId : null,
         extraWaitMin: parsed.data.extraWaitMin,
         newLatestEndClock: parsed.data.newLatestEndClock,
       },
@@ -534,6 +640,8 @@ class Api {
     if (body.revision !== intent.revision) {
       throw E.conflict('INTENT_REVISION_CONFLICT', '需求已更新，请基于最新版本提交', { latestRevision: intent.revision });
     }
+    const active = this.activePlanningJob(req.user.id);
+    if (active) return this.reusePlanningJob(active, 'plan.generate');
     const plan = {
       id: id('pln'), ownerId: req.user.id, intentId: intent.intentId, intentRevision: intent.revision,
       venueId: intent.venueId, venueRef: intent.venueRef || null, scene: intent.scene,
@@ -566,6 +674,8 @@ class Api {
     if (!plan) throw E.notFound('计划不存在');
     const base = store.byId('route_versions', body.baseRouteId);
     if (!base || base.planId !== plan.id) throw E.badRequest('基准路线版本无效', { field: 'baseRouteId' });
+    const active = this.activePlanningJob(req.user.id);
+    if (active) return this.reusePlanningJob(active, 'plan.edit', plan.id);
     const job = createJob(store, {
       type: 'plan.edit', ownerId: req.user.id, planId: plan.id,
       payload: { baseRouteId: base.routeId, edits: body.edits || {} },
@@ -575,12 +685,40 @@ class Api {
   }
 
   /* ---------- 任务与事件 ---------- */
+  activePlanningJob(ownerId) {
+    return this.ctx.store.findOne('jobs', (j) => j.ownerId === ownerId && !j.cancelRequested
+      && ['queued', 'running'].includes(j.status) && ['plan.generate', 'plan.edit', 'trip.replan'].includes(j.type));
+  }
+
+  reusePlanningJob(job, type, planId = null, tripId = null) {
+    if (job.type !== type || (planId && job.planId !== planId) || (tripId && job.tripId !== tripId)) {
+      throw E.conflict('PLANNING_IN_PROGRESS', '已有路线任务正在处理，请完成后再调整', { jobId: job.id, planId: job.planId, jobType: job.type });
+    }
+    return { status: 202, planId: job.planId, jobId: job.id, reused: true };
+  }
+
+  jobProgress(job) {
+    const { store } = this.ctx;
+    const jobs = store.find('jobs', (j) => !j.cancelRequested && ['queued', 'running'].includes(j.status))
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    const phaseOf = (j) => {
+      if (j.status !== 'running') return j.status;
+      const last = store.find('job_events', (e) => e.jobId === j.id).sort((a, b) => b.seq - a.seq)[0];
+      return ({ 'intent.normalized': 'candidates', 'candidates.ready': 'route', 'route.ready': 'alternatives', 'route.alternative_ready': 'guide', 'guide.text_ready': 'guide', 'guide.audio_ready': 'guide' })[last && last.type] || 'candidates';
+    };
+    const labels = { queued: '等待派发', candidates: '正在检索候选', route: '正在组合路线', alternatives: '正在计算备选', guide: '正在补充讲解', completed: '规划完成', failed: '规划失败', cancelled: '任务已取消' };
+    const phase = phaseOf(job);
+    const ahead = job.status === 'queued' ? Math.max(0, jobs.findIndex((j) => j.id === job.id)) : 0;
+    const active = ahead > 0 ? jobs.slice(0, ahead).find((j) => j.status === 'running') : null;
+    return { queuePosition: ahead, phase, phaseLabel: labels[phase] || '正在处理', activePhaseLabel: active ? labels[phaseOf(active)] || '正在处理' : null };
+  }
+
   async getJob(req, p) {
     const { store } = this.ctx;
     const job = store.findOne('jobs', (j) => j.id === p.id && j.ownerId === req.user.id);
     if (!job) throw E.notFound('任务不存在');
     const lastSeq = store.find('job_events', (e) => e.jobId === job.id).reduce((m, e) => Math.max(m, e.seq), 0);
-    return { job: { ...job, payload: undefined }, lastSeq, retryable: job.status === 'failed' };
+    return { job: { ...job, ...this.jobProgress(job), payload: undefined }, lastSeq, retryable: job.status === 'failed' };
   }
 
   async jobEvents(req, p, query, _body, res) {
@@ -590,13 +728,19 @@ class Api {
     const afterSeq = Number(query.afterSeq || 0);
     const events = store.find('job_events', (e) => e.jobId === job.id && e.seq > afterSeq).sort((a, b) => a.seq - b.seq);
     const wantsSse = (req.headers.accept || '').includes('text/event-stream') && !query.poll;
-    if (!wantsSse) return { events, jobStatus: job.status, lastSeq: events.reduce((m, e) => Math.max(m, e.seq), afterSeq) };
+    if (!wantsSse) return { events, jobStatus: job.status, ...this.jobProgress(job), lastSeq: events.reduce((m, e) => Math.max(m, e.seq), afterSeq) };
     // SSE：先补偿缺失事件，再挂接实时流（§9.3）
     writeSseHead(res);
     for (const e of events) res.write(`id: ${e.seq}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
     const unsub = sseHub.subscribe(job.id, res);
+    const progress = () => {
+      const fresh = store.byId('jobs', job.id);
+      if (fresh) res.write(`event: job.progress\ndata: ${JSON.stringify({ type: 'job.progress', jobId: job.id, payload: { ...this.jobProgress(fresh), jobStatus: fresh.status } })}\n\n`);
+    };
+    progress();
+    const progressTimer = setInterval(() => { try { progress(); } catch (_) {} }, 2000);
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 15000);
-    req.on('close', () => { clearInterval(ping); unsub(); });
+    req.on('close', () => { clearInterval(ping); clearInterval(progressTimer); unsub(); });
     return null; // 已接管响应
   }
 
@@ -665,7 +809,9 @@ class Api {
       budgetSec: Math.max(0, Math.floor((intent.latestEndAtMs - nowMs) / 1000)),
     };
     const nodeSeq = route.stops.map((s) => s.entranceNodeId);
-    const sch = scheduleRoute(pack, freshIntent, graph, nodeSeq, { startNodeId: route.startNodeId, endNodeId: route.endNodeId });
+    // 停留时长沿用路线上展示给用户的值（含'停留补足'），只按真实出发时刻平移
+    const dwellOverride = Object.fromEntries(route.stops.filter((s) => s.entranceNodeId && s.dwellSec).map((s) => [s.entranceNodeId, s.dwellSec]));
+    const sch = scheduleRoute(pack, freshIntent, graph, nodeSeq, { startNodeId: route.startNodeId, endNodeId: route.endNodeId, dwellOverride });
     const shiftWarnings = [];
     let adjusted = null;
     if (sch.ok) {
@@ -739,7 +885,7 @@ class Api {
     if (!trip) throw E.notFound('行程不存在');
     if (trip.status !== 'active' && trip.status !== 'paused') throw E.badRequest('行程已结束');
     const base = store.byId('route_versions', body.baseRouteId || trip.activeRouteVersionId);
-    if (!base) throw E.badRequest('基准版本无效');
+    if (!base || base.planId !== trip.planId) throw E.badRequest('基准版本无效');
 
     // 锁定必去点的跳过需先解锁提示（§12.1）
     if (body.cause === 'stop_skipped' && body.data && body.data.poiId) {
@@ -748,9 +894,25 @@ class Api {
         throw E.conflict('LOCKED_STOP_SKIP', `「${stop.name}」是你锁定的必去点，确认放弃该锁定吗？`, { needConfirm: 'unlock_then_skip', poiId: stop.poiId });
       }
     }
+    const active = this.activePlanningJob(req.user.id);
+    if (active) return this.reusePlanningJob(active, 'trip.replan', trip.planId, trip.id);
+    let currentNodeId = body.currentNodeId || null;
+    if (!currentNodeId) {
+      const arrivals = store.find('trip_events', (e) => e.tripId === trip.id && e.type === 'arrive_confirm');
+      // 先按发生时间，时间相同或缺失时按入库顺序；弱网补传旧事件不应让位置倒退。
+      const last = arrivals.map((event, index) => ({ event, index }))
+        .sort((a, b) => (Date.parse(b.event.occurredAt || b.event.receivedAt) || 0) - (Date.parse(a.event.occurredAt || a.event.receivedAt) || 0) || b.index - a.index)[0]?.event;
+      const poiId = last && last.data && last.data.poiId;
+      // 接受过提议后，新路线可能不再包含已到访站，因此也查同一计划的历史版本。
+      const stop = poiId && (base.stops.find((s) => s.poiId === poiId)
+        || store.find('route_versions', (r) => r.planId === trip.planId).slice().reverse()
+          .flatMap((r) => r.stops || []).find((s) => s.poiId === poiId));
+      if (last && !stop?.entranceNodeId) throw E.badRequest('最近到达点无法定位，请确认当前位置后重试', { field: 'currentNodeId' });
+      currentNodeId = stop && stop.entranceNodeId || base.startNodeId;
+    }
     const job = createJob(store, {
       type: 'trip.replan', ownerId: req.user.id, planId: trip.planId, tripId: trip.id,
-      payload: { baseRouteId: base.routeId, cause: body.cause, data: body.data || {}, currentNodeId: body.currentNodeId || null },
+      payload: { baseRouteId: base.routeId, cause: body.cause, data: body.data || {}, currentNodeId },
     });
     return { status: 202, jobId: job.id };
   }
@@ -804,6 +966,17 @@ class Api {
     return route.stops.every((s) => resolved.has(s.poiId));
   }
 
+  /** 计划对应的场所名（实时片区 / 真实场所 / 演示场所包） */
+  venueNameOf(plan) {
+    const { store } = this.ctx;
+    const intent = plan && store.byId('intents', plan.intentId);
+    if (!intent) return null;
+    if (intent.venueId === 'area_amap') return '周边片区（高德实时数据）';
+    if (intent.venueRef && intent.venueRef.name) return intent.venueRef.name;
+    const pk = this.ctx.packs.find((x) => x.venue.id === intent.venueId);
+    return pk ? pk.venue.name : null;
+  }
+
   buildTripSummary(trip) {
     const { store } = this.ctx;
     const plan = store.byId('plans', trip.planId);
@@ -812,9 +985,16 @@ class Api {
     const events = store.find('trip_events', (e) => e.tripId === trip.id);
     const visited = events.filter((e) => e.type === 'arrive_confirm').map((e) => ({ poiId: e.data.poiId, confirmType: e.confirmType, at: e.occurredAt }));
     const skipped = events.filter((e) => e.type === 'stop_skipped').map((e) => ({ poiId: e.data.poiId, reason: e.data.reason || null }));
+    // 实时路线（area_amap/live）的点位不在演示场所包里，必须回落到路线版本中的站名；
+    // 否则小结会直接暴露 am_xxx 这样的高德 POI id（2026-10-18 线上实测）。
+    const routeNames = new Map();
+    for (const r of store.find('route_versions', (x) => x.planId === trip.planId)) {
+      for (const s of r.stops || []) if (s.poiId && s.name) routeNames.set(s.poiId, s.name);
+    }
     const poiName = (pid) => {
+      if (!pid) return pid;
       for (const pack of this.ctx.packs) { const p = pack._poiById.get(pid); if (p) return p.name; }
-      return pid;
+      return routeNames.get(pid) || pid;
     };
     const durationSec = trip.finishedAt ? Math.round((new Date(trip.finishedAt) - new Date(trip.startedAt)) / 1000) : null;
     return {
@@ -853,14 +1033,7 @@ class Api {
         };
       }),
       demo: this.ctx.cfg.demoMode,
-      venueName: (() => {
-        const intent = plan && store.byId('intents', plan.intentId);
-        if (!intent) return null;
-        if (intent.venueId === 'area_amap') return '周边片区（高德实时数据）';
-        if (intent.venueRef && intent.venueRef.name) return intent.venueRef.name;
-        const pk = this.ctx.packs.find((x) => x.venue.id === intent.venueId);
-        return pk ? pk.venue.name : null;
-      })(),
+      venueName: this.venueNameOf(plan),
     };
   }
 
@@ -898,11 +1071,15 @@ class Api {
       .sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''))
       .slice(0, Number(query.limit || 50));
     return {
-      trips: trips.map((t) => ({
-        id: t.id, status: t.status, startedAt: t.startedAt, finishedAt: t.finishedAt,
-        summary: t.finishedAt ? this.buildTripSummary(t) : null,
-        venueName: t.finishedAt ? this.buildTripSummary(t).venueName : null,
-      })),
+      trips: trips.map((t) => {
+        const summary = t.finishedAt ? this.buildTripSummary(t) : null;
+        return {
+          id: t.id, status: t.status, startedAt: t.startedAt, finishedAt: t.finishedAt,
+          summary,
+          // 未结束的行程没有 summary，场所名单独解析（时间线/历史列表都要显示它）
+          venueName: (summary && summary.venueName) || this.venueNameOf(store.byId('plans', t.planId)),
+        };
+      }),
     };
   }
 
@@ -932,7 +1109,7 @@ class Api {
       actualDurationSec: actualSec,
       knownDistanceM,
       distanceKind: 'planned',
-      dataCompleteness: { continuousTrack: false, note: '距离为规划距离合计；未采集连续轨迹，不展示伪造的实际距离（§13.2）' },
+      dataCompleteness: { continuousTrack: false, note: '距离为规划距离合计；未采集连续轨迹，不展示推测的实际行走距离' },
       narrative: null, // §13.4：数值先行，LLM 润色在真实模式接入
     };
   }
@@ -944,16 +1121,20 @@ class Api {
     return {
       preferences: pref || { userId: req.user.id, enabled: true, interests: [], pace: null, guideStyle: 'normal' },
       evidenceCount: evidence.length,
-      note: '偏好画像可查看、修改或关闭；关闭个性化不影响保留自用历史（§13.5）',
+      note: '偏好画像可查看、修改或关闭；关闭个性化不影响保留历史记录',
     };
   }
 
   async putPreferences(req, _p, _q, body) {
     const { store } = this.ctx;
     const existing = store.findOne('preferences', (x) => x.userId === req.user.id);
+    // 兴趣列表清洗：去空白、去重、单个关键词 ≤8 字、最多 12 个（自定义关键词也存这里）
+    const cleanInterests = (arr) => [...new Set((arr || [])
+      .map((t) => String(t == null ? '' : t).trim())
+      .filter((t) => t && t.length <= 8))].slice(0, 12);
     const patch = {
       enabled: body.enabled !== false,
-      interests: Array.isArray(body.interests) ? body.interests : (existing ? existing.interests : []),
+      interests: Array.isArray(body.interests) ? cleanInterests(body.interests) : (existing ? existing.interests : []),
       pace: body.pace || (existing ? existing.pace : null),
       guideStyle: body.guideStyle || (existing ? existing.guideStyle : 'normal'),
       updatedAt: nowIso(),
@@ -984,10 +1165,27 @@ class Api {
 
   async hubHighlights() {
     const content = this.ctx.content;
+    const cities = content.listCities();
+    // 讲解开场白是内容库最有代入感的部分（"从午门进来别急着拍全景…"）：
+    // 取热度最高的一批场所，带出它们的场所导览首句，给发现页做「先听一段」
+    const topVenues = content.listVenues({ limit: 10 });
+    const narrations = [];
+    for (const v of topVenues) {
+      const n = content.narrationForVenue(v.id, 'intro');
+      if (!n || !n.teaser) continue;
+      const city = content.getCity(v.cityId);
+      narrations.push({
+        id: n.id, venueId: v.id, venueName: v.name, cityName: (city && city.name) || '',
+        poiName: n.poiName || null, kind: n.kind || 'venue_intro', teaser: n.teaser,
+      });
+      if (narrations.length >= 6) break;
+    }
     return {
-      cities: content.listCities().slice(0, 6),
-      venues: content.listVenues({ limit: 8 }),
+      cities: cities.slice(0, 6),
+      allCityCount: cities.length,
+      venues: topVenues.slice(0, 8),
       articles: content.listArticles({ limit: 4 }),
+      narrations,
       meta: content.getMeta(),
       reviewStatus: 'library_v1',
     };

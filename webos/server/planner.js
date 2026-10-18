@@ -98,6 +98,16 @@ class VenueGraph {
 }
 
 /* ================= 推荐层：候选评分（§7.4 / §8.3 软得分归一化） ================= */
+
+/** 单个兴趣词是否命中点位：标准标签按标签相等，自定义关键词（"咖啡""夜景"）再按名称/标签包含 */
+function interestMatched(poi, tag) {
+  const t = String(tag || '');
+  if (!t) return false;
+  if ((poi.tags || []).includes(t)) return true;
+  if (String(poi.name || '').includes(t)) return true;
+  return (poi.tags || []).some((x) => String(x).includes(t));
+}
+
 function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
   const interestTags = new Set(intent.interests.map((i) => i.tag));
   const avoid = new Set(intent.hard.avoidPoiIds);
@@ -106,11 +116,12 @@ function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
     if (avoid.has(poi.id)) continue;
     const node = graph.nodeById.get(poi.entranceNode);
     if (!node || node.status !== 'open') continue; // 关闭点不进入候选（必去点另行追问）
-    const interestHit = poi.tags.filter((t) => interestTags.has(t)).length;
-    const interestScore = interestTags.size ? interestHit / Math.max(1, poi.tags.length) : 0.3;
+    const interestHit = intent.interests.filter((i) => interestMatched(poi, i.tag)).length;
+    const interestScore = interestTags.size ? Math.min(1, interestHit / Math.max(1, poi.tags.length)) : 0.3;
     const scenic = poi.scenic ?? 0.5;
     const costPenalty = intent.soft.freePreferred && poi.ticketKnown && poi.ticketCny > 0 ? 0.3 : 0;
     const quietBonus = intent.soft.quietPreferred && ['自然', '公园湿地'].some((t) => poi.tags.includes(t)) ? 0.1 : 0;
+    const indoorAdj = intent.soft.indoorPreferred ? (poi.indoor ? 0.2 : -0.25) : 0;
     const distM = graph.route(originNodeId, poi.entranceNode).distanceM ?? 5000;
     // A→B 型路线：远近按"顺路程度"算（经过它比直接去终点多走多少），而不是离起点多远——
     // 否则靠近终点的好点永远被扣分，末站只能落在起点附近，最后空走一大段去终点。
@@ -124,20 +135,43 @@ function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
     // relax 取向："宁缺毋滥"只惩罚真正低质的兜底点（真实街点 scenic 0.4-0.6 不再被一刀切扣分
     // ——此前的 -0.25 会把整条街区压到收益门槛之下，半天只排得进两三站，2026-10-01 修）
     const relaxAdj = intent.objective === 'relax' ? (scenic >= 0.65 ? 0.15 : scenic >= 0.4 ? 0 : -0.2) : 0; // 不默认"点越多越好"（§2.2）
-    const score = interestScore + scenic * 0.8 + coverageBonus + quietBonus + relaxAdj - costPenalty - distPenalty * 0.5;
+    // 智能体内核的反思-修复操作（"把 X 纳入试试"）只作用于本次求解的克隆意图，不写回用户条件、也不算用户锁定
+    const agentBoost = (intent.agentBoost && Number(intent.agentBoost[poi.id])) || 0;
+    const score = interestScore + scenic * 0.8 + coverageBonus + quietBonus + indoorAdj + relaxAdj + agentBoost - costPenalty - distPenalty * 0.5;
     out.push({ poi, score, distM, must: intent.hard.mustVisitIds.includes(poi.id) });
   }
   // 必去点即使分低也保留在最前
   out.sort((a, b) => (b.must - a.must) || (b.score - a.score));
-  return out.slice(0, 24); // maxPoiCandidates 初值
+  // 智能体评审判为"噪声"（无游览价值）的点：此前只把景观分压到 0.3，仍占候选名额、还会被预算填充塞进路线。
+  // 非噪声候选够用（≥3）时直接剔除；必去点不受影响。
+  const clean = out.filter((c) => c.must || !c.poi.agentNoise);
+  const pool = clean.filter((c) => !c.must).length >= 3 ? clean : out;
+  return pool.slice(0, 24); // maxPoiCandidates 初值
 }
 
 /* ================= 时间排程（§8.4） ================= */
+function isLivePackOf(pack) { return !!(pack && pack.venue && (pack.venue.live === true || pack.venue.id === 'area_amap')); }
+/** 单站停留上限：闲逛 clamp(预算×22%, 15, 60 分钟)，景区 clamp(预算×30%, 15, 75 分钟)；自有核验场所不限 */
+function liveDwellCap(pack, intent) {
+  if (!isLivePackOf(pack)) return Infinity;
+  const b = Number(intent.budgetSec) || 7200;
+  return pack.venue.id === 'area_amap' ? clamp(b * 0.22, 900, 3600) : clamp(b * 0.3, 900, 4500);
+}
+/** 某站在"停留补足"阶段最多能停多久：原建议时长与上限×1.5 取大，但不超过预算的 45% */
+function dwellRoomMax(poi, intent, dwellFactor) {
+  const orig = Math.round((poi.dwellSec || 900) * (dwellFactor || 1));
+  return Math.min(Math.max(orig, (poi.dwellSec || 900) * 1.5), intent.budgetSec * 0.45);
+}
+
 function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
   const tz = intent.timezone;
   const speed = WALK_SPEED[intent.pace] || WALK_SPEED.normal;
   const poiById = new Map(pack.pois.map((p) => [p.id, p]));
   const dwellFactor = opts.dwellFactor || 1;
+  // 真实场所/片区的停留上限：评审给博物馆 80-100 分钟，3 小时只排得下 1-3 站（2026-10-18 线上实测）。
+  // 先按上限排进更多站，最后再把剩余时间按值得度补回停留（optimizeFrom 末尾的"停留补足"）。
+  const dwellCap = opts.dwellCap != null ? opts.dwellCap : liveDwellCap(pack, intent);
+  const mustSet = dwellCap < Infinity ? new Set((intent.hard && intent.hard.mustVisitIds) || []) : null;
   const legs = [];
   const stops = [];
   let t = intent.startAtMs;
@@ -169,7 +203,13 @@ function scheduleRoute(pack, intent, graph, nodeSeq, opts = {}) {
       const lastEntry = tk.zonedTimeToMs(z.dateStr, poi.lastEntryAt, tz);
       if (visitStart > lastEntry) { problems.push({ nodeId, code: 'after_last_entry' }); return { ok: false, problems }; }
     }
-    const dwellSec = Math.round((poi.dwellSec || 900) * dwellFactor);
+    let dwellSec = Math.round((poi.dwellSec || 900) * dwellFactor);
+    if (dwellCap < Infinity) {
+      const cap = mustSet.has(poi.id) ? Math.max(dwellCap, clamp(intent.budgetSec * 0.5, 900, 9000)) : dwellCap;
+      dwellSec = Math.max(Math.min(dwellSec, cap), Math.min(poi.dwellMinSec || 0, dwellSec));
+    }
+    if (opts.dwellBonus && opts.dwellBonus[nodeId]) dwellSec += Math.round(opts.dwellBonus[nodeId]);
+    if (opts.dwellOverride && opts.dwellOverride[nodeId] != null) dwellSec = Math.round(opts.dwellOverride[nodeId]);
     let departure = visitStart + dwellSec * 1000;
     // 多段窗口：离开不得晚于当前窗口结束（§8.4 午休不能被压成全天区间）
     if (poi.openWindows && poi.openWindows.length) {
@@ -295,9 +335,25 @@ const RETURN_DETOUR_MAX_RATIO = 1.35;
 
 function repeatPenaltyOn(intent) { return intent.soft?.repeatRoadPenalty !== 0; }
 
+// A→B 路线：末站→终点超过这段距离的部分算"空走"，在距离键里按双倍计（逛完再空走一大段是最难解释的路线形态）
+const END_EMPTY_WALK_FREE_M = 300;
+// A→B 末段超过 600m 的部分计入首键（每 150m 记一档，与 50m 重复路段同量级）：
+// 此前末段只在第二键（总距离）里加倍，2-opt/插入位置几乎不会为它让步，末段 1-4km 的路线照样发布（2026-10-18）。
+const END_LEG_SOFT_M = 600;
+const END_LEG_BUCKET_M = 150;
+function endLegPenalty(sch, intent) {
+  const isAB = intent.endpoint?.mode === 'fixed' && sch.endLeg && sch.endLeg.toNodeId !== sch.legs[0]?.fromNodeId;
+  return isAB ? Math.ceil(Math.max(0, sch.endLeg.distanceM - END_LEG_SOFT_M) / END_LEG_BUCKET_M) : 0;
+}
 function routeCost(sch, intent) {
   const rep = repeatPenaltyOn(intent) ? Math.round((sch.totals.repeatAllM || 0) / REPEAT_BUCKET_M) : 0;
-  return [rep, sch.totals.distanceM || 0, sch.totals.totalSec || 0];
+  const isAB = intent.endpoint?.mode === 'fixed' && sch.endLeg && sch.endLeg.toNodeId !== sch.legs[0]?.fromNodeId;
+  const empty = isAB ? Math.max(0, sch.endLeg.distanceM - END_EMPTY_WALK_FREE_M) : 0;
+  return [rep + endLegPenalty(sch, intent), (sch.totals.distanceM || 0) + empty, sch.totals.totalSec || 0];
+}
+/** 只看重复路段的首键（"丢点"只为少走回头路服务，不能为了缩短末段把站点丢掉） */
+function repeatKey(sch, intent) {
+  return repeatPenaltyOn(intent) ? Math.round((sch.totals.repeatAllM || 0) / REPEAT_BUCKET_M) : 0;
 }
 
 function costLess(a, b) {
@@ -370,14 +426,20 @@ function solveOnce(pack, intent, graph, policy) {
   const lockedOrder = userOrdered ? userOrder : [];
 
   const constraintProblems = [];
-  const trySchedule = (s) => {
-    const ends = endNodeId ? [endNodeId] : pack.venue.entrances;
+  const trySchedule = (s, bonus = null) => {
+    // 顺路结束（flexible）：实时路网只有 am_origin 一个端口，此前"顺路结束"实际总是走回起点。
+    // 真实场所/片区允许直接在末站结束（不加返程段）；演示场所仍在各出入口中选最省的。
+    const isLivePack = pack.venue.live === true || pack.venue.id === 'area_amap';
+    const ends = endNodeId ? [endNodeId]
+      : (isLivePack && s.length ? [s[s.length - 1]] : pack.venue.entrances);
     let best = null;
     for (const en of ends) {
-      const sch = scheduleRoute(pack, intent, graph, s, { startNodeId, endNodeId: en, dwellFactor: policy.dwellFactor });
+      const schedOpts = { dwellFactor: policy.dwellFactor, ...(bonus ? { dwellBonus: bonus } : {}) };
+      const sch = scheduleRoute(pack, intent, graph, s, { startNodeId, endNodeId: en, ...schedOpts });
       if (!sch.ok && sch.problems) constraintProblems.push(...sch.problems);
-      if (sch.ok && sch.totals.totalSec <= intent.budgetSec && (!best || costLess(routeCost(sch, intent), routeCost(best, intent)))) {
-        best = { ...sch, resolvedEndNodeId: en };
+      if (sch.ok && sch.totals.totalSec <= intent.budgetSec && sch.endArrivalMs <= (intent.latestEndAtMs || Infinity)
+        && (!best || costLess(routeCost(sch, intent), routeCost(best, intent)))) {
+        best = { ...sch, resolvedEndNodeId: en, schedOpts };
       }
     }
     return best;
@@ -386,6 +448,8 @@ function solveOnce(pack, intent, graph, policy) {
   const optional = cands.filter((c) => !c.must);
   const repeatOn = repeatPenaltyOn(intent);
   const droppable = new Set(optional.map((c) => c.poi.entranceNode)); // 必去点不在可丢集合里
+  const scoreByNode = new Map(cands.map((c) => [c.poi.entranceNode, c.score]));
+  const isAB = intent.endpoint?.mode === 'fixed' && endNodeId && endNodeId !== startNodeId;
 
   /** 从一个骨架出发跑完"可选点插入 → 预算填充 → 局部换序"，返回最终序列与排程 */
   function optimizeFrom(skeleton) {
@@ -500,6 +564,20 @@ function solveOnce(pack, intent, graph, policy) {
             if (tryMove([...rest.slice(0, k), item, ...rest.slice(k)])) improved = true;
           }
         }
+        // 换点（仅 A→B）：用未入选的候选替换某个可选站，只要兴趣分不明显变差且路线更顺。
+        // 预算刚好装满时插入阶段加不进终点附近的点，单靠换序永远修不掉"末站离终点远"（2026-10-18）。
+        if (!improved && isAB) {
+          for (let i = 0; i < seq.length && !improved && evals < budget; i++) {
+            if (!droppable.has(seq[i])) continue;
+            const outScore = scoreByNode.get(seq[i]) ?? 0;
+            for (const c of optional) {
+              const nid = c.poi.entranceNode;
+              if (seq.includes(nid) || c.score < outScore - 0.15) continue;
+              if (tryMove([...seq.slice(0, i), nid, ...seq.slice(i + 1)])) { improved = true; break; }
+              if (evals >= budget) break;
+            }
+          }
+        }
         // 丢点：只在"去掉这一站能让整条路线少走回头路"时才丢（用户必去点、锁定点、
         // 以及不造成重复的点都不动）。否则预算填充补进来的点会一路被丢光——
         // 这里正是"死胡同点位能不去就不去"的落点：去了必须原路返回的点，除非别处省得回来，否则请出去。
@@ -510,10 +588,75 @@ function solveOnce(pack, intent, graph, policy) {
           if (evals++ > budget) break;
           if (!keepsLockedOrder(trial, lockedOrder)) continue;
           const sch = trySchedule(trial);
-          if (sch && routeCost(sch, intent)[0] < routeCost(bestSch, intent)[0]) { seq = trial; bestSch = sch; improved = true; }
+          if (sch && repeatKey(sch, intent) < repeatKey(bestSch, intent)) { seq = trial; bestSch = sch; improved = true; }
         }
       }
       bestSch = trySchedule(seq);
+    }
+
+    // 5) 末段修复（仅 A→B）：末站离终点仍超过 600m → 试着把终点附近的候选追加到末尾，
+    //    装不下就用它替换一个分数最低的可选站（站数不减）。
+    if (bestSch && isAB && bestSch.endLeg && bestSch.endLeg.distanceM > END_LEG_SOFT_M) {
+      const endNode = graph.nodeById.get(endNodeId);
+      const nearEnd = optional
+        .filter((c) => !seq.includes(c.poi.entranceNode))
+        .map((c) => ({ c, d: graph.route(c.poi.entranceNode, endNodeId).distanceM }))
+        .filter((x) => x.d != null && x.d < Math.min(END_LEG_SOFT_M, bestSch.endLeg.distanceM * 0.6) && endNode)
+        .sort((a, b) => (b.c.score - a.c.score) || (a.d - b.d))
+        .slice(0, 4);
+      let fixed = false;
+      for (const { c } of nearEnd) {
+        const nid = c.poi.entranceNode;
+        const sch = trySchedule([...seq, nid]);
+        if (sch && sch.endLeg && sch.endLeg.distanceM < bestSch.endLeg.distanceM) { seq = [...seq, nid]; bestSch = sch; fixed = true; break; }
+      }
+      if (!fixed) {
+        const outs = seq.filter((x) => droppable.has(x)).sort((a, b) => (scoreByNode.get(a) ?? 0) - (scoreByNode.get(b) ?? 0)).slice(0, 3);
+        outer: for (const { c } of nearEnd) {
+          for (const out of outs) {
+            if ((scoreByNode.get(out) ?? 0) > c.score + 0.4) continue; // 不拿明显更好的站去换
+            const trial = [...seq.filter((x) => x !== out), c.poi.entranceNode];
+            if (!keepsLockedOrder(trial, lockedOrder)) continue;
+            const sch = trySchedule(trial);
+            if (sch && sch.endLeg && sch.endLeg.distanceM < bestSch.endLeg.distanceM * 0.7) { seq = trial; bestSch = sch; break outer; }
+          }
+        }
+      }
+    }
+
+    // 6) 停留补足（真实场所/片区）：候选都排不进了、预算还剩不少 → 把剩余时间按值得度分给各站
+    //    （封顶到原建议时长或上限×1.5），目标总时长≈预算的 95%。不改变站点与顺序。
+    if (bestSch && liveDwellCap(pack, intent) < Infinity && seq.length) {
+      const target = intent.budgetSec * 0.95;
+      let slack = target - bestSch.totals.totalSec;
+      if (slack > 300) {
+        const rooms = bestSch.stops.map((st) => ({
+          nid: st.nodeId, w: Math.max(0.15, scoreByNode.get(st.nodeId) ?? 0.5),
+          room: Math.max(0, dwellRoomMax(st.poi, intent, policy.dwellFactor) - st.dwellSec),
+        })).filter((x) => x.room > 60);
+        const bonus = {};
+        for (let pass = 0; pass < 3 && slack > 60; pass++) {
+          const open = rooms.filter((x) => x.room - (bonus[x.nid] || 0) > 30);
+          const W = open.reduce((a, x) => a + x.w, 0);
+          if (!W) break;
+          let used = 0;
+          for (const x of open) {
+            const give = Math.min(x.room - (bonus[x.nid] || 0), slack * x.w / W);
+            bonus[x.nid] = (bonus[x.nid] || 0) + give;
+            used += give;
+          }
+          slack -= used;
+          if (used < 30) break;
+        }
+        for (const k of Object.keys(bonus)) bonus[k] = Math.floor(bonus[k] / 60) * 60; // 整分钟
+        for (let shrink = 1; shrink >= 0.25; shrink /= 2) {
+          const b = {};
+          for (const [k, v] of Object.entries(bonus)) if (v * shrink >= 60) b[k] = Math.floor((v * shrink) / 60) * 60;
+          if (!Object.keys(b).length) break;
+          const sch = trySchedule(seq, b);
+          if (sch) { bestSch = sch; break; }
+        }
+      }
     }
     return bestSch ? { seq, sch: bestSch } : null;
   }
@@ -528,7 +671,9 @@ function solveOnce(pack, intent, graph, policy) {
     if (constraintProblems.some((p) => ['REPEATED_EDGE', 'no_non_repeating_path', 'end_requires_repeated_edge'].includes(p.code))) {
       return { status: 'infeasible', conflict: noBacktrackingConflict(intent) };
     }
-    return { status: 'infeasible', conflict: noCandidatesConflict(intent) };
+    // 候选是有的，只是一站都装不进预算：说清楚是"路程占满了时间"，而不是"点位被避开或关闭"
+    // （太古里→杜甫草堂 5.5km 给 2 小时，旧提示"可能全部被避开或关闭"误导用户，2026-10-18 实测）
+    return { status: 'infeasible', conflict: tooTightConflict(pack, intent, graph, startNodeId, endNodeId) || noCandidatesConflict(intent) };
   }
   if (!bestSch) {
     if (constraintProblems.some((p) => ['REPEATED_EDGE', 'no_non_repeating_path', 'end_requires_repeated_edge'].includes(p.code))) {
@@ -555,7 +700,42 @@ function nearestNeighborOrder(graph, startId, nodeIds) {
   return order;
 }
 
+/* ================= 折线回填（距离矩阵模式） =================
+ * 求解阶段只用高德测距结果（直线示意几何），发布前对选中路线的每一段回填真实步行折线与逐步导引，
+ * 再按同一站序、同一停留参数重排时间（距离以真实路线为准）。超预算时先收回"停留补足"的时长；
+ * 仍超就保留回填前的排程（距离来自高德测距，仅地图折线为示意），绝不让发布结果超预算。
+ */
+async function hydrateSolved(pack, intent, graph, solved) {
+  if (!graph || typeof graph.hydrate !== 'function' || !solved || solved.status !== 'ok' || !solved.schedule) return solved;
+  const sch = solved.schedule;
+  const legs = [...(sch.legs || []), ...(sch.endLeg ? [sch.endLeg] : [])];
+  const pairs = legs.map((l) => [l.fromNodeId, l.toNodeId]).filter(([a, b]) => graph.isPending(a, b));
+  if (!pairs.length) return solved;
+  try { await graph.hydrate(pairs); } catch (e) { return solved; }
+  const nodeSeq = sch.stops.map((st) => st.nodeId);
+  const baseOpts = { ...(sch.schedOpts || {}) };
+  const tries = [baseOpts];
+  if (baseOpts.dwellBonus) {
+    const half = {};
+    for (const [k, v] of Object.entries(baseOpts.dwellBonus)) if (v >= 120) half[k] = Math.floor(v / 120) * 60;
+    tries.push({ ...baseOpts, dwellBonus: half }, { ...baseOpts, dwellBonus: null });
+  }
+  for (const o of tries) {
+    const re = scheduleRoute(pack, intent, graph, nodeSeq, { ...o, startNodeId: solved.startNodeId, endNodeId: sch.resolvedEndNodeId || solved.endNodeId });
+    if (re.ok && re.totals.totalSec <= intent.budgetSec && re.endArrivalMs <= (intent.latestEndAtMs || Infinity)) {
+      return { ...solved, schedule: { ...re, resolvedEndNodeId: sch.resolvedEndNodeId, schedOpts: o } };
+    }
+  }
+  return solved;
+}
+
 /* ================= 校验层（§8.7 发布前清单） ================= */
+/** 告警里的站点列表：≤2 个列全名，更多时只列前两个并给数量（避免一屏重复站名） */
+function stopNames(stops) {
+  const names = stops.map((s) => s.poi.name);
+  return names.length > 2 ? `${names.length} 个站点（${names.slice(0, 2).join('、')} 等）` : names.join('、');
+}
+
 function validatePlan(pack, intent, graph, solved) {
   const constraints = [];
   const warnings = [];
@@ -613,14 +793,25 @@ function validatePlan(pack, intent, graph, solved) {
     const endM = Math.round(schedule.endLeg.distanceM);
     const total = schedule.totals.distanceM || 1;
     const long = endM > Math.max(800, total * 0.35);
+    const walkMin = Math.max(1, Math.round(schedule.endLeg.travelSec / 60));
     warnings.push({
       code: long ? 'END_APPROACH_LONG' : 'END_APPROACH',
       level: long ? 'warn' : 'info',
       message: long
         ? `末站「${lastName}」到终点还有约 ${endM}m（步行约 ${Math.round(schedule.endLeg.travelSec / 60)} 分钟）：终点附近没有符合偏好且时间装得下的点，这段是去终点的必要通勤`
-        : `末站「${lastName}」离终点约 ${endM}m，逛完顺路就到`,
+        : endM <= 300
+          ? `末站「${lastName}」离终点约 ${endM}m，逛完顺路就到`
+          : `末站「${lastName}」逛完还需步行约 ${walkMin} 分钟（${endM}m）到终点`,
       evidenceIds: [],
     });
+  }
+  const estLegs = allLegs.filter((l) => l.provider === 'venue-estimate');
+  if (estLegs.length) {
+    warnings.push({ code: 'VENUE_PATH_ESTIMATED', level: 'info', message: `园内 ${estLegs.length} 段路线地图服务无步行数据（会绕到园外），已按直线距离×1.3 估算，请以园内指示牌为准`, evidenceIds: [] });
+  }
+  const sketchLegs = allLegs.filter((l) => l.provider === 'amap-distance' || l.provider === 'amap-estimate');
+  if (sketchLegs.length) {
+    warnings.push({ code: 'LEG_GEOMETRY_SKETCH', level: 'info', message: `${sketchLegs.length} 段路线的地图折线暂为示意（距离来自高德步行测距），出发时可在导航中查看实际走法`, evidenceIds: [] });
   }
   if (repeatApprox && !repeat.repeatedEdgeIds.length) {
     warnings.push({ code: 'BACKTRACKING_APPROXIMATED', message: '真实路线已按折线空间匹配规避重叠，但地图服务未提供稳定道路 ID，无法证明绝对零重复', evidenceIds: [] });
@@ -652,12 +843,12 @@ function validatePlan(pack, intent, graph, solved) {
   }
   // 信息不确定性提示
   const unknownPrice = schedule.stops.filter((s) => !s.poi.ticketKnown);
-  if (unknownPrice.length) warnings.push({ code: 'PRICE_UNKNOWN', message: `${unknownPrice.map((s) => s.poi.name).join('、')}价格未核验，预估费用不含该部分`, evidenceIds: [] });
+  if (unknownPrice.length) warnings.push({ code: 'PRICE_UNKNOWN', message: `${stopNames(unknownPrice)}价格未核验，预估费用不含该部分`, evidenceIds: [] });
   // 开放时间未核验（真实高德候选没有营业时间表）→ 条件性方案，不假装已知（§7.1）
   const hoursUnknown = schedule.stops.filter((s) => !s.poi.openWindows);
   if (hoursUnknown.length) {
     constraints.push({ key: 'hours_unverified', result: 'unknown', evidenceIds: ['ev_amap_live'] });
-    warnings.push({ code: 'HOURS_UNKNOWN', message: `${hoursUnknown.map((s) => s.poi.name).join('、')}的开放时间未核验，出发前请现场确认`, evidenceIds: [] });
+    warnings.push({ code: 'HOURS_UNKNOWN', message: `${stopNames(hoursUnknown)}的开放时间未核验，出发前请现场确认`, evidenceIds: [] });
   }
 
   const hasFail = constraints.some((c) => c.result === 'fail');
@@ -853,10 +1044,12 @@ function chooseRouteTitle(pack, stops) {
 
 function buildWhy(poi, intent) {
   const reasons = [];
-  const hits = poi.tags.filter((t) => intent.interests.some((i) => i.tag === t));
-  if (hits.length) reasons.push(`符合你的${hits.join('、')}偏好`);
-  if (poi.scenic >= 0.8) reasons.push('园内景观价值最高的点位之一');
   if (intent.hard.mustVisitIds.includes(poi.id)) reasons.push('你指定的必去点');
+  // 智能体评审/提名给出的具体理由（"明清皇家园林，古柏与堆秀山"）优先于"景观价值高"这类模板话
+  if (poi.agentReason) reasons.push(poi.agentReason);
+  const hits = intent.interests.map((i) => i.tag).filter((t) => interestMatched(poi, t));
+  if (hits.length) reasons.push(`符合你的${hits.join('、')}偏好`);
+  if (!poi.agentReason && poi.scenic >= 0.8) reasons.push(poi.nominated ? '值得专程一看的代表性地点' : '园内景观价值最高的点位之一');
   if (!reasons.length) reasons.push('顺路且停留时间可控');
   return reasons.join('；');
 }
@@ -983,6 +1176,31 @@ function noCandidatesConflict(intent) {
   };
 }
 
+function tooTightConflict(pack, intent, graph, startNodeId, endNodeId) {
+  const speed = WALK_SPEED[intent.pace] || WALK_SPEED.normal;
+  const haveMin = Math.floor(intent.budgetSec / 60);
+  const isAB = endNodeId && endNodeId !== startNodeId;
+  const suggestions = [{ action: 'extend_time', label: '延长 30 分钟', effect: '预算增加 30 分钟' }];
+  if (isAB) {
+    const d = graph.route(startNodeId, endNodeId).distanceM;
+    if (d == null) return null;
+    const walkMin = Math.ceil(d / speed / 60);
+    suggestions.push({ action: 'change_endpoint_flexible', label: '改为顺路结束', effect: '不必赶到远处的终点，时间留给沿途' });
+    return {
+      code: 'NO_FEASIBLE_ROUTE',
+      message: `起点到终点步行约 ${(d / 1000).toFixed(1)}km、约 ${walkMin} 分钟，再加上沿途停留与缓冲，${haveMin} 分钟装不下任何一站；可以延长时间，或改为顺路结束`,
+      violations: [{ field: 'time_budget', message: `仅路程就需约 ${walkMin} 分钟`, evidenceIds: [] }],
+      suggestions,
+    };
+  }
+  return {
+    code: 'NO_FEASIBLE_ROUTE',
+    message: `附近候选点的往返路程加停留超过了 ${haveMin} 分钟，当前预算装不下任何一站；可以延长时间再试`,
+    violations: [{ field: 'time_budget', message: '最近的候选点也排不进预算', evidenceIds: [] }],
+    suggestions,
+  };
+}
+
 function noBacktrackingConflict(intent) {
   const returning = intent.endpoint.mode === 'return_to_origin';
   return {
@@ -1028,8 +1246,11 @@ function buildTimeConflict(pack, intent, graph, seq, startNodeId, endNodeId) {
 }
 
 /* ================= 版本差异文案（§12.3 提议—确认） ================= */
-function diffRoutes(oldPlan, newPlan) {
+function diffRoutes(oldPlan, newPlan, opts = {}) {
   const lines = [];
+  // 行程中重排：已到访/已跳过的站不属于"这次调整"，不能写成"跳过了它们"（2026-10-18 线上实测）
+  const done = new Set(opts.doneIds || []);
+  oldPlan = { ...oldPlan, stops: oldPlan.stops.filter((s) => !done.has(s.poiId)) };
   const oldIds = oldPlan.stops.map((s) => s.poiId);
   const newIds = newPlan.stops.map((s) => s.poiId);
   const removed = oldPlan.stops.filter((s) => !newIds.includes(s.poiId));
@@ -1046,4 +1267,4 @@ function diffRoutes(oldPlan, newPlan) {
   return lines;
 }
 
-module.exports = { VenueGraph, solveAlternatives, solveOnce, scoreCandidates, scheduleRoute, buildRoutePlan, diffRoutes, validatePlan, closedNowConflict, rankRouteAlternatives, chooseRouteTitle, isCulturalVenue, SOLVER_VERSION, POLICY_VERSION };
+module.exports = { VenueGraph, solveAlternatives, solveOnce, scoreCandidates, scheduleRoute, buildRoutePlan, hydrateSolved, diffRoutes, validatePlan, closedNowConflict, rankRouteAlternatives, chooseRouteTitle, isCulturalVenue, budgetUtilization, SOLVER_VERSION, POLICY_VERSION };

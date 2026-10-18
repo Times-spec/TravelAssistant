@@ -94,6 +94,7 @@ export function subscribeJob(jobId, onEvent, { afterSeq = 0, onError } = {}) {
       try {
         const j = await get(`/v1/jobs/${jobId}/events?poll=1&afterSeq=${lastSeq}`);
         for (const e of j.events) handle(e);
+        handle({ type: 'job.progress', jobId, payload: { queuePosition: j.queuePosition, phase: j.phase, phaseLabel: j.phaseLabel, activePhaseLabel: j.activePhaseLabel, jobStatus: j.jobStatus } });
         if (j.jobStatus === 'completed' || j.jobStatus === 'failed' || j.jobStatus === 'cancelled') {
           return; // 本次返回的尾部事件已全部交付
         }
@@ -109,8 +110,8 @@ export function subscribeJob(jobId, onEvent, { afterSeq = 0, onError } = {}) {
       // 注意：EventSource 无法附带鉴权头；服务端对 events 端点接受 query token
       es.onerror = () => { es.close(); es = null; startPolling(); };
       const types = ['intent.normalized', 'clarification.required', 'candidates.ready', 'route.ready',
-        'route.alternative_ready', 'guide.text_ready', 'guide.audio_ready', 'route.risk_detected',
-        'job.failed', 'job.completed'];
+        'route.alternative_ready', 'guide.text_ready', 'guide.audio_ready', 'route.risk_detected', 'agent.progress',
+        'job.failed', 'job.completed', 'job.progress'];
       for (const t of types) {
         es.addEventListener(t, (m) => { try { handle(JSON.parse(m.data)); } catch (e) {} });
       }

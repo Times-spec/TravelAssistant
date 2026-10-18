@@ -1,4 +1,4 @@
-import { LEG_STYLE, legStates, polylineTurns, turnWord, distM } from './routeview.js';
+import { LEG_STYLE, legStates, polylineTurns, turnWord, distM, stopMarkerGroups } from './routeview.js';
 // UI 工具：DOM 构建、toast、底部 sheet、SVG 地图组件（平移/缩放只改视图，不改行程 §10.3）
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -88,7 +88,40 @@ export const fmtMin = (sec) => {
   return r ? `${hh} 小时 ${r} 分` : `${hh} 小时`;
 };
 export const fmtKm = (m) => m >= 1000 ? (m / 1000).toFixed(1) + 'km' : Math.round(m) + 'm';
-export const fmtClock = (iso) => iso ? iso.slice(11, 16) : '--:--';
+/* 时间一律按产品时区渲染：服务端事件时间是 UTC ISO，直接截字符串会少 8 小时（2026-10-18 线上实测） */
+const SHOP_TZ = 'Asia/Shanghai';
+const _partsFmt = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: SHOP_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hourCycle: 'h23', weekday: 'short',
+});
+/** ISO 字符串（UTC 或带偏移）→ 上海时区的拆分结果；解析失败返回 null */
+export function zoned(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const p = {};
+  for (const { type, value } of _partsFmt.formatToParts(d)) p[type] = value;
+  return {
+    y: p.year, m: p.month, d: p.day, hh: p.hour, mm: p.minute, week: p.weekday,
+    dateStr: `${p.year}-${p.month}-${p.day}`,
+    hhmm: `${p.hour}:${p.minute}`,
+    md: `${p.month}-${p.day}`,
+  };
+}
+/** 浏览器定位只在安全上下文可用（HTTPS 或 localhost）：HTTP 公网地址下应明确告知并给手选入口 */
+export function locateBlockedReason() {
+  try {
+    if (window.isSecureContext) return null;
+    const h = location.hostname;
+    if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]') return null;
+    if (!navigator.geolocation) return '当前浏览器不支持定位';
+    return '当前地址不是 HTTPS，手机/浏览器会拒绝定位；可搜索或在地图上选点，或改用 HTTPS 入口';
+  } catch (e) { return null; }
+}
+
+export const fmtClock = (iso) => { const z = zoned(iso); return z ? z.hhmm : '--:--'; };
+export const fmtDate = (iso) => { const z = zoned(iso); return z ? z.md : ''; };
+export const fmtDateTime = (iso) => { const z = zoned(iso); return z ? `${z.md} ${z.hhmm}` : ''; };
 
 /* ---------------- SVG 地图 ----------------
  * 输入：nodes/edges（场所包）+ route legs/stops + 用户位置。
@@ -159,6 +192,7 @@ export class SvgMap {
   }
   _apply() {
     this.svg.setAttribute('viewBox', `${this.view.x} ${this.view.y} ${this.view.w} ${this.view.h}`);
+    this._scalePins();
     // 缩放分级（视口宽度≈可见米数）：远图只看路线骨架，中图出现站名与转向箭头，近图补转向文字
     const w = this.view.w;
     this.svg.classList.toggle('am-z-far', w > 2200);
@@ -172,6 +206,22 @@ export class SvgMap {
     this._apply();
   }
   clear() { this.root.innerHTML = ''; }
+  _scalePins() {
+    const rect = this.svg.getBoundingClientRect();
+    const unit = 1 / Math.min((rect.width || 360) / this.view.w, (rect.height || 300) / this.view.h);
+    this.root.querySelectorAll('[data-map-pin]').forEach((pin) => {
+      pin.setAttribute('transform', `translate(${pin.dataset.x} ${pin.dataset.y}) scale(${unit})`);
+    });
+  }
+  pin(point) {
+    const group = this.el('g', { 'data-map-pin': '1', 'data-x': point.x, 'data-y': point.y });
+    this._scalePins();
+    return { el: (name, attrs) => {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', name);
+      for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+      group.appendChild(node); return node;
+    } };
+  }
   el(name, attrs) {
     const e = document.createElementNS('http://www.w3.org/2000/svg', name);
     for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
@@ -208,8 +258,8 @@ export function loadAmap(jsKey, securityCode) {
 
 function stopMarkerContent(text, bg, big) {
   const d = big ? 30 : 24;
-  return `<div style="width:${d}px;height:${d}px;border-radius:50%;background:${bg};color:#fff;
-    display:flex;align-items:center;justify-content:center;font:700 ${big ? 14 : 12}px/1 sans-serif;
+  return `<div class="route-stop-marker" style="min-width:${d}px;padding:0 5px;height:${d}px;border-radius:${d}px;background:${bg};color:#fff;
+    display:flex;align-items:center;justify-content:center;white-space:nowrap;font:700 ${big ? 14 : 12}px/1 sans-serif;
     border:2.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3)${big ? ',0 0 0 6px rgba(22,119,255,.18)' : ''}">${text}</div>`;
 }
 const badgeContent = (text, bg) => `<div style="min-width:22px;height:22px;padding:0 5px;border-radius:11px;background:${bg};color:#fff;display:flex;align-items:center;justify-content:center;font:700 12px/1 sans-serif;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3);white-space:nowrap">${text}</div>`;
@@ -270,25 +320,25 @@ export class AmapRouteMap {
     // 起点 / 终点：A→B 路线单独标"终"（此前默认"终点即最后一站"，末站→终点那段因此无从解释）
     const first = route.legs.length && route.legs[0].geometry.coordinates[0];
     const last = route.legs[route.legs.length - 1];
-    const endPt = last && last.isReturnLeg ? last.geometry.coordinates[last.geometry.coordinates.length - 1] : null;
+    const endPt = last && last.geometry.coordinates[last.geometry.coordinates.length - 1];
+    const markers = stopMarkerGroups(route, opts);
+    const mergedEnd = markers.some((m) => m.endsHere);
     const sameEnd = first && endPt && distM(first, endPt) < 30;
-    if (first) {
-      this._add(new AMap.Marker({ position: new AMap.LngLat(first[0], first[1]), content: badgeContent(sameEnd ? '起/终' : '起', '#0f6f4f'), anchor: 'center', title: '起点', zIndex: 45 }));
+    if (first && !markers.some((m) => m.startsHere)) {
+      this._add(new AMap.Marker({ position: new AMap.LngLat(first[0], first[1]), content: badgeContent(sameEnd && !mergedEnd ? '起/终' : '起', '#0f6f4f'), anchor: 'center', title: '起点', zIndex: 45 }));
     }
-    if (endPt && !sameEnd) {
+    if (endPt && !sameEnd && !mergedEnd) {
       this._add(new AMap.Marker({ position: new AMap.LngLat(endPt[0], endPt[1]), content: badgeContent('终', '#c2410c'), anchor: 'center', title: (route.endApproach && route.endApproach.endName) || '终点', zIndex: 45 }));
     }
-    route.stops.forEach((s, i) => {
-      const isNext = opts.nextPoiId && s.poiId === opts.nextPoiId;
-      const state = opts.stopState ? opts.stopState(s) : null;
+    markers.forEach((marker) => {
+      const { isNext, state } = marker;
       const bg = state === 'skip' ? '#b8c2bd' : state === 'done' ? '#8a9a92' : isNext ? '#1677ff' : '#0f6f4f';
-      const text = state === 'skip' ? '✕' : state === 'done' ? '✓' : String(i + 1);
-      const showLabel = opts.labels !== 'key' || isNext;
+      const safeLabel = (marker.label || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
       this._add(new AMap.Marker({
-        position: new AMap.LngLat(s.coord[0], s.coord[1]),
-        content: stopMarkerContent(text, bg, isNext),
-        anchor: 'center', title: s.name, zIndex: isNext ? 55 : 50,
-        label: showLabel ? { content: `<div class="am-label-halo${state ? ' dim' : ''}${isNext ? ' next' : ''}">${s.name}</div>`, direction: 'top' } : undefined,
+        position: new AMap.LngLat(marker.coord[0], marker.coord[1]),
+        content: stopMarkerContent(marker.text, bg, isNext),
+        anchor: 'center', title: marker.title, zIndex: isNext ? 65 : 50,
+        label: isNext ? { content: `<div class="am-label-halo next">${safeLabel}</div>`, direction: 'top' } : undefined,
       }));
     });
     // 转向箭头只画当前这段（后续路段的转向此刻用不上，画满屏只会更乱）

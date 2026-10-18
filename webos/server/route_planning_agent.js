@@ -19,7 +19,11 @@ const PROBE_POLICY = { name: 'probe', interestW: 1, timeCostW: 0.55, dwellFactor
 function compileConstraintLedger(intent) {
   const hard = hardConstraintsOf(intent);
   const rows = [
-    { id: 'system.no_repeated_edges', kind: 'route.edge_repeat', hardness: 'hard', source: 'system_default', value: hard.noRepeatedEdges ? 0 : null, unit: 'count' },
+    // 真实路网（高德街道折线）只能做近似检测：resolvePackGraph 会把 noRepeatedEdges 置否，
+    // 此时台账不能再写成"硬约束已满足"——口径必须与底部诚实警告一致（2026-10-18 审计发现）。
+    hard.noRepeatedEdges
+      ? { id: 'system.no_repeated_edges', kind: 'route.edge_repeat', hardness: 'hard', source: 'system_default', value: 0, unit: 'count' }
+      : { id: 'preference.approx_no_repeat', kind: 'route.edge_repeat_approx', hardness: 'soft', source: 'system_default', value: true },
     { id: 'user.must_visit', kind: 'poi.must_visit', hardness: 'hard', source: 'user', value: [...(intent.hard?.mustVisitIds || [])] },
     { id: 'user.avoid', kind: 'poi.avoid', hardness: 'hard', source: 'user', value: [...(intent.hard?.avoidPoiIds || [])] },
     { id: 'user.latest_end', kind: 'time.latest_end', hardness: 'hard', source: 'user', value: intent.latestEndAt },

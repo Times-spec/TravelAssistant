@@ -14,6 +14,10 @@
     "test:planner-constraints": "node scripts/planner-constraints.js",
     "test:planner-ordering": "node scripts/planner-ordering.js",
     "test:planner-endpoint": "node scripts/planner-endpoint.js",
-    "test:route-strategies": "node scripts/compare-route-strategies.js"
+    "test:route-strategies": "node scripts/compare-route-strategies.js",
+    "test:live-fixes": "node scripts/live-fixes.js",
+    "test:agent-kernel": "node scripts/agent-kernel.js",
+    "eval:agent": "node scripts/agent-eval.js",
+    "bench": "node scripts/planner-bench.js"
   }
 }

@@ -6,7 +6,7 @@
  * - 阶段边界检查取消标志；事件带 seq，支持断线补偿。
  */
 const { id, nowIso } = require('./util');
-const { VenueGraph, solveAlternatives, buildRoutePlan, solveOnce, scheduleRoute, validatePlan, diffRoutes } = require('./planner');
+const { VenueGraph, solveAlternatives, buildRoutePlan, solveOnce, scheduleRoute, validatePlan, diffRoutes, hydrateSolved } = require('./planner');
 const { buildGuideContent } = require('./providers');
 const tk = require('./timekit');
 
@@ -45,13 +45,15 @@ class JobRunner {
   }
 
   /** 场所包与图：真实场所/真实片区走高德实时构建；来源为自有数据的场所包直接取用 */
-  async resolvePackGraph(intent) {
-    const out = await this._resolvePackGraph(intent);
+  async resolvePackGraph(intent, hooks = {}) {
+    const out = await this._resolvePackGraph(intent, hooks);
     this.alignTraversalConstraint(intent, out.pack);
+    // 智能体知识（提名/评审）按意图落库：规划、编辑、途中重排都在同一套候选口径上工作
+    if (intent.agentKnowledge) require('./agent_kernel').applyAgentKnowledge(out.pack, intent.agentKnowledge);
     return out;
   }
 
-  async _resolvePackGraph(intent) {
+  async _resolvePackGraph(intent, hooks = {}) {
     if (this.ctx.cfg.providers.map !== 'amap') {
       const local = this.packOf(intent.venueId);
       if (local) return { pack: local, graph: this.graphOf(intent.venueId) };
@@ -59,7 +61,16 @@ class JobRunner {
     }
     const { buildAmapAreaPack } = require('./amap');
     if (intent.venueId === 'area_amap') {
-      const area = await buildAmapAreaPack(this.ctx.cfg, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec, endpointPointOf(intent));
+      const area = await buildAmapAreaPack(this.ctx.cfg, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec, endpointPointOf(intent), {
+        // 兴趣标签决定候选池排序（"想吃点东西"时餐饮点不该被展馆整体挤出）；
+        // 室内偏好决定室内/露天点的相对权重（与候选评分层的 indoorAdj 同一口径）
+        interests: (intent.interests || []).map((x) => x.tag),
+        indoorPreferred: !!(intent.soft && intent.soft.indoorPreferred),
+        // 必去点是硬约束：即使不在检索半径/走廊内也要进候选池（否则校验层直接判 infeasible）
+        mustVisitIds: intent.hard.mustVisitIds || [],
+        nominated: (intent.agentKnowledge && intent.agentKnowledge.nominated) || [], // 智能体提名（已经高德核实）
+        onCandidates: hooks.onCandidates,
+      });
       return area;
     }
     if (String(intent.venueId).startsWith('live:')) {
@@ -73,6 +84,8 @@ class JobRunner {
         mustVisitIds: intent.hard.mustVisitIds || [],
         // 固定终点单独建节点，末站→终点这段参与排序
         endpoint: endpointPointOf(intent),
+        nominated: (intent.agentKnowledge && intent.agentKnowledge.nominated) || [],
+        onCandidates: hooks.onCandidates,
       });
       return { pack: live.pack, graph: live.graph };
     }
@@ -152,7 +165,32 @@ class JobRunner {
     const { store, cfg } = this.ctx;
     const plan = store.byId('plans', job.planId);
     const intent = store.byId('intents', plan.intentId);
-    const { pack, graph } = await this.resolvePackGraph(intent);
+    const kernel = require('./agent_kernel');
+    const agentOn = kernel.enabledFor(cfg, intent) && !(intent.unresolved || []).length;
+    const kernelT0 = Date.now();
+    const preTrace = [];
+    // ①② 智能体提名 + 高德核实：必须在建候选池之前（提名点要进池）
+    if (agentOn && kernel.llmReady(cfg)) {
+      this.emit(job, 'agent.progress', { stage: 'nominate', label: '大模型提名值得去的地点，并用高德逐个核实' });
+      // 等大模型的同时先把片区周边检索跑掉（进缓存），不让两段耗时串行叠加
+      const prewarm = intent.venueId === 'area_amap' && cfg.providers.map === 'amap'
+        ? require('./amap').prewarmAreaSearch(cfg, intent.origin.point, intent.budgetSec, endpointPointOf(intent)).catch(() => {})
+        : Promise.resolve();
+      try { preTrace.push(await kernel.ensureNominations(cfg, intent, { store })); }
+      catch (e) { console.warn('[agent] 提名失败，回退规则候选', e.message); }
+      await prewarm;
+    }
+    // ③ 评审提前到"候选已定、路网矩阵抓取中"开始：大模型与高德路线两段耗时并行
+    let appraisalPending = null;
+    const appraiseT0 = Date.now();
+    const hooks = agentOn && kernel.llmReady(cfg) ? {
+      onCandidates: (list) => {
+        if (appraisalPending) return;
+        appraisalPending = kernel.startAppraisal(cfg, intent, list, { store });
+        if (appraisalPending) this.emit(job, 'agent.progress', { stage: 'appraise', label: '大模型评审候选点（与高德路网抓取并行）' });
+      },
+    } : {};
+    const { pack, graph } = await this.resolvePackGraph(intent, hooks);
     const { confirmChips } = require('./domain');
 
     store.update('plans', plan.id, {
@@ -171,13 +209,23 @@ class JobRunner {
       return; // 等待用户确认后重新提交（新 revision → 新 plan 任务）
     }
 
+    // ③ 智能体评审：给候选打"值得去"分、建议停留、纠正分类、识别噪声点
+    if (agentOn && kernel.llmReady(cfg)) {
+      if (!appraisalPending) this.emit(job, 'agent.progress', { stage: 'appraise', label: '大模型评审候选点：值得度、停留时长、噪声' });
+      try { preTrace.push(await kernel.ensureAppraisal(cfg, intent, pack, { store, pending: appraisalPending, t0: appraisalPending ? appraiseT0 : null })); }
+      catch (e) { console.warn('[agent] 评审失败，沿用类型先验', e.message); }
+    }
+
     // 候选点
     const { scoreCandidates } = require('./planner');
     const originNear = graph.nearestNode(intent.origin.point);
     const startNodeId = intent.origin.entranceId && graph.nodeById.has(intent.origin.entranceId)
       ? intent.origin.entranceId : originNear.node.id;
     const cands = scoreCandidates(pack, intent, graph, startNodeId);
-    const candidatePreview = { count: cands.length, names: cands.slice(0, 12).map((c) => c.poi.name) };
+    const candidatePreview = {
+      count: cands.length, names: cands.slice(0, 12).map((c) => c.poi.name),
+      nominated: cands.filter((c) => c.poi.nominated).map((c) => c.poi.name).slice(0, 12),
+    };
     store.update('plans', plan.id, { candidatePreview });
     this.emit(job, 'candidates.ready', {
       count: cands.length,
@@ -196,11 +244,27 @@ class JobRunner {
       results = solveAlternatives(pack, intent, graph);
       store.update('plans', plan.id, { planningMode: 'algorithm' });
     } else {
-      const { RoutePlanningAgent } = require('./route_planning_agent');
-      agentResult = new RoutePlanningAgent().plan({ pack, intent, graph, planId: plan.id });
+      if (agentOn) {
+        // ④~⑦ 求解 + 独立验证 + 反思-修复循环 + 解释（真实场所/片区）
+        agentResult = await kernel.runAgentKernel({
+          cfg, pack, intent, graph, planId: plan.id, preTrace, startedAt: kernelT0,
+          onProgress: (p) => this.emit(job, 'agent.progress', p.stage === 'critic'
+            ? { stage: 'critic', round: p.round, label: `反思第 ${p.round} 轮：${(p.issues || []).slice(0, 2).join('；')}` }
+            : { stage: p.stage, label: '基于路线数据生成推荐理由' }),
+        });
+      } else {
+        const { RoutePlanningAgent } = require('./route_planning_agent');
+        agentResult = new RoutePlanningAgent().plan({ pack, intent, graph, planId: plan.id });
+      }
       results = agentResult.solutions;
       store.update('plans', plan.id, {
         planningMode: 'agent',
+        agentKernel: agentOn ? {
+          llm: kernel.llmReady(cfg),
+          quality: agentResult.quality || null,
+          critic: agentResult.critic || null,
+          nominated: ((intent.agentKnowledge && intent.agentKnowledge.nominated) || []).map((n) => ({ id: n.id, name: n.name, reason: n.reason || null })),
+        } : null,
         constraintLedger: agentResult.constraintLedger,
         agentTrace: agentResult.trace,
         agentProposals: agentResult.proposals.map((proposal) => ({
@@ -235,6 +299,10 @@ class JobRunner {
       return;
     }
 
+    // 距离矩阵模式：发布前给每个方案回填真实步行折线（智能体内核已回填过的段直接跳过）
+    for (const r of results) {
+      if (r && r.solved) r.solved = await hydrateSolved(pack, intent, graph, r.solved);
+    }
     const routeIds = [];
     let version = store.find('route_versions', (r) => r.planId === plan.id).length;
     for (let i = 0; i < results.length; i++) {
@@ -250,8 +318,17 @@ class JobRunner {
       // 备选标题体现真实取向差异（主推荐不加后缀，避免读起来像次级方案）；
       // 三种策略都要有区分，否则主推 light、备选 balanced 时会撞成同一个标题
       if (i > 0) {
-        plan_.title += r.policy.name === 'light' ? ' · 轻松版'
-          : r.policy.name === 'full' ? ' · 全览版' : ' · 均衡版';
+        // 备选名称必须和数据一致：站数/距离/时长都更少就不该叫"全览版"（2026-10-18 审计发现）
+        const mainRv = results[0] && buildRoutePlan(pack, intent, graph, results[0].solved, { version: 1, planId: plan.id });
+        const dStops = plan_.stops.length - (mainRv ? mainRv.stops.length : plan_.stops.length);
+        const dKm = mainRv ? (plan_.totals.distanceM - mainRv.totals.distanceM) / 1000 : 0;
+        const dMin = mainRv ? Math.round((plan_.totals.totalSec - mainRv.totals.totalSec) / 60) : 0;
+        const cmp = [];
+        if (dStops !== 0) cmp.push(`${dStops > 0 ? '多' : '少'} ${Math.abs(dStops)} 站`);
+        if (Math.abs(dKm) >= 0.3) cmp.push(`${dKm > 0 ? '多走' : '少走'} ${Math.abs(dKm).toFixed(1)}km`);
+        if (Math.abs(dMin) >= 5) cmp.push(`${dMin > 0 ? '多' : '少'} ${Math.abs(dMin)} 分钟`);
+        const label = dStops > 0 ? ' · 更全' : dStops < 0 ? ' · 更精简' : ' · 均衡';
+        plan_.title += label + (cmp.length ? `（${cmp.join('，')}）` : '');
       }
       if (!existing) store.insert('route_versions', plan_);
       routeIds.push(plan_.routeId);
@@ -342,7 +419,9 @@ class JobRunner {
     if (Array.isArray(edits.reorder) && edits.reorder.length) {
       // 用户指定顺序：直接排程校验，不让求解器悄悄改回
       const startNodeId = base.startNodeId;
-      const sch = scheduleRoute(pack, edited, graph, edits.reorder, { startNodeId, endNodeId: base.endNodeId });
+      // 保留原路线每站的停留时长（含"停留补足"），只按新顺序重排路程
+      const dwellOverride = Object.fromEntries((base.stops || []).filter((x) => x.entranceNodeId && x.dwellSec).map((x) => [x.entranceNodeId, x.dwellSec]));
+      const sch = scheduleRoute(pack, edited, graph, edits.reorder, { startNodeId, endNodeId: base.endNodeId, dwellOverride });
       if (!sch.ok || sch.totals.totalSec > edited.budgetSec) {
         this.emit(job, 'job.failed', { code: 'NO_FEASIBLE_ROUTE', message: '调整顺序后超出时间预算或时间窗，未替换原路线', retryable: false });
         return;
@@ -356,6 +435,7 @@ class JobRunner {
       }
       solved = r;
     }
+    solved = await hydrateSolved(pack, edited, graph, solved);
     const version = store.find('route_versions', (x) => x.planId === plan.id).length + 1;
     const newPlan = buildRoutePlan(pack, edited, graph, solved, { version, planId: plan.id, parentVersion: base.version });
     store.insert('route_versions', newPlan);
@@ -363,7 +443,7 @@ class JobRunner {
     store.update('plans', plan.id, { routeIds });
     this.emit(job, 'route.ready', {
       routeId: newPlan.routeId, status: newPlan.status, title: newPlan.title,
-      summary: routeSummary(newPlan), diffLines: diffRoutes(base, newPlan), editedFrom: base.routeId,
+      summary: routeSummary(newPlan), diffLines: diffRoutes(base, newPlan, { doneIds: doneIdsOf(store, plan.id) }), editedFrom: base.routeId,
     }, newPlan.version);
   }
 
@@ -415,10 +495,12 @@ class JobRunner {
     if (cause === 'fatigue_reported') {
       edited.soft.restPreferred = true;
       edited.pace = 'easy';
-      // 疲劳：主动放弃剩余可选点中价值较低的一半（锁定点保留，§12.1）
+      // 疲劳：主动放弃剩余可选点中价值较低的一半（锁定点保留，§12.1）。
+      // 按"去掉它能省多少路"丢点，而不是丢最后几站：A→B 路线里最后几站恰是靠近终点的顺路站，
+      // 丢掉它们会让末段空走 1km+（2026-10-18 线上实测"春熙路→天府广场"疲劳重排末段 1388m）
       const optional = remaining.filter((s) => !s.locked).map((s) => s.poiId);
       const dropN = Math.ceil(optional.length / 2);
-      if (dropN > 0) edited.hard.avoidPoiIds.push(...optional.slice(-dropN));
+      if (dropN > 0) edited.hard.avoidPoiIds.push(...pickFatigueDrops(graph, startNode.id, remaining, base.endNodeId, dropN));
       edited.hard.avoidPoiIds = [...new Set(edited.hard.avoidPoiIds)];
     }
     if (cause === 'rain_reported') {
@@ -439,17 +521,18 @@ class JobRunner {
       edited.hard.avoidPoiIds = [...new Set(edited.hard.avoidPoiIds)];
     }
 
-    const r = solveOnce(pack, edited, graph, { interestW: 1, timeCostW: 0.55, dwellFactor: 1 });
+    let r = solveOnce(pack, edited, graph, { interestW: 1, timeCostW: 0.55, dwellFactor: 1 });
     if (r.status !== 'ok') {
       this.emit(job, 'job.failed', { code: r.conflict.code, message: r.conflict.message, retryable: false, conflict: r.conflict });
       return;
     }
+    r = await hydrateSolved(pack, edited, graph, r);
     const version = store.find('route_versions', (x) => x.planId === plan.id).length + 1;
     const proposal = buildRoutePlan(pack, edited, graph, r, { version, planId: plan.id, parentVersion: base.version });
     proposal.isProposal = true;
     proposal.proposalCause = cause;
     store.insert('route_versions', proposal);
-    const diff = diffRoutes(base, proposal);
+    const diff = diffRoutes(base, proposal, { doneIds: [...visitedIds, ...skippedIds] });
     this.emit(job, 'route.alternative_ready', {
       routeId: proposal.routeId, status: proposal.status, title: proposal.title,
       summary: routeSummary(proposal), diffLines: diff, isReplanProposal: true,
@@ -457,6 +540,43 @@ class JobRunner {
     }, proposal.version);
     store.update('jobs', job.id, { result: { proposalRouteId: proposal.routeId, diffLines: diff } });
   }
+}
+
+/** 已到访/已跳过的点（编辑重排时同样不应出现在差异文案里） */
+function doneIdsOf(store, planId) {
+  const trips = store.find('trips', (t) => t.planId === planId && (t.status === 'active' || t.status === 'paused'));
+  if (!trips.length) return [];
+  const tid = trips[trips.length - 1].id;
+  return store.find('trip_events', (e) => e.tripId === tid && (e.type === 'arrive_confirm' || e.type === 'stop_skipped')).map((e) => e.data.poiId);
+}
+
+/**
+ * 疲劳时选哪些站放弃：逐个移除"边际绕行"最大的可选站（prev→s→next 比 prev→next 多走的路），
+ * 每移除一个重新计算，锁定站不动；距离未知时视为 0（不优先丢）。
+ */
+function pickFatigueDrops(graph, startNodeId, remaining, endNodeId, dropN) {
+  const seq = remaining.map((s) => ({ poiId: s.poiId, node: s.entranceNodeId, locked: !!s.locked }));
+  const d = (a, b) => {
+    if (!a || !b || a === b) return 0;
+    const r = graph.route(a, b);
+    return r && Number.isFinite(r.distanceM) ? r.distanceM : null;
+  };
+  const drops = [];
+  while (drops.length < dropN) {
+    let best = -1, bestSave = -Infinity;
+    for (let i = 0; i < seq.length; i++) {
+      if (seq[i].locked) continue;
+      const prev = i === 0 ? startNodeId : seq[i - 1].node;
+      const next = i === seq.length - 1 ? endNodeId : seq[i + 1].node;
+      const a = d(prev, seq[i].node), b = next ? d(seq[i].node, next) : 0, c = next ? d(prev, next) : 0;
+      const save = a == null || b == null || c == null ? 0 : a + b - c;
+      if (save > bestSave) { bestSave = save; best = i; }
+    }
+    if (best < 0) break;
+    drops.push(seq[best].poiId);
+    seq.splice(best, 1);
+  }
+  return drops;
 }
 
 function routeSummary(plan) {
@@ -489,4 +609,4 @@ function createJob(store, { type, ownerId, planId = null, tripId = null, payload
   return job;
 }
 
-module.exports = { JobRunner, createJob, routeSummary };
+module.exports = { pickFatigueDrops, JobRunner, createJob, routeSummary };

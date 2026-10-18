@@ -1,0 +1,27 @@
+{
+  "viewport": [
+    390,
+    844
+  ],
+  "screenshots": 8,
+  "measurements": [
+    {
+      "label": "before",
+      "barHeight": 105.046875,
+      "barTop": 738.953125,
+      "contentBottom": 727.625,
+      "paddingBottom": "90px"
+    },
+    {
+      "label": "after",
+      "barHeight": 105.046875,
+      "barTop": 738.953125,
+      "contentBottom": 695.625,
+      "paddingBottom": "122px"
+    }
+  ],
+  "consoleErrors": [],
+  "failedResponses": [],
+  "mapToggle": "passed",
+  "locationButton": "visible"
+}
