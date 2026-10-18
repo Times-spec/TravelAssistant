@@ -1154,10 +1154,27 @@ class Api {
 
   async hubHighlights() {
     const content = this.ctx.content;
+    const cities = content.listCities();
+    // 讲解开场白是内容库最有代入感的部分（"从午门进来别急着拍全景…"）：
+    // 取热度最高的一批场所，带出它们的场所导览首句，给发现页做「先听一段」
+    const topVenues = content.listVenues({ limit: 10 });
+    const narrations = [];
+    for (const v of topVenues) {
+      const n = content.narrationForVenue(v.id, 'intro');
+      if (!n || !n.teaser) continue;
+      const city = content.getCity(v.cityId);
+      narrations.push({
+        id: n.id, venueId: v.id, venueName: v.name, cityName: (city && city.name) || '',
+        poiName: n.poiName || null, kind: n.kind || 'venue_intro', teaser: n.teaser,
+      });
+      if (narrations.length >= 6) break;
+    }
     return {
-      cities: content.listCities().slice(0, 6),
-      venues: content.listVenues({ limit: 8 }),
+      cities: cities.slice(0, 6),
+      allCityCount: cities.length,
+      venues: topVenues.slice(0, 8),
       articles: content.listArticles({ limit: 4 }),
+      narrations,
       meta: content.getMeta(),
       reviewStatus: 'library_v1',
     };

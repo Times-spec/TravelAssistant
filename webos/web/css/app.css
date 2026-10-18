@@ -299,19 +299,69 @@ li.active .stage-dot { background: var(--warn); animation: pulse 1s infinite alt
 .lib-note { font-size: 11px; color: var(--ink-2); }
 .warn-line { font-size: 12px; color: var(--warn); background: var(--warn-bg); border-radius: 8px; padding: 6px 10px; margin-top: 6px; }
 
-.city-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.city-card { border: 1px solid var(--line); background: #fff; border-radius: 12px; padding: 10px 6px; text-align: center; }
-.city-card:active { background: var(--green-l); }
-.city-name { font-size: 22px; font-weight: 700; color: var(--green-d); }
-.city-full { font-size: 12px; color: var(--ink); margin-top: 2px; }
-.city-meta { font-size: 10px; color: var(--ink-2); margin-top: 2px; }
+/* ==================== 发现页（2026-10-18 重做） ==================== */
+.disc-hero { background: linear-gradient(160deg, #f2f8f5 0%, #ffffff 58%); }
+.disc-title { margin: 2px 0 4px; font-size: 22px; letter-spacing: .5px; }
+.disc-sub { font-size: 13px; color: var(--ink-2); line-height: 1.6; }
+.disc-foot { padding: 2px 8px 18px; font-size: 11px; color: #8a9a92; line-height: 1.7; text-align: center; }
+
+.chip-scroll { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 8px; scrollbar-width: none; }
+.chip-scroll::-webkit-scrollbar { display: none; }
+.chip-scroll .chip { flex: none; }
+.dur-chip { flex: none; display: inline-flex; align-items: baseline; gap: 6px; padding: 7px 12px;
+  border: 1px solid var(--line); border-radius: 10px; background: #fff; font-size: 13.5px; color: var(--ink); }
+.dur-chip b { font-weight: 600; }
+.dur-chip span { font-size: 11px; color: var(--ink-2); }
+.dur-chip.sel { background: var(--green); border-color: var(--green); color: #fff; }
+.dur-chip.sel span { color: rgba(255, 255, 255, .82); }
+
+.tpl-badge { display: inline-block; margin-bottom: 6px; padding: 2px 9px; border-radius: 999px;
+  background: var(--warn-bg); color: var(--warn); font-size: 11px; font-weight: 600; }
+.tpl-route { margin-top: 6px; font-size: 12.5px; line-height: 1.6; color: var(--green-d);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.tpl-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+.tpl-foot .tpl-meta { margin-top: 0; }
+.tpl-cta { flex: none; font-size: 12px; font-weight: 600; color: var(--green); }
+
+.city-strip { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; scroll-snap-type: x mandatory; scrollbar-width: none; }
+.city-strip::-webkit-scrollbar { display: none; }
+.city-strip-card { flex: 0 0 200px; scroll-snap-align: start; text-align: left; padding: 12px;
+  border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+.city-strip-card:active { background: var(--green-l); }
+.cs-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.cs-name { font-size: 17px; font-weight: 700; color: var(--green-d); }
+.cs-count { flex: none; font-size: 11px; color: var(--ink-2); }
+.cs-slogan { margin-top: 4px; font-size: 12px; line-height: 1.55; color: var(--ink-2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cs-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 7px; }
+.cs-meta { margin-top: 7px; font-size: 11px; color: #8a9a92; }
+
+.narr-strip { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; scroll-snap-type: x mandatory; scrollbar-width: none; }
+.narr-strip::-webkit-scrollbar { display: none; }
+.narr-card { flex: 0 0 250px; scroll-snap-align: start; text-align: left; padding: 12px 13px;
+  border: 1px solid var(--line); border-left: 3px solid #e8a13c; border-radius: 4px 14px 14px 4px; background: #fff; }
+.narr-card:active { background: #fdf8ef; }
+.narr-quote { font-size: 13.5px; line-height: 1.6; color: var(--ink); }
+.narr-from { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px;
+  font-size: 11.5px; color: var(--ink-2); }
+.narr-cta { flex: none; font-weight: 600; color: var(--green); }
+
+.art-card { padding: 11px 4px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.art-card:last-of-type { border-bottom: 0; }
+.art-card .n { font-weight: 600; font-size: 15px; }
+.art-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 5px; }
+.art-sum { margin-top: 5px; font-size: 12.5px; line-height: 1.6; color: var(--ink-2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 .city-hero h2 { font-size: 22px; }
 .city-slogan { font-size: 13px; font-weight: 400; color: var(--ink-2); }
 .city-facts { margin-top: 10px; font-size: 13px; color: var(--ink-2); display: grid; gap: 4px; }
 .city-facts b { color: var(--ink); }
-.itin-entry { border: 1.5px dashed var(--green); background: var(--green-l); }
-.itin-entry .btn { margin-top: 10px; }
+.itin-entry { display: flex; align-items: center; gap: 12px; border: 1.5px dashed var(--green); background: var(--green-l); }
+.itin-entry .btn { flex: none; width: auto; margin-top: 0; }
+.itin-emoji { font-size: 24px; }
+.itin-body { flex: 1; min-width: 0; }
+.itin-title { font-weight: 700; font-size: 15px; }
 
 /* 路线模板库（发现页主体） */
 .tpl-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }

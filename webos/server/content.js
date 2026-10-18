@@ -166,10 +166,13 @@ class ContentHub {
 
   templateCard(t) {
     const city = this._cityById.get(t.cityId);
+    const venue = t.venueId ? this._venueById.get(t.venueId) : null;
     return {
       id: t.id, name: t.name, cityId: t.cityId, cityName: city ? city.name : (t.cityId || ''),
-      scene: t.scene, venueId: t.venueId || null, durationSec: t.durationSec,
+      scene: t.scene, venueId: t.venueId || null, venueName: venue ? venue.name : null, durationSec: t.durationSec,
       themeTags: t.themeTags || [], summary: t.summary,
+      // 途经点名称让"这条路线具体去哪"一眼可见（详情页仍给每站 brief）
+      stopNames: (t.stops || []).map((s) => s.name).slice(0, 6),
       stopCount: (t.stops || []).length, heat: t.heat || 0, blurb: t.blurb || '',
     };
   }
