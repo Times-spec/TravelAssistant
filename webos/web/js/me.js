@@ -38,7 +38,7 @@ export function renderFinish(view, ctx, tripId) {
         h('p', { class: 'card-title' }, '过程记录'),
         h('div', { class: 'proc-sub' }, `${s.startedAt ? s.startedAt.slice(11, 16) : ''} 出发 → ${s.finishedAt ? s.finishedAt.slice(11, 16) : '—'} 结束 · 计划与实际分开记录`),
         h('div', { class: 'proc-stats' },
-          procStat('用时', s.actualDurationSec ? fmtMin(s.actualDurationSec) : '未知', s.plannedDurationSec ? `计划约 ${fmtMin(s.plannedDurationSec)}` : ''),
+          procStat('用时', s.actualDurationSec == null ? '未知' : s.actualDurationSec < 60 ? '<1 分钟' : fmtMin(s.actualDurationSec), s.plannedDurationSec ? `计划约 ${fmtMin(s.plannedDurationSec)}` : ''),
           procStat('到访', `${(s.confirmedVisits || []).length} 站`, s.skippedStops.length ? `跳过 ${s.skippedStops.length} 站` : '全部走到'),
           procStat('途中调整', s.replanCount ? `${s.replanCount} 次` : '无', s.replanCount ? `共 ${s.versionCount} 个路线版本` : ''),
           procStat('规划距离', fmtKm(s.distanceM), '无实际轨迹')),
