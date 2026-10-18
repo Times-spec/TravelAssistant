@@ -88,6 +88,9 @@ function intentOf(endpoint) {
     assert(route.endApproach && route.endApproach.endNodeId === 'am_end' && !route.endApproach.returnTrip);
     assert(route.legs[route.legs.length - 1].isReturnLeg);
     assert(route.legs.some((l) => Array.isArray(l.steps) && l.steps[0].instruction), '正向路段应带高德逐步导引');
+    assert(route.endApproach.distanceM < 600, '有终点附近候选时末段不应空走 ' + route.endApproach.distanceM + 'm');
+    assert(/前\/中\/后段/.test(pack.venue.coverageScope.scopeLabel), '走廊候选应分段统计');
+    assert(!pack.pois.some((p) => haversineM(graph.nodes.get(p.id), E) < 60), '离终点 <60m 的点不应作为候选');
     console.log('  固定终点：', stops.map((n) => `${n.name}(距终点${Math.round(dEnd(n))}m)`).join(' → '), `→ 终点 ${route.endApproach.distanceM}m`);
   }
   /* ---------- 4. 回起点不受影响 ---------- */
@@ -99,6 +102,17 @@ function intentOf(endpoint) {
     assert.equal(solved.status, 'ok');
     assert.equal(solved.schedule.endLeg.toNodeId, 'am_origin');
   }
-  console.log('✅ 终点回归通过：独立终点节点 / 末站靠近终点 / endApproach 与逐步导引 / 回起点不变');
+  /* ---------- 5. 顺路结束：在末站直接结束，不再走回起点 ---------- */
+  {
+    const intent = intentOf({ mode: 'flexible' });
+    const { graph, pack } = await buildAmapAreaPack(cfg, O, intent.budgetSec, null);
+    const solved = solveOnce(pack, intent, graph, policy);
+    assert.equal(solved.status, 'ok');
+    assert(!solved.schedule.endLeg, '顺路结束不应有返程段');
+    const route = buildRoutePlan(pack, intent, graph, solved, { version: 1, planId: 'p' });
+    assert(route.endLabel.startsWith('顺路结束于') && !route.endLabel.includes('起点'), route.endLabel);
+    assert(!route.endApproach);
+  }
+  console.log('✅ 终点回归通过：独立终点节点 / 末站靠近终点 / endApproach 与逐步导引 / 回起点不变 / 顺路结束在末站 / 末段不空走');
   process.exit(0);
 })().catch((e) => { console.error('❌', e.message); process.exit(1); });

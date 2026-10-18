@@ -8,7 +8,7 @@
  * - 开放时间/门票高德不提供 → 标记 unknown，方案标为条件性；
  * - 路段一律走高德步行路径规划（真实折线），没有真实路由的边标 unreachable，绝不用直线顶替。
  */
-const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf } = require('./amap');
+const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf, EXCLUDE_NAME_RE } = require('./amap');
 const { haversineM } = require('./geo');
 
 const VENUE_TYPECODES = ['110101', '110102', '110103', '110105', '110200', '110202', '141201', '141200'];
@@ -120,7 +120,7 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
     } catch (e) { /* 补搜失败不影响主检索 */ }
   }
 
-  const pois = [];
+  let pois = [];
   const seenProvider = new Set();
   for (const { p, supplement } of raw) {
     if (!p || !p.id || p.id === venueRef.providerPoiId) continue; // 场所本身不作为游览点
@@ -148,6 +148,18 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
       pois.push(poi);
       byProvider.set(pid, poi);
     } catch (e) { /* 取不到就保持缺失，由需求层如实提示，不编造 */ }
+  }
+
+  // 场所围栏（2026-10-18 线上实测故宫：700m 圈内混进灯市口小学、南池子大街、园外餐厅）：
+  // ① 学校/医院等名称黑名单一律剔除；② 名称或地址带场所核心名（"故宫"）视为园内；
+  // ③ 园内点足够多（≥6）时，园外点只保留离中心 ≤300m 的，街道/胡同名一律不作为游览点。
+  // 用户明确加入的必去点不参与围栏剔除（需求层已承诺"必去点即使不在半径内也进候选池"）。
+  const core = String(venueRef.name || '').replace(/[（(][^）)]*[）)]/g, '').replace(/(博物院|博物馆|风景名胜区|风景区|旅游区|景区|公园)$/, '');
+  const insideOf = (p) => core.length >= 2 && (p.name.includes(core) || (p.address || '').includes(core));
+  pois = pois.filter((p) => p.mustForce
+    || (!(EXCLUDE_NAME_RE.test(p.name) && !insideOf(p)) && !(/(大街|胡同|路|街|巷)$/.test(p.name) && !insideOf(p))));
+  if (core.length >= 2 && pois.filter(insideOf).length >= 6) {
+    pois = pois.filter((p) => p.mustForce || insideOf(p) || p.distanceM <= 300);
   }
 
   // 分桶保多样性（打卡点/文化/餐饮/其他各取最近若干），再取前 10 进精算

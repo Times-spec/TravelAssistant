@@ -59,7 +59,12 @@ class JobRunner {
     }
     const { buildAmapAreaPack } = require('./amap');
     if (intent.venueId === 'area_amap') {
-      const area = await buildAmapAreaPack(this.ctx.cfg, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec, endpointPointOf(intent));
+      const area = await buildAmapAreaPack(this.ctx.cfg, { ...intent.origin.point, label: intent.origin.label }, intent.budgetSec, endpointPointOf(intent), {
+        // 兴趣标签决定候选池排序（"想吃点东西"时餐饮点不该被展馆整体挤出）；
+        // 室内偏好决定室内/露天点的相对权重（与候选评分层的 indoorAdj 同一口径）
+        interests: (intent.interests || []).map((x) => x.tag),
+        indoorPreferred: !!(intent.soft && intent.soft.indoorPreferred),
+      });
       return area;
     }
     if (String(intent.venueId).startsWith('live:')) {
@@ -363,7 +368,7 @@ class JobRunner {
     store.update('plans', plan.id, { routeIds });
     this.emit(job, 'route.ready', {
       routeId: newPlan.routeId, status: newPlan.status, title: newPlan.title,
-      summary: routeSummary(newPlan), diffLines: diffRoutes(base, newPlan), editedFrom: base.routeId,
+      summary: routeSummary(newPlan), diffLines: diffRoutes(base, newPlan, { doneIds: doneIdsOf(store, plan.id) }), editedFrom: base.routeId,
     }, newPlan.version);
   }
 
@@ -415,10 +420,12 @@ class JobRunner {
     if (cause === 'fatigue_reported') {
       edited.soft.restPreferred = true;
       edited.pace = 'easy';
-      // 疲劳：主动放弃剩余可选点中价值较低的一半（锁定点保留，§12.1）
+      // 疲劳：主动放弃剩余可选点中价值较低的一半（锁定点保留，§12.1）。
+      // 按"去掉它能省多少路"丢点，而不是丢最后几站：A→B 路线里最后几站恰是靠近终点的顺路站，
+      // 丢掉它们会让末段空走 1km+（2026-10-18 线上实测"春熙路→天府广场"疲劳重排末段 1388m）
       const optional = remaining.filter((s) => !s.locked).map((s) => s.poiId);
       const dropN = Math.ceil(optional.length / 2);
-      if (dropN > 0) edited.hard.avoidPoiIds.push(...optional.slice(-dropN));
+      if (dropN > 0) edited.hard.avoidPoiIds.push(...pickFatigueDrops(graph, startNode.id, remaining, base.endNodeId, dropN));
       edited.hard.avoidPoiIds = [...new Set(edited.hard.avoidPoiIds)];
     }
     if (cause === 'rain_reported') {
@@ -449,7 +456,7 @@ class JobRunner {
     proposal.isProposal = true;
     proposal.proposalCause = cause;
     store.insert('route_versions', proposal);
-    const diff = diffRoutes(base, proposal);
+    const diff = diffRoutes(base, proposal, { doneIds: [...visitedIds, ...skippedIds] });
     this.emit(job, 'route.alternative_ready', {
       routeId: proposal.routeId, status: proposal.status, title: proposal.title,
       summary: routeSummary(proposal), diffLines: diff, isReplanProposal: true,
@@ -457,6 +464,43 @@ class JobRunner {
     }, proposal.version);
     store.update('jobs', job.id, { result: { proposalRouteId: proposal.routeId, diffLines: diff } });
   }
+}
+
+/** 已到访/已跳过的点（编辑重排时同样不应出现在差异文案里） */
+function doneIdsOf(store, planId) {
+  const trips = store.find('trips', (t) => t.planId === planId && (t.status === 'active' || t.status === 'paused'));
+  if (!trips.length) return [];
+  const tid = trips[trips.length - 1].id;
+  return store.find('trip_events', (e) => e.tripId === tid && (e.type === 'arrive_confirm' || e.type === 'stop_skipped')).map((e) => e.data.poiId);
+}
+
+/**
+ * 疲劳时选哪些站放弃：逐个移除"边际绕行"最大的可选站（prev→s→next 比 prev→next 多走的路），
+ * 每移除一个重新计算，锁定站不动；距离未知时视为 0（不优先丢）。
+ */
+function pickFatigueDrops(graph, startNodeId, remaining, endNodeId, dropN) {
+  const seq = remaining.map((s) => ({ poiId: s.poiId, node: s.entranceNodeId, locked: !!s.locked }));
+  const d = (a, b) => {
+    if (!a || !b || a === b) return 0;
+    const r = graph.route(a, b);
+    return r && Number.isFinite(r.distanceM) ? r.distanceM : null;
+  };
+  const drops = [];
+  while (drops.length < dropN) {
+    let best = -1, bestSave = -Infinity;
+    for (let i = 0; i < seq.length; i++) {
+      if (seq[i].locked) continue;
+      const prev = i === 0 ? startNodeId : seq[i - 1].node;
+      const next = i === seq.length - 1 ? endNodeId : seq[i + 1].node;
+      const a = d(prev, seq[i].node), b = next ? d(seq[i].node, next) : 0, c = next ? d(prev, next) : 0;
+      const save = a == null || b == null || c == null ? 0 : a + b - c;
+      if (save > bestSave) { bestSave = save; best = i; }
+    }
+    if (best < 0) break;
+    drops.push(seq[best].poiId);
+    seq.splice(best, 1);
+  }
+  return drops;
 }
 
 function routeSummary(plan) {
@@ -489,4 +533,4 @@ function createJob(store, { type, ownerId, planId = null, tripId = null, payload
   return job;
 }
 
-module.exports = { JobRunner, createJob, routeSummary };
+module.exports = { pickFatigueDrops, JobRunner, createJob, routeSummary };

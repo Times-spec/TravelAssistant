@@ -131,7 +131,7 @@ function mapType(typecode, name) {
  * 2026-10-01 春熙路实数据补强：080500 休闲场所在商圈=拼豆/DIY 工坊重灾区（名称词兜底）、
  * 亚朵酒店把大堂书吧标成"图书馆"（连锁品牌词）、商场内部设施节点（楼梯/扶梯）。 */
 const EXCLUDE_NAME_RE = new RegExp([
-  '学校', '学院', '大学', '培训', '补习', '考研', '驾校', '幼儿园', '托育', '托管',
+  '学校', '学院', '大学', '小学', '中学', '附小', '附中', '一中', '二中', '实验学', '少年宫', '培训', '补习', '考研', '驾校', '幼儿园', '托育', '托管',
   '医院', '诊所', '卫生服务', '药店', '药房', '体检',
   '银行', '储蓄', '信用社', '证券', '保险', '营业厅',
   '加油站', '充电站', '加气站', '停车场', '洗车', '汽修', '维修', '4S',
@@ -189,7 +189,23 @@ const SEARCH_TYPE_GROUPS = [
   // 注：080500 休闲场所不检索——实数据里该子类被手工 DIY/拼豆/自拍馆工坊占满（2026-10-01 春熙路验证）
 ];
 
+/** 周边检索缓存（10 分钟，约 50m 网格）：同一片区反复规划/途中加点不再重复打 5 次高德检索 */
+const aroundCache = new Map();
+const AROUND_TTL_MS = 10 * 60 * 1000;
+/** 商业"体验馆"类降权：城市候选里 XR/飞行影院/主题展馆挤占了真正的街区与人文点（2026-10-18 线上实测春熙路） */
+const COMMERCIAL_EXPERIENCE_RE = /(XR|VR|AR|飞览|飞行影院|体验馆|体验中心|探索馆|奥秘|恋爱|爱情|网红|打卡馆|沉浸式|数字展|光影展|萌宠|猫咖|主题展)/i;
+
 async function searchAround(cfg, point, radiusM) {
+  const key = `${Math.round(point.lng / 0.0005)},${Math.round(point.lat / 0.0005)},${radiusM}`;
+  const hit = aroundCache.get(key);
+  if (hit && Date.now() - hit.at < AROUND_TTL_MS) return hit.value.map((c) => ({ ...c, tags: [...c.tags] }));
+  const value = await searchAroundRaw(cfg, point, radiusM);
+  aroundCache.set(key, { at: Date.now(), value });
+  while (aroundCache.size > 40) aroundCache.delete(aroundCache.keys().next().value);
+  return value.map((c) => ({ ...c, tags: [...c.tags] }));
+}
+
+async function searchAroundRaw(cfg, point, radiusM) {
   const seen = new Map();
   for (const types of SEARCH_TYPE_GROUPS) {
     const json = await amapGet(cfg, '/v3/place/around', {
@@ -205,6 +221,7 @@ async function searchAround(cfg, point, radiusM) {
     .map((p) => {
     const [lng, lat] = p.location.split(',').map(Number);
     const m = mapType(p.typecode, p.name);
+    if (COMMERCIAL_EXPERIENCE_RE.test(p.name || '')) m.scenic = Math.max(0.3, m.scenic - 0.25);
     return {
       id: 'am_' + p.id, name: p.name, providerPoiId: p.id,
       address: typeof p.address === 'string' ? p.address : '',
@@ -287,6 +304,56 @@ function detourM(o, c, e) {
 /** 终点并入矩阵缓存键（约 50m 网格），换了终点必须重抓 OD */
 function endKeyOf(e) {
   return `end@${Math.round(e.lng / 0.0005)},${Math.round(e.lat / 0.0005)}`;
+}
+
+const END_DUP_M = 60; // 候选离终点不足 60m 视为"就是终点"
+
+/** 候选在 o→e 走廊上的投影位置 t∈[0,1]（平面近似，城市尺度足够） */
+function corridorT(o, e, c) {
+  const kx = 111320 * Math.cos((o.lat * Math.PI) / 180), ky = 110540;
+  const ex = (e.lng - o.lng) * kx, ey = (e.lat - o.lat) * ky;
+  const cx = (c.lng - o.lng) * kx, cy = (c.lat - o.lat) * ky;
+  const L2 = ex * ex + ey * ey || 1;
+  return Math.max(0, Math.min(1, (cx * ex + cy * ey) / L2));
+}
+const segOf = (t) => (t < 1 / 3 ? 0 : t < 2 / 3 ? 1 : 2);
+
+/** 普通（回起点/顺路结束）：类型分桶保证多样性，每桶最近 4 个，再按景观分取前 cap */
+function pickByBuckets(list, cap, nearKey) {
+  const buckets = new Map();
+  for (const c of [...list].sort((a, b) => nearKey(a) - nearKey(b))) {
+    const key = c.tags[0];
+    if (!buckets.has(key)) buckets.set(key, []);
+    if (buckets.get(key).length < 4) buckets.get(key).push(c);
+  }
+  return [...buckets.values()].flat()
+    .sort((a, b) => rankOf(b) - rankOf(a) || nearKey(a) - nearKey(b))
+    .slice(0, cap);
+}
+/** 进精算池的排序分：景观分 + 用户兴趣命中加成（"想吃点东西"时餐饮 scenic 0.5 不该被 0.75 的展馆全部挤出池子） */
+const rankOf = (c) => (c._rank != null ? c._rank : c.scenic);
+
+/**
+ * A→B 走廊选点：按投影位置分前/中/后三段，每段保底配额（35%/30%/35%），段内再分桶取景观分高且顺路的。
+ * 此前所有候选一起按"绕行量"排序再截断：起点周边 POI 密集、绕行同样≈0，终点段的点被整体挤掉，
+ * 春熙路→宽窄巷子 12 个候选全在春熙路，末站离终点 2.4km（2026-10-18 线上实测）。
+ */
+function pickCorridor(list, cap, segmented) {
+  if (!segmented) return pickByBuckets(list, cap, (c) => c.detourM);
+  const quota = [0.35, 0.3, 0.35].map((r) => Math.max(1, Math.round(r * cap)));
+  while (quota.reduce((a, b) => a + b, 0) > cap) quota[1]--;
+  const picked = [];
+  const left = [];
+  for (let k = 0; k < 3; k++) {
+    const seg = list.filter((c) => segOf(c.corridorT) === k);
+    const ranked = pickByBuckets(seg, seg.length, (c) => c.detourM);
+    picked.push(...ranked.slice(0, quota[k]));
+    left.push(...ranked.slice(quota[k]));
+  }
+  // 某段不够配额时，用其余段的剩余点补满（优先景观分高、绕行小的）
+  left.sort((a, b) => rankOf(b) - rankOf(a) || a.detourM - b.detourM);
+  for (const c of left) { if (picked.length >= cap) break; picked.push(c); }
+  return picked.slice(0, cap);
 }
 
 class AmapAreaGraph {
@@ -471,47 +538,59 @@ class AmapAreaGraph {
 }
 
 /** 构建真实闲逛"场所包"（结构同演示包，数据来源标注为高德实时查询） */
-async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint) {
+async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
   // 检索半径=步行可达圈：闲逛者不会把 1.5 小时花在"赶路去 4km 外"上。
   // 此前 (budgetSec/3600)*2500 封顶 4000m——两小时的闲逛也在 4km 半径找点，
   // 候选间实际步行 1-3km，每站光交通就吃掉 15-30 分钟，半天只装得下两三站（2026-10-01 修）。
   const radiusM = Math.min(2500, Math.max(1000, Math.round((budgetSec / 3600) * 700)));
   const end = endpoint && Number.isFinite(endpoint.lng) && haversineM(origin, endpoint) > END_NODE_MIN_M ? endpoint : null;
   let rawCands = await searchAround(cfg, origin, radiusM);
+  const prefTags = new Set(opts.interests || []);
+  const markRank = () => {
+    for (const c of rawCands) {
+      const hit = c.tags.some((t) => prefTags.has(t) || (t === '自然' && prefTags.has('公园湿地')));
+      const indoorish = c.tags.includes('美食') || c.tags.includes('人文');
+      c._rank = c.scenic + (hit ? 0.3 : 0) + (opts.indoorPreferred ? (indoorish ? 0.15 : -0.15) : 0);
+    }
+  };
+  markRank();
+  const capByBudget = budgetSec >= 10800 ? 12 : 8; // 3 小时以上放宽池子，半天不该只有五六个可选点
+  // 多一个终点节点就多一行 OD，候选上限相应少 1，保证矩阵仍能抓满
+  const cap = Math.max(1, Math.min(capByBudget, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - (end ? 1 : 0)));
+  let cands;
+  let corridor = null;
   if (end) {
     // A→B 型路线：候选不能只围着起点找，否则最后一站必然离终点很远、只能"空走"过去。
-    // 终点较远时再围绕终点检索一次，并按"顺路程度"（绕行椭圆）过滤：顺路经过它多走的距离不超过 detourMax。
+    // 终点较远时再围绕终点（以及走廊中点）检索，并按"顺路程度"（绕行椭圆）过滤。
     const odM = haversineM(origin, end);
+    const searchErrors = [];
+    const merge = (list) => {
+      const seen = new Set(rawCands.map((c) => c.id));
+      for (const c of list) if (!seen.has(c.id)) { seen.add(c.id); rawCands.push(c); }
+    };
     if (odM > radiusM * 0.5) {
-      try {
-        const near = await searchAround(cfg, end, radiusM);
-        const seen = new Set(rawCands.map((c) => c.id));
-        for (const c of near) if (!seen.has(c.id)) { seen.add(c.id); rawCands.push(c); }
-      } catch (e) { /* 终点周边检索失败不影响主流程 */ }
+      try { merge(await searchAround(cfg, end, radiusM)); }
+      catch (e) { searchErrors.push('end:' + (e.code || e.message)); console.warn('[amap-area] 终点周边检索失败', e.code || e.message); }
     }
+    if (odM > radiusM * 1.2) {
+      const mid = { lng: (origin.lng + end.lng) / 2, lat: (origin.lat + end.lat) / 2 };
+      try { merge(await searchAround(cfg, mid, Math.min(radiusM, Math.max(800, Math.round(odM / 2))))); }
+      catch (e) { searchErrors.push('mid:' + (e.code || e.message)); console.warn('[amap-area] 走廊中点检索失败', e.code || e.message); }
+    }
+    markRank();
     const detourMax = Math.max(radiusM, odM * 0.6);
     for (const c of rawCands) {
       c.distanceM = Math.round(haversineM(origin, c));
       c.detourM = Math.round(detourM(origin, c, end));
+      c.corridorT = corridorT(origin, end, c);
     }
-    rawCands = rawCands.filter((c) => c.detourM <= detourMax);
+    // 离终点 < END_DUP_M 的点就是终点本身（"天府广场"作为末站又作为终点），不作为候选
+    rawCands = rawCands.filter((c) => c.detourM <= detourMax && haversineM(c, end) >= END_DUP_M);
+    cands = pickCorridor(rawCands, cap, odM > radiusM * 0.5);
+    corridor = { odM: Math.round(odM), searchErrors, segments: [0, 1, 2].map((k) => cands.filter((c) => segOf(c.corridorT) === k).length) };
+  } else {
+    cands = pickByBuckets(rawCands, cap, (c) => c.distanceM);
   }
-  // 粗筛：按类型分桶保证多样性，每桶取最近 4 个，再按预算取前 8~12 进精算（§7.4 评分压缩）。
-  // 候选数同时受路由矩阵配额约束：配额必须够抓满"起点 + 候选"的两两组合，
-  // 否则末尾的候选拿不到任何 OD 边、永远排不进多站路线（2026-09-30 修）。
-  const buckets = new Map();
-  const nearKey = (c) => (end ? c.detourM : c.distanceM); // 有终点时"近"指顺路，而不是离起点近
-  for (const c of rawCands.sort((a, b) => nearKey(a) - nearKey(b))) {
-    const key = c.tags[0];
-    if (!buckets.has(key)) buckets.set(key, []);
-    if (buckets.get(key).length < 4) buckets.get(key).push(c);
-  }
-  const capByBudget = budgetSec >= 10800 ? 12 : 8; // 3 小时以上放宽池子，半天不该只有五六个可选点
-  // 多一个终点节点就多一行 OD，候选上限相应少 1，保证矩阵仍能抓满
-  const cap = Math.max(1, Math.min(capByBudget, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - (end ? 1 : 0)));
-  const cands = [...buckets.values()].flat()
-    .sort((a, b) => b.scenic - a.scenic || nearKey(a) - nearKey(b))
-    .slice(0, cap);
   const graph = new AmapAreaGraph(cfg, origin, budgetSec, end);
   await graph.init(cands, { cacheKey: matrixCacheKeyOf('area', origin, [...(end ? [endKeyOf(end)] : []), ...cands.map((c) => c.id)]) });
   const usable = cands.filter((c) => graph.nodes.has(c.id));
@@ -519,7 +598,13 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint) {
     venue: {
       id: 'area_amap', name: '周边片区（高德实时数据）', nameNote: '候选点与路段来自高德 Web 服务实时查询',
       city: '', timezone: 'Asia/Shanghai', packVersion: 'amap-live-' + new Date().toISOString().slice(0, 10),
-      coverageScope: { kind: 'poi', scopeLabel: `周边 ${radiusM}m 内检索到的 ${usable.length} 个候选点` },
+      coverageScope: {
+        kind: 'poi',
+        scopeLabel: corridor
+          ? `起点→终点沿途 ${usable.length} 个候选点（前/中/后段 ${corridor.segments.join('/')}）`
+          : `周边 ${radiusM}m 内检索到的 ${usable.length} 个候选点`,
+        corridor,
+      },
       center: { lng: origin.lng, lat: origin.lat, crs: 'GCJ02' },
       entrances: graph.endNodeId ? ['am_origin', 'am_end'] : ['am_origin'], openWindows: [['00:00', '24:00']],
     },
@@ -549,4 +634,4 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint) {
   return { pack, graph };
 }
 
-module.exports = { detourM, endKeyOf, END_NODE_MIN_M, searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };
+module.exports = { corridorT, pickCorridor, END_DUP_M, COMMERCIAL_EXPERIENCE_RE, detourM, endKeyOf, END_NODE_MIN_M, searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };
