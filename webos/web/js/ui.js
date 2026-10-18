@@ -108,6 +108,17 @@ export function zoned(iso) {
     md: `${p.month}-${p.day}`,
   };
 }
+/** 浏览器定位只在安全上下文可用（HTTPS 或 localhost）：HTTP 公网地址下应明确告知并给手选入口 */
+export function locateBlockedReason() {
+  try {
+    if (window.isSecureContext) return null;
+    const h = location.hostname;
+    if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]') return null;
+    if (!navigator.geolocation) return '当前浏览器不支持定位';
+    return '当前地址不是 HTTPS，手机/浏览器会拒绝定位；可搜索或在地图上选点，或改用 HTTPS 入口';
+  } catch (e) { return null; }
+}
+
 export const fmtClock = (iso) => { const z = zoned(iso); return z ? z.hhmm : '--:--'; };
 export const fmtDate = (iso) => { const z = zoned(iso); return z ? z.md : ''; };
 export const fmtDateTime = (iso) => { const z = zoned(iso); return z ? `${z.md} ${z.hhmm}` : ''; };

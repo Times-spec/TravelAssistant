@@ -3,7 +3,7 @@
 //       → ③ 怎么安排（只排路线：时长/玩法/节奏，不再改地点）→ 生成路线。
 // AI 不再是入口，而是每一步都能调用的助手（"一句话帮我填"）与游览中的导游（见 trip.js）。
 import { post, get } from './api.js';
-import { h, toast, openSheet, closeSheet, SvgMap, makeProjector, loadAmap } from './ui.js';
+import { h, toast, openSheet, closeSheet, locateBlockedReason, SvgMap, makeProjector, loadAmap } from './ui.js';
 import { saveDraft, state, getVenuePack } from './app.js';
 
 const INTERESTS = ['自然', '公园湿地', '街区', '人文', '建筑', '美食'];
@@ -122,6 +122,8 @@ export function renderHome(view) {
     box.innerHTML = '<div class="empty">正在获取位置…</div>';
     try {
       const pos = await new Promise((res, rej) => {
+        const blocked = locateBlockedReason();
+        if (blocked) return rej(new Error(blocked));
         if (!navigator.geolocation) return rej(new Error('当前环境不支持定位'));
         navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 });
       });
@@ -472,6 +474,8 @@ export function renderHome(view) {
 
   /* ================= 定位 / 搜索 / 地图选点 ================= */
   async function locateMe() {
+    const blocked = locateBlockedReason();
+    if (blocked) { toast(blocked, 4000); return; }
     if (!navigator.geolocation) { toast('当前环境不支持定位，请搜索或地图选点'); return; }
     toast('正在定位…');
     navigator.geolocation.getCurrentPosition(async (pos) => {
