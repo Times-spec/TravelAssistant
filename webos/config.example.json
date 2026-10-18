@@ -10,6 +10,14 @@
     "apiKey": "",
     "model": ""
   },
+  "agent": {
+    "enabled": true,
+    "llmNominate": true,
+    "llmAppraise": true,
+    "llmCritic": true,
+    "llmExplain": true,
+    "maxRounds": 3
+  },
   "asr": {
     "baseUrl": "",
     "apiKey": ""

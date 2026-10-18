@@ -45,13 +45,15 @@ class JobRunner {
   }
 
   /** 场所包与图：真实场所/真实片区走高德实时构建；来源为自有数据的场所包直接取用 */
-  async resolvePackGraph(intent) {
-    const out = await this._resolvePackGraph(intent);
+  async resolvePackGraph(intent, hooks = {}) {
+    const out = await this._resolvePackGraph(intent, hooks);
     this.alignTraversalConstraint(intent, out.pack);
+    // 智能体知识（提名/评审）按意图落库：规划、编辑、途中重排都在同一套候选口径上工作
+    if (intent.agentKnowledge) require('./agent_kernel').applyAgentKnowledge(out.pack, intent.agentKnowledge);
     return out;
   }
 
-  async _resolvePackGraph(intent) {
+  async _resolvePackGraph(intent, hooks = {}) {
     if (this.ctx.cfg.providers.map !== 'amap') {
       const local = this.packOf(intent.venueId);
       if (local) return { pack: local, graph: this.graphOf(intent.venueId) };
@@ -66,6 +68,8 @@ class JobRunner {
         indoorPreferred: !!(intent.soft && intent.soft.indoorPreferred),
         // 必去点是硬约束：即使不在检索半径/走廊内也要进候选池（否则校验层直接判 infeasible）
         mustVisitIds: intent.hard.mustVisitIds || [],
+        nominated: (intent.agentKnowledge && intent.agentKnowledge.nominated) || [], // 智能体提名（已经高德核实）
+        onCandidates: hooks.onCandidates,
       });
       return area;
     }
@@ -80,6 +84,8 @@ class JobRunner {
         mustVisitIds: intent.hard.mustVisitIds || [],
         // 固定终点单独建节点，末站→终点这段参与排序
         endpoint: endpointPointOf(intent),
+        nominated: (intent.agentKnowledge && intent.agentKnowledge.nominated) || [],
+        onCandidates: hooks.onCandidates,
       });
       return { pack: live.pack, graph: live.graph };
     }
@@ -159,7 +165,32 @@ class JobRunner {
     const { store, cfg } = this.ctx;
     const plan = store.byId('plans', job.planId);
     const intent = store.byId('intents', plan.intentId);
-    const { pack, graph } = await this.resolvePackGraph(intent);
+    const kernel = require('./agent_kernel');
+    const agentOn = kernel.enabledFor(cfg, intent) && !(intent.unresolved || []).length;
+    const kernelT0 = Date.now();
+    const preTrace = [];
+    // ①② 智能体提名 + 高德核实：必须在建候选池之前（提名点要进池）
+    if (agentOn && kernel.llmReady(cfg)) {
+      this.emit(job, 'agent.progress', { stage: 'nominate', label: '大模型提名值得去的地点，并用高德逐个核实' });
+      // 等大模型的同时先把片区周边检索跑掉（进缓存），不让两段耗时串行叠加
+      const prewarm = intent.venueId === 'area_amap' && cfg.providers.map === 'amap'
+        ? require('./amap').prewarmAreaSearch(cfg, intent.origin.point, intent.budgetSec, endpointPointOf(intent)).catch(() => {})
+        : Promise.resolve();
+      try { preTrace.push(await kernel.ensureNominations(cfg, intent, { store })); }
+      catch (e) { console.warn('[agent] 提名失败，回退规则候选', e.message); }
+      await prewarm;
+    }
+    // ③ 评审提前到"候选已定、路网矩阵抓取中"开始：大模型与高德路线两段耗时并行
+    let appraisalPending = null;
+    const appraiseT0 = Date.now();
+    const hooks = agentOn && kernel.llmReady(cfg) ? {
+      onCandidates: (list) => {
+        if (appraisalPending) return;
+        appraisalPending = kernel.startAppraisal(cfg, intent, list, { store });
+        if (appraisalPending) this.emit(job, 'agent.progress', { stage: 'appraise', label: '大模型评审候选点（与高德路网抓取并行）' });
+      },
+    } : {};
+    const { pack, graph } = await this.resolvePackGraph(intent, hooks);
     const { confirmChips } = require('./domain');
 
     store.update('plans', plan.id, {
@@ -178,13 +209,23 @@ class JobRunner {
       return; // 等待用户确认后重新提交（新 revision → 新 plan 任务）
     }
 
+    // ③ 智能体评审：给候选打"值得去"分、建议停留、纠正分类、识别噪声点
+    if (agentOn && kernel.llmReady(cfg)) {
+      if (!appraisalPending) this.emit(job, 'agent.progress', { stage: 'appraise', label: '大模型评审候选点：值得度、停留时长、噪声' });
+      try { preTrace.push(await kernel.ensureAppraisal(cfg, intent, pack, { store, pending: appraisalPending, t0: appraisalPending ? appraiseT0 : null })); }
+      catch (e) { console.warn('[agent] 评审失败，沿用类型先验', e.message); }
+    }
+
     // 候选点
     const { scoreCandidates } = require('./planner');
     const originNear = graph.nearestNode(intent.origin.point);
     const startNodeId = intent.origin.entranceId && graph.nodeById.has(intent.origin.entranceId)
       ? intent.origin.entranceId : originNear.node.id;
     const cands = scoreCandidates(pack, intent, graph, startNodeId);
-    const candidatePreview = { count: cands.length, names: cands.slice(0, 12).map((c) => c.poi.name) };
+    const candidatePreview = {
+      count: cands.length, names: cands.slice(0, 12).map((c) => c.poi.name),
+      nominated: cands.filter((c) => c.poi.nominated).map((c) => c.poi.name).slice(0, 12),
+    };
     store.update('plans', plan.id, { candidatePreview });
     this.emit(job, 'candidates.ready', {
       count: cands.length,
@@ -203,11 +244,27 @@ class JobRunner {
       results = solveAlternatives(pack, intent, graph);
       store.update('plans', plan.id, { planningMode: 'algorithm' });
     } else {
-      const { RoutePlanningAgent } = require('./route_planning_agent');
-      agentResult = new RoutePlanningAgent().plan({ pack, intent, graph, planId: plan.id });
+      if (agentOn) {
+        // ④~⑦ 求解 + 独立验证 + 反思-修复循环 + 解释（真实场所/片区）
+        agentResult = await kernel.runAgentKernel({
+          cfg, pack, intent, graph, planId: plan.id, preTrace, startedAt: kernelT0,
+          onProgress: (p) => this.emit(job, 'agent.progress', p.stage === 'critic'
+            ? { stage: 'critic', round: p.round, label: `反思第 ${p.round} 轮：${(p.issues || []).slice(0, 2).join('；')}` }
+            : { stage: p.stage, label: '基于路线数据生成推荐理由' }),
+        });
+      } else {
+        const { RoutePlanningAgent } = require('./route_planning_agent');
+        agentResult = new RoutePlanningAgent().plan({ pack, intent, graph, planId: plan.id });
+      }
       results = agentResult.solutions;
       store.update('plans', plan.id, {
         planningMode: 'agent',
+        agentKernel: agentOn ? {
+          llm: kernel.llmReady(cfg),
+          quality: agentResult.quality || null,
+          critic: agentResult.critic || null,
+          nominated: ((intent.agentKnowledge && intent.agentKnowledge.nominated) || []).map((n) => ({ id: n.id, name: n.name, reason: n.reason || null })),
+        } : null,
         constraintLedger: agentResult.constraintLedger,
         agentTrace: agentResult.trace,
         agentProposals: agentResult.proposals.map((proposal) => ({

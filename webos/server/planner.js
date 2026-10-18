@@ -135,7 +135,9 @@ function scoreCandidates(pack, intent, graph, originNodeId, endNodeId) {
     // relax 取向："宁缺毋滥"只惩罚真正低质的兜底点（真实街点 scenic 0.4-0.6 不再被一刀切扣分
     // ——此前的 -0.25 会把整条街区压到收益门槛之下，半天只排得进两三站，2026-10-01 修）
     const relaxAdj = intent.objective === 'relax' ? (scenic >= 0.65 ? 0.15 : scenic >= 0.4 ? 0 : -0.2) : 0; // 不默认"点越多越好"（§2.2）
-    const score = interestScore + scenic * 0.8 + coverageBonus + quietBonus + indoorAdj + relaxAdj - costPenalty - distPenalty * 0.5;
+    // 智能体内核的反思-修复操作（"把 X 纳入试试"）只作用于本次求解的克隆意图，不写回用户条件、也不算用户锁定
+    const agentBoost = (intent.agentBoost && Number(intent.agentBoost[poi.id])) || 0;
+    const score = interestScore + scenic * 0.8 + coverageBonus + quietBonus + indoorAdj + relaxAdj + agentBoost - costPenalty - distPenalty * 0.5;
     out.push({ poi, score, distM, must: intent.hard.mustVisitIds.includes(poi.id) });
   }
   // 必去点即使分低也保留在最前
@@ -891,10 +893,12 @@ function chooseRouteTitle(pack, stops) {
 
 function buildWhy(poi, intent) {
   const reasons = [];
+  if (intent.hard.mustVisitIds.includes(poi.id)) reasons.push('你指定的必去点');
+  // 智能体评审/提名给出的具体理由（"明清皇家园林，古柏与堆秀山"）优先于"景观价值高"这类模板话
+  if (poi.agentReason) reasons.push(poi.agentReason);
   const hits = intent.interests.map((i) => i.tag).filter((t) => interestMatched(poi, t));
   if (hits.length) reasons.push(`符合你的${hits.join('、')}偏好`);
-  if (poi.scenic >= 0.8) reasons.push('园内景观价值最高的点位之一');
-  if (intent.hard.mustVisitIds.includes(poi.id)) reasons.push('你指定的必去点');
+  if (!poi.agentReason && poi.scenic >= 0.8) reasons.push(poi.nominated ? '值得专程一看的代表性地点' : '园内景观价值最高的点位之一');
   if (!reasons.length) reasons.push('顺路且停留时间可控');
   return reasons.join('；');
 }
@@ -1087,4 +1091,4 @@ function diffRoutes(oldPlan, newPlan, opts = {}) {
   return lines;
 }
 
-module.exports = { VenueGraph, solveAlternatives, solveOnce, scoreCandidates, scheduleRoute, buildRoutePlan, diffRoutes, validatePlan, closedNowConflict, rankRouteAlternatives, chooseRouteTitle, isCulturalVenue, SOLVER_VERSION, POLICY_VERSION };
+module.exports = { VenueGraph, solveAlternatives, solveOnce, scoreCandidates, scheduleRoute, buildRoutePlan, diffRoutes, validatePlan, closedNowConflict, rankRouteAlternatives, chooseRouteTitle, isCulturalVenue, budgetUtilization, SOLVER_VERSION, POLICY_VERSION };

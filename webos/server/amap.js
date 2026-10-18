@@ -537,20 +537,71 @@ class AmapAreaGraph {
   }
 }
 
+/** 片区检索半径=步行可达圈（智能体提名的地理过滤与此同一口径） */
+function areaRadiusM(budgetSec) {
+  return Math.min(2500, Math.max(1000, Math.round((budgetSec / 3600) * 700)));
+}
+
+/** 智能体提名点并入候选：同一高德 id 已在池里就只打标记，否则作为新候选加入（坐标来自高德地理编码，不是模型） */
+function mergeNominated(rawCands, nominated) {
+  const byId = new Map(rawCands.map((c) => [c.id, c]));
+  for (const n of nominated || []) {
+    if (!n || !n.id || !Number.isFinite(n.lng) || !Number.isFinite(n.lat)) continue;
+    const hit = byId.get(n.id);
+    if (hit) { hit.nominated = true; hit.agentReason = hit.agentReason || n.reason || null; continue; }
+    const m = mapType(n.typecode, n.name);
+    const c = {
+      id: n.id, name: n.name, providerPoiId: n.providerPoiId || String(n.id).replace(/^am_/, ''),
+      address: n.address || '', lng: n.lng, lat: n.lat, type: n.type || '', typecode: n.typecode || '',
+      ...m, nominated: true, agentReason: n.reason || null,
+    };
+    rawCands.push(c);
+    byId.set(c.id, c);
+  }
+}
+
+/** 先保留智能体提名点（至多约 60% 名额），剩余名额再按原有分桶/走廊规则补齐，保证多样性 */
+function reserveNominated(list, cap, pickRest) {
+  const nom = list.filter((c) => c.nominated).sort((a, b) => rankOf(b) - rankOf(a));
+  const keep = nom.slice(0, Math.max(0, Math.min(nom.length, Math.ceil(cap * 0.6))));
+  const keepIds = new Set(keep.map((c) => c.id));
+  const rest = pickRest(list.filter((c) => !keepIds.has(c.id)), cap - keep.length);
+  return [...keep, ...rest].slice(0, cap);
+}
+
+/** 预热片区周边检索缓存：智能体等大模型提名时，高德检索并行先跑（结果进 10 分钟缓存，建包时直接命中） */
+async function prewarmAreaSearch(cfg, origin, budgetSec, endpoint) {
+  const radiusM = areaRadiusM(budgetSec);
+  const end = endpoint && Number.isFinite(endpoint.lng) && haversineM(origin, endpoint) > END_NODE_MIN_M ? endpoint : null;
+  const jobs = [searchAround(cfg, origin, radiusM)];
+  if (end) {
+    const odM = haversineM(origin, end);
+    if (odM > radiusM * 0.5) jobs.push(searchAround(cfg, end, radiusM));
+    if (odM > radiusM * 1.2) {
+      const mid = { lng: (origin.lng + end.lng) / 2, lat: (origin.lat + end.lat) / 2 };
+      jobs.push(searchAround(cfg, mid, Math.min(radiusM, Math.max(800, Math.round(odM / 2)))));
+    }
+  }
+  await Promise.allSettled(jobs);
+}
+
 /** 构建真实闲逛"场所包"（结构同演示包，数据来源标注为高德实时查询） */
 async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
   // 检索半径=步行可达圈：闲逛者不会把 1.5 小时花在"赶路去 4km 外"上。
   // 此前 (budgetSec/3600)*2500 封顶 4000m——两小时的闲逛也在 4km 半径找点，
   // 候选间实际步行 1-3km，每站光交通就吃掉 15-30 分钟，半天只装得下两三站（2026-10-01 修）。
-  const radiusM = Math.min(2500, Math.max(1000, Math.round((budgetSec / 3600) * 700)));
+  const radiusM = areaRadiusM(budgetSec);
   const end = endpoint && Number.isFinite(endpoint.lng) && haversineM(origin, endpoint) > END_NODE_MIN_M ? endpoint : null;
   let rawCands = await searchAround(cfg, origin, radiusM);
+  const nominated = Array.isArray(opts.nominated) ? opts.nominated : [];
+  mergeNominated(rawCands, nominated);
   const prefTags = new Set(opts.interests || []);
   const markRank = () => {
     for (const c of rawCands) {
       const hit = c.tags.some((t) => prefTags.has(t) || (t === '自然' && prefTags.has('公园湿地')));
       const indoorish = c.tags.includes('美食') || c.tags.includes('人文');
-      c._rank = c.scenic + (hit ? 0.3 : 0) + (opts.indoorPreferred ? (indoorish ? 0.15 : -0.15) : 0);
+      // 智能体提名（大模型知识 + 高德地理编码核实）是"值得去"的直接证据，按类型猜的景观分只是先验
+      c._rank = c.scenic + (hit ? 0.3 : 0) + (opts.indoorPreferred ? (indoorish ? 0.15 : -0.15) : 0) + (c.nominated ? 0.5 : 0);
     }
   };
   markRank();
@@ -593,6 +644,7 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
       try { merge(await searchAround(cfg, mid, Math.min(radiusM, Math.max(800, Math.round(odM / 2))))); }
       catch (e) { searchErrors.push('mid:' + (e.code || e.message)); console.warn('[amap-area] 走廊中点检索失败', e.code || e.message); }
     }
+    mergeNominated(rawCands, nominated); // 终点/中点检索可能带回同一 id：补打提名标记
     markRank();
     markMust();
     const detourMax = Math.max(radiusM, odM * 0.6);
@@ -604,10 +656,13 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
     // 离终点 < END_DUP_M 的点就是终点本身（"天府广场"作为末站又作为终点），不作为候选；
     // 但用户明确必去的点不参与这两条过滤（硬约束优先于选点偏好）
     rawCands = rawCands.filter((c) => c.mustForce || (c.detourM <= detourMax && haversineM(c, end) >= END_DUP_M));
-    cands = pickCorridor(rawCands.filter((c) => !c.mustForce), pickCap, odM > radiusM * 0.5);
+    cands = reserveNominated(rawCands.filter((c) => !c.mustForce), pickCap, (list, n) => pickCorridor(list, n, odM > radiusM * 0.5));
   } else {
     markMust();
-    cands = pickByBuckets(rawCands.filter((c) => !c.mustForce), pickCap, (c) => c.distanceM);
+    for (const c of rawCands) if (!Number.isFinite(c.distanceM)) c.distanceM = Math.round(haversineM(origin, c));
+    // 提名点离起点超出步行圈就不要（地理过滤在内核里已做，这里再兜一次底）
+    const normal = rawCands.filter((c) => !c.mustForce && (!c.nominated || c.distanceM <= radiusM * 1.25));
+    cands = reserveNominated(normal, pickCap, (list, n) => pickByBuckets(list, n, (c) => c.distanceM));
   }
   // 必去点不在检索结果里时按 id 直接取详情补进候选池（取不到就保持缺失，由校验层如实判 infeasible）
   for (const pid of mustPids) {
@@ -633,6 +688,10 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
   cands = [...mustCands, ...cands];
   if (end) corridor = { odM: Math.round(haversineM(origin, end)), searchErrors: corridorSearchErrors, segments: [0, 1, 2].map((k) => cands.filter((c) => segOf(c.corridorT) === k).length) };
   const graph = new AmapAreaGraph(cfg, origin, budgetSec, end);
+  // 候选已定、路网矩阵还没抓：把候选交给调用方（智能体评审与矩阵抓取并行）
+  if (typeof opts.onCandidates === 'function') {
+    try { opts.onCandidates(cands.map((c) => ({ id: c.id, name: c.name, typecode: c.typecode || '', tags: c.tags || [], nominated: !!c.nominated, address: c.address || '' }))); } catch (e) { /* 回调失败不影响建包 */ }
+  }
   await graph.init(cands, { cacheKey: matrixCacheKeyOf('area', origin, [...(end ? [endKeyOf(end)] : []), ...cands.map((c) => c.id)]) });
   const usable = cands.filter((c) => graph.nodes.has(c.id));
   const pack = {
@@ -658,7 +717,8 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
       openWindows: null, // 开放时间未核验 → 校验层标 unknown，绝不假装已知（§7.1）
       ticketCny: null, ticketKnown: false, costNote: '门票/消费未核验',
       reservation: 'unknown', hoursEvidenceIds: ['ev_amap_live'],
-      providerPoiId: c.providerPoiId, address: c.address,
+      providerPoiId: c.providerPoiId, address: c.address, typecode: c.typecode || '',
+      nominated: !!c.nominated, agentReason: c.agentReason || null,
       guide: null, // 真实内容需资料检索管线（未配置 LLM 时不虚构，§11.2）
     })),
     evidence: [{
@@ -675,4 +735,4 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
   return { pack, graph };
 }
 
-module.exports = { corridorT, pickCorridor, END_DUP_M, COMMERCIAL_EXPERIENCE_RE, detourM, endKeyOf, END_NODE_MIN_M, searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };
+module.exports = { _rateGate: rateGate, prewarmAreaSearch, areaRadiusM, mergeNominated, reserveNominated, corridorT, pickCorridor, END_DUP_M, COMMERCIAL_EXPERIENCE_RE, detourM, endKeyOf, END_NODE_MIN_M, searchAround, walkingRoute, textSearch, regeo, convertCoord, buildAmapAreaPack, AmapAreaGraph, amapGet, mapType, maxCandidatesForQuota, matrixCacheKeyOf, EXCLUDE_NAME_RE, SEARCH_TYPE_GROUPS };

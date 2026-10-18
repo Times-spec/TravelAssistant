@@ -13,7 +13,8 @@ export function renderPlan(view, ctx, planId) {
   let editMode = false;
   const cleanupFns = [];
 
-  const stageState = { intent: 'active', candidates: 'todo', route: 'todo', alt: 'todo', guide: 'todo', done: 'todo' };
+  // agentStage/agentLabel：智能体内核的实时进度事件（nominate / appraise / critic / explain）
+  const stageState = { intent: 'active', candidates: 'todo', route: 'todo', alt: 'todo', guide: 'todo', done: 'todo', agentStage: null, agentLabel: null };
   // 只重置阶段键：stageState 上还挂着 confirmText / candidateInfo 等展示字段，不能被一并写成 'done'
   const STAGE_KEYS = ['intent', 'candidates', 'route', 'alt', 'guide', 'done'];
 
@@ -55,8 +56,13 @@ export function renderPlan(view, ctx, planId) {
 
   function agentTrace(stage) {
     const list = (planData && planData.plan && planData.plan.agentTrace) || [];
-    return list.find((t) => t.stage === stage) || null;
+    return list.find((t) => t && t.stage === stage) || null;
   }
+  function agentTraces(stage) {
+    const list = (planData && planData.plan && planData.plan.agentTrace) || [];
+    return list.filter((t) => t && t.stage === stage);
+  }
+  const fmtQ = (q) => (q == null ? '—' : Math.round(q * 100));
 
   function ledgerText(r) {
     if (r.kind === 'route.edge_repeat') return '不重复路段';
@@ -88,12 +94,52 @@ export function renderPlan(view, ctx, planId) {
   function agentDetail(key, d) {
     const { plan, versions, ledger, solver, topology, verifier, isAgent } = d;
     const box = (...children) => h('div', { class: 'agent-detailbox' }, ...children.filter(Boolean));
+    if (key === 'nominate') {
+      const t = d.nominated;
+      if (!t) return box(h('div', { class: 'agent-mini' }, stageState.agentLabel || '大模型正在提名值得去的地点…'));
+      return box(
+        h('div', { class: 'agent-mini' }, `大模型凭知识提名 ${t.asked || 0} 个地点，逐个用高德检索核实名称与位置，通过 ${t.count} 个进入候选池；模型不能凭空造点。`),
+        (t.names || []).length ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...t.names.map((n) => h('span', { class: 'agent-chip' }, '✓ ' + n))) : null,
+        (t.misses || []).length ? h('div', { class: 'agent-mini', style: 'margin-top:6px' }, '未核实（已丢弃）：' + t.misses.join('、')) : null,
+        t.error ? h('div', { class: 'agent-mini', style: 'margin-top:4px' }, '提名失败，已回退为高德类型检索') : null);
+    }
+    if (key === 'appraise') {
+      const t = d.appraised;
+      if (!t) return box(h('div', { class: 'agent-mini' }, stageState.agentLabel || '大模型正在评审候选点…'));
+      return box(
+        h('div', { class: 'agent-mini' }, `逐个评估候选「值得专门停留」的程度、建议停留时长与分类；共评审 ${t.count} 个${(t.noise || []).length ? `，识别出 ${t.noise.length} 个非游览点并降权` : ''}。`),
+        (t.top || []).length ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...t.top.map((x) => h('span', { class: 'agent-chip' }, `${x.name} ${Math.round(x.value * 100)}`))) : null,
+        (t.noise || []).length ? h('div', { class: 'agent-mini', style: 'margin-top:6px' }, '降权：' + t.noise.join('、')) : null,
+        t.error ? h('div', { class: 'agent-mini', style: 'margin-top:4px' }, '评审失败，沿用类型先验分') : null);
+    }
+    if (key === 'critic') {
+      const rounds = d.criticRounds || [];
+      const qual = d.quality;
+      const explained = d.explained;
+      if (!rounds.length) return box(h('div', { class: 'agent-mini' }, stageState.agentLabel || '路线出来后，智能体会按质量指标自查并尝试修复…'));
+      const m = qual && qual.metrics;
+      return box(
+        h('div', { class: 'agent-mini', style: 'margin-bottom:6px' }, qual
+          ? `质量分 ${fmtQ(qual.before)} → ${fmtQ(qual.after)}（值得度、时长利用、兴趣命中、非商业、末段空走、回头路综合）。每个修改都重新求解并通过独立验证，只接受真正变好的。`
+          : '按质量指标自查并逐个试算修复操作。'),
+        ...rounds.map((r) => h('div', { class: 'agent-round' },
+          h('div', { class: 'agent-cand-title' }, `第 ${r.round} 轮 · ${fmtQ(r.before)} → ${fmtQ(r.after)}${r.llmUsed ? ' · 含大模型提议' : ''}`),
+          (r.issues || []).length
+            ? h('div', { class: 'agent-mini' }, '发现：' + r.issues.map((x) => x.label).join('；'))
+            : h('div', { class: 'agent-mini' }, '未发现需要修复的问题'),
+          ...(r.tried || []).slice(0, 5).map((t) => h('div', { class: 'agent-mini' },
+            `${r.accepted && r.accepted.label === t.label ? '✓ 采纳' : '· 试算'} ${t.label}${t.source === 'llm' ? '（大模型）' : ''}：${t.ok ? (t.same ? '路线不变' : '质量 ' + fmtQ(t.q)) : '不可行'}`)))),
+        m ? h('div', { class: 'agent-mini', style: 'margin-top:6px' }, `终版：${m.stops} 站 · 时长利用 ${Math.round(m.util * 100)}%${m.isAB ? ` · 末段 ${m.endWalkM}m` : ''} · 商业类 ${Math.round(m.commercialShare * 100)}%${m.nomPool ? ` · 提名点 ${m.nomVisited}/${m.nomPool}` : ''}`) : null,
+        explained ? h('div', { class: 'agent-mini', style: 'margin-top:4px' }, explained.source === 'llm' ? '推荐理由：大模型基于路线数据撰写，已通过数字/地名事实校验' : '推荐理由：按路线数据生成（大模型未启用或未通过事实校验）') : null);
+    }
     if (key === 'intent') {
       const chips = (plan && plan.confirmChips) || [];
       const labels = chips.length ? chips.map((c) => c.label)
         : (stageState.confirmText ? stageState.confirmText.split(' · ') : []);
       return box(
-        h('div', { class: 'agent-mini' }, 'AI 只负责把话听懂；路线由确定性求解器生成，硬约束不会被静默放宽。'),
+        h('div', { class: 'agent-mini' }, d.kernel
+          ? 'AI 负责听懂需求、提名与评审候选、复核路线；道路与时间由确定性求解器 + 高德真实路网计算，硬约束不会被静默放宽。'
+          : 'AI 只负责把话听懂；路线由确定性求解器生成，硬约束不会被静默放宽。'),
         labels.length
           ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...labels.map((l) => h('span', { class: 'agent-chip' }, l)))
           : h('div', { class: 'agent-mini', style: 'margin-top:4px' }, plan ? '条件已用于本次规划。' : '正在解析条件…'));
@@ -102,11 +148,13 @@ export function renderPlan(view, ctx, planId) {
       const preview = plan && plan.candidatePreview;
       const count = preview ? preview.count : (stageState.candidateInfo != null ? stageState.candidateInfo : null);
       const names = (preview && preview.names) || [];
+      const starred = new Set((preview && preview.nominated) || []);
       return box(
         h('div', { class: 'agent-mini' }, count != null
           ? `共 ${count} 个候选进入评分：按兴趣匹配 × 步行距离排序，最多 24 个进入求解。`
           : (plan ? '候选点已进入求解（旧计划未保留候选明细）。' : '正在按兴趣匹配与步行距离评分…')),
-        names.length ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...names.map((n) => h('span', { class: 'agent-chip soft' }, n))) : null);
+        names.length ? h('div', { class: 'chips', style: 'margin-top:6px' }, ...names.map((n) => h('span', { class: 'agent-chip soft', title: starred.has(n) ? '大模型提名、高德核实' : '' }, (starred.has(n) ? '★ ' : '') + n))) : null,
+        starred.size ? h('div', { class: 'agent-mini', style: 'margin-top:4px' }, '★ 为大模型提名并经高德核实的地点') : null);
     }
     if (key === 'solver') {
       const budget = plan && plan.budgetSec;
@@ -180,6 +228,12 @@ export function renderPlan(view, ctx, planId) {
     const solver = agentTrace('solver.completed');
     const verifier = agentTrace('verifier.completed');
     const repair = agentTrace('repair.proposed');
+    const nominated = agentTrace('agent.nominated');
+    const appraised = agentTrace('agent.appraised');
+    const criticRounds = agentTraces('critic.round');
+    const quality = agentTrace('agent.quality');
+    const explained = agentTrace('agent.explained');
+    const kernel = !!(plan && plan.agentKernel) || !!stageState.agentStage;
     const isAgent = !plan || plan.planningMode !== 'algorithm';
     const allDone = stageState.done === 'done';
     const solverDone = !!solver || stageState.route === 'done';
@@ -199,10 +253,21 @@ export function renderPlan(view, ctx, planId) {
     const push = (key, state, label, detail, ms) => steps.push({ key, state, label, detail, ms });
     push('intent', intentDone ? 'done' : 'active', '理解需求',
       stageState.confirmText || '解析游玩方式、目的地、时长与偏好');
+    const agentAt = stageState.agentStage; // 实时事件：nominate / appraise / critic / explain
+    if (nominated || agentAt === 'nominate') {
+      push('nominate', nominated || (agentAt && agentAt !== 'nominate') || candDone ? 'done' : 'active', '提名核实',
+        nominated ? `提名 ${nominated.asked || 0} 个，高德核实 ${nominated.count} 个` : '大模型提名值得去的地点，高德逐个核实',
+        nominated && nominated.durMs != null ? nominated.durMs + 'ms' : null);
+    }
     push('candidates', candDone ? 'done' : stageState.candidates === 'active' ? 'active' : 'pending', '候选检索',
       stageState.candidateInfo != null
         ? `命中 ${stageState.candidateInfo} 个候选点${stageState.candidateNames ? ' · ' + stageState.candidateNames : ''}`
         : '按兴趣匹配与步行距离评分');
+    if (appraised || agentAt === 'appraise') {
+      push('appraise', appraised || candDone ? 'done' : 'active', '候选评审',
+        appraised ? `评审 ${appraised.count} 个${(appraised.noise || []).length ? `，降权 ${appraised.noise.length} 个非游览点` : ''}` : '大模型评估值得度与停留时长',
+        appraised && appraised.durMs != null ? appraised.durMs + 'ms' : null);
+    }
     push('solver', solverDone ? 'done' : candDone && !allDone ? 'active' : 'pending', '组合求解',
       solver
         ? `生成 ${solver.candidates} 个候选方案${topology ? `（拓扑预检：死胡同 ${topology.deadEndCount} 处）` : ''}`
@@ -218,6 +283,11 @@ export function renderPlan(view, ctx, planId) {
       push('guide', allDone || stageState.guide === 'done' ? 'done' : stageState.guide === 'active' ? 'active' : 'pending', '讲解补充',
         stageState.guideDetail || (allDone ? '各站讲解已就绪' : '为每站准备可核验的讲解'));
     }
+    if (kernel && isAgent && (criticRounds.length || verifyDone || agentAt === 'critic' || agentAt === 'explain')) {
+      push('critic', quality || hasVersions ? 'done' : 'active', '反思修复',
+        quality ? `质量分 ${fmtQ(quality.before)} → ${fmtQ(quality.after)} · ${criticRounds.length} 轮` : '按质量指标自查并试算修复',
+        quality && quality.durMs != null ? quality.durMs + 'ms' : null);
+    }
     if (repair && repair.count > 0) {
       push('repair', 'done', '修复提议', `${repair.count} 条待确认方案（不放宽硬约束）`, stepMs(repair, verifier));
     }
@@ -225,7 +295,7 @@ export function renderPlan(view, ctx, planId) {
     const keys = steps.map((s) => s.key);
     if (!agentSelectedManual || !keys.includes(agentSelected)) {
       agentSelected = (repair && repair.count > 0) ? 'repair'
-        : allDone ? 'solver'
+        : allDone ? (keys.includes('critic') ? 'critic' : 'solver')
           : ((steps.find((s) => s.state === 'active') || steps[0]).key);
     }
     const selected = steps.find((s) => s.key === agentSelected) || steps[0];
@@ -249,7 +319,8 @@ export function renderPlan(view, ctx, planId) {
       !allDone && !agentCollapsed ? h('div', { class: 'agent-sub job-progress', role: 'status', 'aria-live': 'polite' }, summary) : null,
       h('div', { class: 'agent-sub' },
         agentCollapsed ? summary : (isAgent
-          ? '只编排「约束台账 → 求解 → 独立验证 → 修复提议」，不直接生成道路'
+          ? (kernel ? '提名核实 → 候选评审 → 求解 → 独立验证 → 反思修复 → 解释；道路来自高德真实路网'
+            : '只编排「约束台账 → 求解 → 独立验证 → 修复提议」，不直接生成道路')
           : '当前为算法直解模式，未启用智能体编排')),
       agentCollapsed ? null : h('div', { class: 'agent-stepper' }, ...steps.map((s) =>
         h('button', {
@@ -262,7 +333,7 @@ export function renderPlan(view, ctx, planId) {
         h('div', { class: 'agent-detahead' },
           h('span', { class: 'agent-detaname' }, selected.label),
           selected.ms ? h('span', { class: 'agent-mini' }, '本步 ' + selected.ms) : null),
-        agentDetail(selected.key, { plan, versions, ledger, solver, topology, verifier, repair, isAgent })),
+        agentDetail(selected.key, { plan, versions, ledger, solver, topology, verifier, repair, isAgent, kernel, nominated, appraised, criticRounds, quality, explained })),
       agentCollapsed ? null : ledgerChips(ledger),
     ].filter(Boolean));
   }
@@ -707,6 +778,9 @@ export function renderPlan(view, ctx, planId) {
           chipsBar.innerHTML = '';
           chipsBar.append(...p.chips.map((c) => h('span', { class: 'cchip', onclick: () => { location.hash = '#/'; } }, c.label)));
         }
+      } else if (evt.type === 'agent.progress') {
+        stageState.agentStage = p.stage;
+        stageState.agentLabel = p.label || null;
       } else if (evt.type === 'clarification.required') {
         stageState.intent = 'active';
         toast('有需要确认的条件，请返回修改');

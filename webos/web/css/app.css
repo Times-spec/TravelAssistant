@@ -123,6 +123,8 @@ li.active .stage-dot { background: var(--warn); animation: pulse 1s infinite alt
 .agent-detahead { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; background: var(--green-l); }
 .agent-detaname { font-size: 12px; font-weight: 700; color: var(--green-d); }
 .agent-detailbox { padding: 9px 10px; background: #fbfcfb; font-size: 12px; line-height: 1.6; }
+.agent-round { padding: 6px 0; border-top: 1px dashed #e3e8e4; }
+.agent-round:first-of-type { border-top: 0; }
 .agent-mini { font-size: 11px; color: var(--ink-2); line-height: 1.6; }
 .agent-cand { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
   padding: 7px 9px; border: 1px solid var(--line); border-radius: 9px; background: #fff;

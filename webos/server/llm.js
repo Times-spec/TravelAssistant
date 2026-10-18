@@ -7,12 +7,14 @@
  * - 模型不能创造 POI ID、不能声称开放/可通行事实——讲解内容若无资料来源，必须标注"未核验"。
  */
 
-async function chat(cfg, messages, maxTokens = 800) {
+async function chat(cfg, messages, maxTokens = 800, opts = {}) {
+  const body = { model: cfg.llm.model, messages, max_tokens: Math.min(maxTokens, cfg.limits.maxLlmTokens), temperature: opts.temperature ?? 0.2 };
+  if (opts.jsonMode) body.response_format = { type: 'json_object' };
   const resp = await fetch(`${cfg.llm.baseUrl.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.llm.apiKey}` },
-    body: JSON.stringify({ model: cfg.llm.model, messages, max_tokens: Math.min(maxTokens, cfg.limits.maxLlmTokens), temperature: 0.2 }),
-    signal: AbortSignal.timeout(25000),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(opts.timeoutMs || 25000),
   });
   if (!resp.ok) { const e = new Error('llm http ' + resp.status); e.code = 'PROVIDER_RATE_LIMITED'; throw e; }
   const json = await resp.json();
@@ -219,4 +221,42 @@ async function answerWithMaterial(cfg, guide, question) {
   }
 }
 
-module.exports = { llmNLU, generateGuide, parseCommand, ruleCommand, answerWithMaterial };
+/** 从模型输出里取出第一个 JSON 对象（容忍 ```json 包裹与前后解释文字） */
+function extractJSON(raw) {
+  const text = String(raw || '').replace(/```(?:json)?/gi, '');
+  const start = text.indexOf('{');
+  if (start < 0) throw new Error('no json');
+  // 括号配对截取：贪婪正则在"JSON 后面还有一段带花括号的解释"时会截错
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return JSON.parse(text.slice(start, i + 1));
+  }
+  throw new Error('unterminated json');
+}
+
+/**
+ * 结构化调用：只接受 JSON 对象输出；不合法时带着错误提示修复一次（§6.3），仍失败抛错由调用方回退。
+ * 智能体内核的提名/评审/反思/解释都走这里——输出一律再经服务端白名单校验，模型不能凭空造 POI。
+ */
+async function chatJSON(cfg, system, user, opts = {}) {
+  const msgs = [{ role: 'system', content: system }, { role: 'user', content: user }];
+  const call = (m) => chat(cfg, m, opts.maxTokens || 900, { timeoutMs: opts.timeoutMs || 20000, jsonMode: !!(cfg.agent && cfg.agent.jsonMode), temperature: opts.temperature });
+  const raw = await call(msgs);
+  try {
+    return extractJSON(raw);
+  } catch (e) {
+    const raw2 = await call([...msgs, { role: 'assistant', content: String(raw).slice(0, 2000) }, { role: 'user', content: '上面的输出不是合法 JSON。请只输出修复后的 JSON 对象，不要任何解释。' }]);
+    return extractJSON(raw2);
+  }
+}
+
+module.exports = { llmNLU, generateGuide, parseCommand, ruleCommand, answerWithMaterial, chat, chatJSON, extractJSON };

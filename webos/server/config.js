@@ -32,6 +32,10 @@ function loadConfig() {
       apiKey: process.env.LLM_API_KEY || (fileCfg.llm && fileCfg.llm.apiKey) || '',
       model: process.env.LLM_MODEL || (fileCfg.llm && fileCfg.llm.model) || '',
     },
+    // 智能体编排内核（提名→核实→评审→反思修复→解释）开关与参数，见 server/agent_kernel.js DEFAULTS；
+    // 环境变量 AGENT_KERNEL=off 可一键关闭（回到纯规则候选 + 单次求解）
+    agent: Object.assign({}, fileCfg.agent || {},
+      process.env.AGENT_KERNEL ? { enabled: !/^(0|off|false|no)$/i.test(process.env.AGENT_KERNEL) } : {}),
     asr: fileCfg.asr || {},
     tts: fileCfg.tts || {},
     admin: fileCfg.admin || {},
