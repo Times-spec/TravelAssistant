@@ -24,6 +24,8 @@ async function runCase(c) {
   const form = { objective: 'highlights', timeMode: 'duration', durationSec: 10800, startMode: 'later', startAtMs: d.getTime(), startTouched: true, durationTouched: true, mobility: 'walk', pace: 'normal', interests: [], mustVisitIds: [], avoidPoiIds: [], endpointMode: 'return_to_origin', ...c.form };
   if (form.endpointMode === 'fixed' || c.form.endpointMode) form.endpointTouched = true;
   if (c.textOnly) { form.durationTouched = false; form.durationSec = 7200; }
+  // 前端从"让 AI 帮我填好并规划"提交时会带 textOverrides（一句话是最新表达）
+  if (c.textOverrides) form.textOverrides = true;
   const ni = await api(T, 'POST', '/v1/intents/normalize', { form, text: c.text || '', timezone: 'Asia/Shanghai' });
   if (!ni.intentId) return { id: c.id, name: c.name, err: 'normalize ' + JSON.stringify(ni).slice(0, 300) };
   const intent = ni.intent || {};

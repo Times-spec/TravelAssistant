@@ -1,5 +1,5 @@
 const fs = require('fs');
-const lines = fs.readFileSync('summary.jsonl', 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+const lines = fs.readFileSync(process.env.FILE || 'summary.jsonl', 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 const only = process.argv[2] ? process.argv[2].split(',') : null;
 for (const r of lines.sort((a, b) => a.id.localeCompare(b.id))) {
   if (only && !only.includes(r.id)) continue;
