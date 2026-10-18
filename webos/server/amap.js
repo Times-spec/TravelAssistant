@@ -557,13 +557,29 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
   const capByBudget = budgetSec >= 10800 ? 12 : 8; // 3 小时以上放宽池子，半天不该只有五六个可选点
   // 多一个终点节点就多一行 OD，候选上限相应少 1，保证矩阵仍能抓满
   const cap = Math.max(1, Math.min(capByBudget, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - (end ? 1 : 0)));
+  // 用户指定的必去点是硬约束：必须进候选池（此前城市闲逛的必去点不在检索/走廊结果里时，
+  // 校验层 must_visit_present 直接 fail，整条计划被判 infeasible —— 2026-10-18 审阅发现）
+  const mustPids = new Set((opts.mustVisitIds || []).map((x) => String(x || '').replace(/^am_/, '')).filter(Boolean));
+  const mustCands = [];
+  const seenMust = new Set();
+  const markMust = () => {
+    for (const c of rawCands) {
+      if (!mustPids.has(c.providerPoiId) || seenMust.has(c.providerPoiId)) continue;
+      seenMust.add(c.providerPoiId);
+      c.mustForce = true;
+      mustCands.push(c);
+    }
+  };
+  // 必去点占用名额：普通候选按剩余额度选，保证矩阵配额仍能覆盖"端口 + 全部候选"两两组合
+  const pickCap = Math.max(0, Math.max(cap, mustPids.size) - mustPids.size);
   let cands;
   let corridor = null;
+  let corridorSearchErrors = [];
   if (end) {
     // A→B 型路线：候选不能只围着起点找，否则最后一站必然离终点很远、只能"空走"过去。
     // 终点较远时再围绕终点（以及走廊中点）检索，并按"顺路程度"（绕行椭圆）过滤。
     const odM = haversineM(origin, end);
-    const searchErrors = [];
+    const searchErrors = corridorSearchErrors;
     const merge = (list) => {
       const seen = new Set(rawCands.map((c) => c.id));
       for (const c of list) if (!seen.has(c.id)) { seen.add(c.id); rawCands.push(c); }
@@ -578,19 +594,44 @@ async function buildAmapAreaPack(cfg, origin, budgetSec, endpoint, opts = {}) {
       catch (e) { searchErrors.push('mid:' + (e.code || e.message)); console.warn('[amap-area] 走廊中点检索失败', e.code || e.message); }
     }
     markRank();
+    markMust();
     const detourMax = Math.max(radiusM, odM * 0.6);
     for (const c of rawCands) {
       c.distanceM = Math.round(haversineM(origin, c));
       c.detourM = Math.round(detourM(origin, c, end));
       c.corridorT = corridorT(origin, end, c);
     }
-    // 离终点 < END_DUP_M 的点就是终点本身（"天府广场"作为末站又作为终点），不作为候选
-    rawCands = rawCands.filter((c) => c.detourM <= detourMax && haversineM(c, end) >= END_DUP_M);
-    cands = pickCorridor(rawCands, cap, odM > radiusM * 0.5);
-    corridor = { odM: Math.round(odM), searchErrors, segments: [0, 1, 2].map((k) => cands.filter((c) => segOf(c.corridorT) === k).length) };
+    // 离终点 < END_DUP_M 的点就是终点本身（"天府广场"作为末站又作为终点），不作为候选；
+    // 但用户明确必去的点不参与这两条过滤（硬约束优先于选点偏好）
+    rawCands = rawCands.filter((c) => c.mustForce || (c.detourM <= detourMax && haversineM(c, end) >= END_DUP_M));
+    cands = pickCorridor(rawCands.filter((c) => !c.mustForce), pickCap, odM > radiusM * 0.5);
   } else {
-    cands = pickByBuckets(rawCands, cap, (c) => c.distanceM);
+    markMust();
+    cands = pickByBuckets(rawCands.filter((c) => !c.mustForce), pickCap, (c) => c.distanceM);
   }
+  // 必去点不在检索结果里时按 id 直接取详情补进候选池（取不到就保持缺失，由校验层如实判 infeasible）
+  for (const pid of mustPids) {
+    if (seenMust.has(pid)) continue;
+    try {
+      const dj = await amapGet(cfg, '/v3/place/detail', { id: pid, extensions: 'base' });
+      const p = (dj.pois || [])[0];
+      const [lng, lat] = String((p && p.location) || ',').split(',').map(Number);
+      if (!p || !p.id || !Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+      const m = mapType(p.typecode, p.name);
+      const c = {
+        id: 'am_' + p.id, name: p.name, providerPoiId: p.id,
+        address: typeof p.address === 'string' ? p.address : '',
+        lng, lat, type: p.type, typecode: p.typecode,
+        distanceM: Math.round(haversineM(origin, { lng, lat })), ...m, mustForce: true,
+      };
+      if (end) c.corridorT = corridorT(origin, end, c);
+      c._rank = 1; // 必去点不参与普通候选排序，固定在最前
+      mustCands.push(c);
+      seenMust.add(pid);
+    } catch (e) { /* 取不到详情 → 保持缺失，由校验层如实判 infeasible */ }
+  }
+  cands = [...mustCands, ...cands];
+  if (end) corridor = { odM: Math.round(haversineM(origin, end)), searchErrors: corridorSearchErrors, segments: [0, 1, 2].map((k) => cands.filter((c) => segOf(c.corridorT) === k).length) };
   const graph = new AmapAreaGraph(cfg, origin, budgetSec, end);
   await graph.init(cands, { cacheKey: matrixCacheKeyOf('area', origin, [...(end ? [endKeyOf(end)] : []), ...cands.map((c) => c.id)]) });
   const usable = cands.filter((c) => graph.nodes.has(c.id));

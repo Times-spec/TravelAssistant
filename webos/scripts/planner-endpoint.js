@@ -35,6 +35,16 @@ global.fetch = async (url, opts) => {
     });
     return J({ count: String(pois.length), pois });
   }
+  if (u.pathname.includes('/place/detail')) {
+    const id = q.get('id');
+    if (id === 'MUST1') {
+      return J({ count: '1', pois: [{
+        id: 'MUST1', name: '指定必去点', typecode: '110200', type: '风景名胜', address: '必去路1号',
+        location: '104.012,30.0', distance: '0', cityname: '成都市', adname: '锦江区',
+      }] });
+    }
+    return J({ count: '0', pois: [] });
+  }
   if (u.pathname.includes('/direction/walking')) {
     const a = q.get('origin'), b = q.get('destination');
     const [x1, y1] = a.split(',').map(Number), [x2, y2] = b.split(',').map(Number);
@@ -113,6 +123,18 @@ function intentOf(endpoint) {
     assert(route.endLabel.startsWith('顺路结束于') && !route.endLabel.includes('起点'), route.endLabel);
     assert(!route.endApproach);
   }
-  console.log('✅ 终点回归通过：独立终点节点 / 末站靠近终点 / endApproach 与逐步导引 / 回起点不变 / 顺路结束在末站 / 末段不空走');
+  /* ---------- 6. 必去点不在检索结果里也要进候选池（否则硬约束直接判 infeasible） ---------- */
+  {
+    const intent = intentOf({ mode: 'return_to_origin' });
+    intent.hard.mustVisitIds = ['am_MUST1'];
+    const { pack, graph } = await buildAmapAreaPack(cfg, O, intent.budgetSec, null, { mustVisitIds: intent.hard.mustVisitIds });
+    assert(pack.pois.some((p) => p.id === 'am_MUST1'), '必去点应按 id 取详情补进候选池');
+    const solved = solveOnce(pack, intent, graph, policy);
+    assert.equal(solved.status, 'ok', JSON.stringify(solved.conflict || {}));
+    const route = buildRoutePlan(pack, intent, graph, solved, { version: 1, planId: 'p' });
+    assert(route.stops.some((s) => s.poiId === 'am_MUST1'), '路线必须包含必去点');
+    assert.equal(route.constraints.find((c) => c.key === 'must_visit_present').result, 'pass');
+  }
+  console.log('✅ 终点回归通过：独立终点节点 / 末站靠近终点 / endApproach 与逐步导引 / 回起点不变 / 顺路结束在末站 / 末段不空走 / 必去点强制入池');
   process.exit(0);
 })().catch((e) => { console.error('❌', e.message); process.exit(1); });

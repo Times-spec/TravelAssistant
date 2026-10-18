@@ -64,6 +64,8 @@ class JobRunner {
         // 室内偏好决定室内/露天点的相对权重（与候选评分层的 indoorAdj 同一口径）
         interests: (intent.interests || []).map((x) => x.tag),
         indoorPreferred: !!(intent.soft && intent.soft.indoorPreferred),
+        // 必去点是硬约束：即使不在检索半径/走廊内也要进候选池（否则校验层直接判 infeasible）
+        mustVisitIds: intent.hard.mustVisitIds || [],
       });
       return area;
     }
