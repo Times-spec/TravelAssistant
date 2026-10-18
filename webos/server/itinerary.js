@@ -64,10 +64,24 @@ function distanceTip(a, b, hub) {
 
 /**
  * 确定性多日行程：
- * 输入 { cityId, days(1-7), interests[], pace(easy|normal|active), budget(economy|comfort|premium), people }
- * 输出 { days:[{am, pm, night, tips, budgetCny}], totals, notices }
+ * 输入 { cityId, days(1-7), interests[], pace, budget, people, mustVenueIds[], templateId }
+ *  - templateId：把模板的城市/天数/兴趣/节奏与途经点带入（用户从"按这条排"进来，承诺过保留骨架）；
+ *  - mustVenueIds：用户指定必须纳入的场所（如场所页"排进多日行程"的 focus）。
+ * 输出 { days:[{...}], totals, notices, template: {...}|null, mustNotPlaced: [] }
  */
-function planItinerary(hub, { cityId, days, interests, pace, budget, people }) {
+function planItinerary(hub, input = {}) {
+  let { cityId, days, interests, pace, budget, people, mustVenueIds } = input;
+  let template = null;
+  if (input.templateId) {
+    template = hub.getTemplate(input.templateId);
+    if (!template) throw E.badRequest('模板不存在', { field: 'templateId' });
+    cityId = template.cityId || cityId;
+    days = (template.draft && template.draft.days) || days;
+    pace = (template.draft && template.draft.pace) || pace;
+    if (!Array.isArray(interests) || !interests.length) {
+      interests = (template.draft && template.draft.interests) || template.themeTags || [];
+    }
+  }
   const city = hub.getCity(cityId);
   if (!city) throw E.badRequest('城市不存在', { field: 'cityId' });
   const dayCount = Math.min(7, Math.max(1, Number(days) || 1));
@@ -77,6 +91,18 @@ function planItinerary(hub, { cityId, days, interests, pace, budget, people }) {
 
   const venues = city.venues.slice();
   if (!venues.length) throw E.badRequest('该城市暂无场所数据');
+  const venueByName = (nm) => venues.find((v) => v.name === nm)
+    || venues.find((v) => v.name.includes(nm) || nm.includes(v.name));
+  // 模板途经点（"D1 故宫博物院"这类）解析为本城场所；解析不到的如实报告，不静默丢失
+  const wantIds = [...new Set((Array.isArray(mustVenueIds) ? mustVenueIds : []).filter(Boolean))];
+  const unresolvedStops = [];
+  for (const s of (template && template.stops) || []) {
+    const nm = String(s.name || '').replace(/^D\d+\s*/, '').trim();
+    if (!nm) continue;
+    const v = venueByName(nm);
+    if (v) wantIds.push(v.id);
+    else unresolvedStops.push(nm);
+  }
   const scored = venues
     .map((v) => ({ v, score: venueScore(v, interests) }))
     .sort((a, b) => b.score - a.score || a.v.id.localeCompare(b.v.id)); // 稳定排序
@@ -101,6 +127,15 @@ function planItinerary(hub, { cityId, days, interests, pace, budget, people }) {
     }
     return null;
   };
+
+  // 0) 明确要求纳入的场所优先落位（模板途经点 / 用户指定的景点），尽量分散到不同天
+  const mustVenues = [...new Set(wantIds)].map((id) => venues.find((v) => v.id === id)).filter(Boolean);
+  const mustNotPlaced = [];
+  mustVenues.forEach((v, i) => {
+    if (assigned.has(v.id)) return;
+    const d = placeIn(v, i % dayCount);
+    if (d == null) mustNotPlaced.push(v);
+  });
 
   // 1) 大场所优先落位（各自占一天；尽量与前一天场所拉开距离）
   let lastCenter = null;
@@ -184,6 +219,15 @@ function planItinerary(hub, { cityId, days, interests, pace, budget, people }) {
     };
   });
 
+  if (template) {
+    notices.push(`已按模板《${template.name}》带入 ${mustVenues.length} 处途经点与 ${dayCount} 天安排。`);
+  }
+  if (unresolvedStops.length) {
+    notices.push(`模板里的 ${unresolvedStops.join('、')} 暂未在内容库中找到对应场所，未纳入本行程。`);
+  }
+  if (mustNotPlaced.length) {
+    notices.push(`你指定的「${mustNotPlaced.map((v) => v.name).join('、')}」因天数/节奏容量不足未排入，可增加天数或选择「紧凑」节奏。`);
+  }
   if (placedCount < scored.length) {
     notices.push(`因天数与节奏限制，${scored.length - placedCount} 个场所未纳入本行程（可增加天数或选择「紧凑」节奏）。`);
   }
@@ -200,6 +244,9 @@ function planItinerary(hub, { cityId, days, interests, pace, budget, people }) {
     itinerary: outDays,
     totals,
     notices,
+    template: template ? { id: template.id, name: template.name } : null,
+    mustVenueIds: mustVenues.map((v) => v.id),
+    mustNotPlaced: mustNotPlaced.map((v) => ({ id: v.id, name: v.name })),
     reviewStatus: 'library_v1',
     generatedAt: new Date().toISOString(),
     algorithm: 'deterministic-greedy-v1',

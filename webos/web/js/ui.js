@@ -88,7 +88,29 @@ export const fmtMin = (sec) => {
   return r ? `${hh} 小时 ${r} 分` : `${hh} 小时`;
 };
 export const fmtKm = (m) => m >= 1000 ? (m / 1000).toFixed(1) + 'km' : Math.round(m) + 'm';
-export const fmtClock = (iso) => iso ? iso.slice(11, 16) : '--:--';
+/* 时间一律按产品时区渲染：服务端事件时间是 UTC ISO，直接截字符串会少 8 小时（2026-10-18 线上实测） */
+const SHOP_TZ = 'Asia/Shanghai';
+const _partsFmt = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: SHOP_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hourCycle: 'h23', weekday: 'short',
+});
+/** ISO 字符串（UTC 或带偏移）→ 上海时区的拆分结果；解析失败返回 null */
+export function zoned(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const p = {};
+  for (const { type, value } of _partsFmt.formatToParts(d)) p[type] = value;
+  return {
+    y: p.year, m: p.month, d: p.day, hh: p.hour, mm: p.minute, week: p.weekday,
+    dateStr: `${p.year}-${p.month}-${p.day}`,
+    hhmm: `${p.hour}:${p.minute}`,
+    md: `${p.month}-${p.day}`,
+  };
+}
+export const fmtClock = (iso) => { const z = zoned(iso); return z ? z.hhmm : '--:--'; };
+export const fmtDate = (iso) => { const z = zoned(iso); return z ? z.md : ''; };
+export const fmtDateTime = (iso) => { const z = zoned(iso); return z ? `${z.md} ${z.hhmm}` : ''; };
 
 /* ---------------- SVG 地图 ----------------
  * 输入：nodes/edges（场所包）+ route legs/stops + 用户位置。

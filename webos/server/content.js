@@ -11,7 +11,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const CONTENT_DIR = path.join(__dirname, '..', 'data', 'content');
+// 内容库目录可用 CONTENT_DIR 覆盖：验收/审查要在独立副本上跑，不能改写产品内容文件
+const CONTENT_DIR = process.env.CONTENT_DIR || path.join(__dirname, '..', 'data', 'content');
 
 function loadJson(name) {
   const file = path.join(CONTENT_DIR, name);
@@ -213,7 +214,7 @@ class ContentHub {
   /** 全局搜索：城市/场所/攻略 三路检索 */
   search(q, limit = 8) {
     const query = (q || '').trim();
-    if (!query) return { cities: [], venues: [], articles: [] };
+    if (!query) return { cities: [], venues: [], articles: [], templates: [] };
     const cities = this.cities.filter((c) => c.name.includes(query)
       || (c.tags || []).some((t) => t.includes(query)) || (c.summary || '').includes(query))
       .slice(0, 4).map((c) => ({ id: c.id, name: c.name, slogan: c.slogan, tags: c.tags }));
@@ -222,7 +223,20 @@ class ContentHub {
     const articles = this.articles.filter((a) => a.title.includes(query)
       || (a.summary || '').includes(query)).slice(0, limit)
       .map((a) => ({ id: a.id, title: a.title, summary: a.summary, readMin: a.readMin }));
-    return { cities, venues, articles };
+    // 路线模板也要能被搜到（此前发现页有模板、搜索却查不到，2026-10-18 审计发现）
+    const cityName = (id) => (this._cityById.get(id) || {}).name || '';
+    const cityMatch = this.cities.filter((c) => c.name.includes(query)).map((c) => c.id);
+    const templates = this.templates.filter((t) => t.name.includes(query)
+      || (t.summary || '').includes(query)
+      || (t.themeTags || []).some((g) => g.includes(query))
+      || cityMatch.includes(t.cityId))
+      .slice(0, limit)
+      .map((t) => ({
+        id: t.id, name: t.name, cityId: t.cityId, cityName: cityName(t.cityId),
+        summary: t.summary, scene: t.scene, durationSec: t.durationSec,
+        themeTags: t.themeTags || [], stopCount: (t.stops || []).length,
+      }));
+    return { cities, venues, articles, templates };
   }
 
   /** 管理后台：保存内容文件（原子替换） */

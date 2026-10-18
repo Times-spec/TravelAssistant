@@ -45,7 +45,8 @@ export function renderPlan(view, ctx, planId) {
   cleanupFns.push(() => { bottomObserver?.disconnect(); window.removeEventListener('resize', syncBottomSpace); view.classList.remove('plan-view'); view.style.removeProperty('--plan-bar-height'); });
 
   let taskFailed = false; // 任务级失败：立即停掉阶段动画，改显示失败卡片
-  let agentCollapsed = false; // 决策链可收起（默认展开：等待期它就是进度）
+  let agentCollapsed = false; // 等待期默认展开（它就是进度）；出结果后自动收起，用户手动展开过就不再干预
+  let agentTouched = false;
   let agentSelected = null; // 当前查看的决策步骤
   let agentSelectedManual = false; // 用户点过步骤后，不再自动跟随活动步骤
 
@@ -65,7 +66,8 @@ export function renderPlan(view, ctx, planId) {
   const fmtQ = (q) => (q == null ? '—' : Math.round(q * 100));
 
   function ledgerText(r) {
-    if (r.kind === 'route.edge_repeat') return '不重复路段';
+    if (r.kind === 'route.edge_repeat') return '不重复路段（已核验路网）';
+    if (r.kind === 'route.edge_repeat_approx') return '尽量少走回头路（真实路网近似检测）';
     if (r.kind === 'poi.must_visit') return `必去 ${(r.value || []).length} 处`;
     if (r.kind === 'poi.avoid') return `避开 ${(r.value || []).length} 处`;
     if (r.kind === 'time.latest_end') return `最晚 ${fmtClock(r.value)} 到终点`;
@@ -306,15 +308,17 @@ export function renderPlan(view, ctx, planId) {
         ? `前面还有 ${stageState.queuePosition} 个任务 · ${stageState.activePhaseLabel || stageState.phaseLabel || '等待派发'}`
         : stageState.phaseLabel || (activeStep ? `正在${activeStep.label}…` : '准备中…');
 
+    // 结果出来后默认收起（首屏先给路线），用户主动展开过则不再自动收起
+    if (allDone && !agentTouched) agentCollapsed = true;
     progressCard.classList.remove('hidden');
     progressCard.innerHTML = '';
     // 原生 append 会把 null 变成字面量 "null"，先过滤再展开
     progressCard.append(...[
       h('div', { class: 'agent-head' },
         h('div', { class: 'agent-head-left' },
-          h('div', { class: 'agent-title' }, '🤖 智能体决策过程'),
+          h('div', { class: 'agent-title' }, '🤖 为什么这样推荐'),
           h('span', { class: 'agent-badge' }, isAgent ? '有界智能体' : '算法直解')),
-        h('button', { class: 'link-btn', onclick: () => { agentCollapsed = !agentCollapsed; renderStages(); } },
+        h('button', { class: 'link-btn', onclick: () => { agentCollapsed = !agentCollapsed; agentTouched = true; renderStages(); } },
           agentCollapsed ? '展开 ▾' : '收起 ▴')),
       !allDone && !agentCollapsed ? h('div', { class: 'agent-sub job-progress', role: 'status', 'aria-live': 'polite' }, summary) : null,
       h('div', { class: 'agent-sub' },
@@ -764,8 +768,33 @@ export function renderPlan(view, ctx, planId) {
     }
     if (!jobId) return;
     if (['completed', 'failed', 'cancelled'].includes(planData.plan.jobStatus)) return;
+    // 进度自愈：一段时间收不到任何推进事件就主动核对任务/计划状态，避免"连接还在但页面永远转圈"
+    let stopped = false;
+    let lastEvtAt = Date.now();
+    let silentChecks = 0;
+    const watchdog = setInterval(async () => {
+      if (stopped || Date.now() - lastEvtAt < 20000) return;
+      lastEvtAt = Date.now(); // 占位，避免重入
+      silentChecks++;
+      try {
+        await loadPlan(true);
+        const plan = planData && planData.plan;
+        const finished = plan && (['ready', 'conditional', 'infeasible'].includes(plan.status)
+          || ['completed', 'failed', 'cancelled'].includes(plan.jobStatus));
+        if (finished) {
+          STAGE_KEYS.forEach((k) => { if (stageState[k] !== 'done') stageState[k] = 'done'; });
+          stageState.done = 'done';
+        } else if (silentChecks >= 2) {
+          stageState.phaseLabel = '进度推送似乎中断，正在自动重试（也可下拉刷新页面）';
+        }
+        renderStages();
+      } catch (e) { /* 下次心跳再试 */ }
+    }, 5000);
+    cleanupFns.push(() => { stopped = true; clearInterval(watchdog); });
     unsub = subscribeJob(jobId, async (evt) => {
       const p = evt.payload || {};
+      lastEvtAt = Date.now();
+      silentChecks = 0;
       if (evt.type === 'job.progress') {
         stageState.queuePosition = p.queuePosition || 0;
         stageState.phaseLabel = p.phaseLabel || null;

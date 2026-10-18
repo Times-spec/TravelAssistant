@@ -593,6 +593,12 @@ function nearestNeighborOrder(graph, startId, nodeIds) {
 }
 
 /* ================= 校验层（§8.7 发布前清单） ================= */
+/** 告警里的站点列表：≤2 个列全名，更多时只列前两个并给数量（避免一屏重复站名） */
+function stopNames(stops) {
+  const names = stops.map((s) => s.poi.name);
+  return names.length > 2 ? `${names.length} 个站点（${names.slice(0, 2).join('、')} 等）` : names.join('、');
+}
+
 function validatePlan(pack, intent, graph, solved) {
   const constraints = [];
   const warnings = [];
@@ -692,12 +698,12 @@ function validatePlan(pack, intent, graph, solved) {
   }
   // 信息不确定性提示
   const unknownPrice = schedule.stops.filter((s) => !s.poi.ticketKnown);
-  if (unknownPrice.length) warnings.push({ code: 'PRICE_UNKNOWN', message: `${unknownPrice.map((s) => s.poi.name).join('、')}价格未核验，预估费用不含该部分`, evidenceIds: [] });
+  if (unknownPrice.length) warnings.push({ code: 'PRICE_UNKNOWN', message: `${stopNames(unknownPrice)}价格未核验，预估费用不含该部分`, evidenceIds: [] });
   // 开放时间未核验（真实高德候选没有营业时间表）→ 条件性方案，不假装已知（§7.1）
   const hoursUnknown = schedule.stops.filter((s) => !s.poi.openWindows);
   if (hoursUnknown.length) {
     constraints.push({ key: 'hours_unverified', result: 'unknown', evidenceIds: ['ev_amap_live'] });
-    warnings.push({ code: 'HOURS_UNKNOWN', message: `${hoursUnknown.map((s) => s.poi.name).join('、')}的开放时间未核验，出发前请现场确认`, evidenceIds: [] });
+    warnings.push({ code: 'HOURS_UNKNOWN', message: `${stopNames(hoursUnknown)}的开放时间未核验，出发前请现场确认`, evidenceIds: [] });
   }
 
   const hasFail = constraints.some((c) => c.result === 'fail');

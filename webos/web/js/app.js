@@ -96,6 +96,8 @@ function route() {
         b.classList.toggle('active', matches.includes(r.name));
       });
       const view = document.getElementById('view');
+      // 当前路由名挂到 body：桌面断点按页面决定两列/单列（发现页列表、规划页地图区等）
+      document.body.dataset.route = r.name;
       if (currentCleanup) { try { currentCleanup(); } catch (e) {} currentCleanup = null; }
       view.innerHTML = '';
       currentCleanup = r.render(view, m) || null;
@@ -124,7 +126,24 @@ async function boot() {
     el.addEventListener('click', () => { location.hash = el.dataset.nav; });
   });
   window.addEventListener('hashchange', route);
+  // 列表行是 div+onclick：补上键盘可达性（Tab 聚焦、Enter/Space 触发），异步渲染的新节点也覆盖
+  const VIEW = document.getElementById('view');
+  const decorate = (el) => {
+    el.querySelectorAll('.poi-result, .venue-row, .art-card, .narr-card, .tpl-card').forEach((row) => {
+      if (row.tagName === 'BUTTON' || row.dataset.a11y) return;
+      row.dataset.a11y = '1';
+      row.setAttribute('role', 'button');
+      row.setAttribute('tabindex', '0');
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); row.click(); }
+      });
+    });
+  };
+  new MutationObserver((muts) => {
+    for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) decorate(n);
+  }).observe(VIEW, { childList: true, subtree: true });
   route();
+  decorate(VIEW);
 }
 
 function showBootError(e) {

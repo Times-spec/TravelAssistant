@@ -74,13 +74,35 @@ export function renderTrip(view, ctx, tripId) {
     return String(route.endLabel || '终点').replace(/^终点：|^返回|^顺路结束于/, '') || '终点';
   }
 
+  /**
+   * 延迟开始游览时，服务端会按当前时间重排并给出 adjustedTimeline（校正时间表）。
+   * 页面显示一律以校正后为准，否则顶栏/行程单/终点时间仍显示规划时的旧时间（2026-10-18 审计发现）。
+   */
+  function effectiveRoute(route, trip) {
+    const tl = trip && trip.adjustedTimeline;
+    if (!Array.isArray(tl) || !tl.length || !route || !route.stops) return route;
+    const byNode = new Map(tl.map((x) => [x.nodeId, x]));
+    const stops = route.stops.map((st) => {
+      const a = byNode.get(st.entranceNodeId);
+      return a ? { ...st, arrivalAt: a.arrivalAt, visitStartAt: a.visitStartAt, departureAt: a.departureAt } : st;
+    });
+    let endArrivalAt = route.endArrivalAt;
+    const lastAdj = tl[tl.length - 1];
+    const oldLast = route.stops[route.stops.length - 1];
+    if (lastAdj && oldLast && route.endArrivalAt) {
+      const gap = new Date(route.endArrivalAt).getTime() - new Date(oldLast.departureAt).getTime();
+      if (Number.isFinite(gap) && gap >= 0) endArrivalAt = new Date(new Date(lastAdj.departureAt).getTime() + gap).toISOString();
+    }
+    return { ...route, stops, endArrivalAt, timelineAdjusted: true };
+  }
+
   async function render() {
     const seq = ++renderSeq; // 重渲染代际：await 之后若已有更新的渲染，本轮作废
     root.innerHTML = '';
     liveHooks = [];
     svgView = null;
-    const route = tripData.route;
     const trip = tripData.trip;
+    const route = effectiveRoute(tripData.route, trip);
     if (!route) { root.append(h('div', { class: 'card empty' }, '路线数据缺失')); return; }
     if (trip.status !== 'active' && trip.status !== 'paused') {
       location.hash = '#/finish/' + tripId;
@@ -338,6 +360,7 @@ export function renderTrip(view, ctx, tripId) {
       h('div', { class: 'pg-track' }, ...nodes),
       h('div', { class: 'pg-sub' },
         `剩 ${remaining} 站 · 预计 ${fmtClock(route.endArrivalAt)} 到终点`,
+        route.timelineAdjusted ? h('span', { class: 'tag', style: 'margin-left:6px', title: '开始游览时按当前时间重排过' }, '已按开始时间校正') : null,
         trip.status === 'paused' ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '已暂停') : null));
   }
 

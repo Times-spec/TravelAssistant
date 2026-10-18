@@ -314,8 +314,17 @@ class JobRunner {
       // 备选标题体现真实取向差异（主推荐不加后缀，避免读起来像次级方案）；
       // 三种策略都要有区分，否则主推 light、备选 balanced 时会撞成同一个标题
       if (i > 0) {
-        plan_.title += r.policy.name === 'light' ? ' · 轻松版'
-          : r.policy.name === 'full' ? ' · 全览版' : ' · 均衡版';
+        // 备选名称必须和数据一致：站数/距离/时长都更少就不该叫"全览版"（2026-10-18 审计发现）
+        const mainRv = results[0] && buildRoutePlan(pack, intent, graph, results[0].solved, { version: 1, planId: plan.id });
+        const dStops = plan_.stops.length - (mainRv ? mainRv.stops.length : plan_.stops.length);
+        const dKm = mainRv ? (plan_.totals.distanceM - mainRv.totals.distanceM) / 1000 : 0;
+        const dMin = mainRv ? Math.round((plan_.totals.totalSec - mainRv.totals.totalSec) / 60) : 0;
+        const cmp = [];
+        if (dStops !== 0) cmp.push(`${dStops > 0 ? '多' : '少'} ${Math.abs(dStops)} 站`);
+        if (Math.abs(dKm) >= 0.3) cmp.push(`${dKm > 0 ? '多走' : '少走'} ${Math.abs(dKm).toFixed(1)}km`);
+        if (Math.abs(dMin) >= 5) cmp.push(`${dMin > 0 ? '多' : '少'} ${Math.abs(dMin)} 分钟`);
+        const label = dStops > 0 ? ' · 更全' : dStops < 0 ? ' · 更精简' : ' · 均衡';
+        plan_.title += label + (cmp.length ? `（${cmp.join('，')}）` : '');
       }
       if (!existing) store.insert('route_versions', plan_);
       routeIds.push(plan_.routeId);

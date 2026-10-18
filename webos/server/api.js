@@ -1098,7 +1098,7 @@ class Api {
       actualDurationSec: actualSec,
       knownDistanceM,
       distanceKind: 'planned',
-      dataCompleteness: { continuousTrack: false, note: '距离为规划距离合计；未采集连续轨迹，不展示伪造的实际距离（§13.2）' },
+      dataCompleteness: { continuousTrack: false, note: '距离为规划距离合计；未采集连续轨迹，不展示推测的实际行走距离' },
       narrative: null, // §13.4：数值先行，LLM 润色在真实模式接入
     };
   }
@@ -1110,7 +1110,7 @@ class Api {
     return {
       preferences: pref || { userId: req.user.id, enabled: true, interests: [], pace: null, guideStyle: 'normal' },
       evidenceCount: evidence.length,
-      note: '偏好画像可查看、修改或关闭；关闭个性化不影响保留自用历史（§13.5）',
+      note: '偏好画像可查看、修改或关闭；关闭个性化不影响保留历史记录',
     };
   }
 

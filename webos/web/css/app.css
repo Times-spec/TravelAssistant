@@ -642,3 +642,42 @@ svg.am-z-mid .am-turn-text { display: none; }
 .poi-result:last-child { border-bottom: 0; padding-bottom: 2px; }
 .empty { text-align: center; color: var(--ink-2); font-size: 13px; padding: 26px 0 30px; }
 .empty::before { content: '◌'; display: block; font-size: 22px; color: #c3d2ca; margin-bottom: 6px; }
+
+/* 行程单带入提示（模板 / 指定必去） */
+.itin-banner { display: grid; gap: 10px; }
+.ib-row { display: flex; align-items: flex-start; gap: 10px; }
+.ib-main { flex: 1; min-width: 0; }
+.ib-row .btn { flex: none; width: auto; margin-top: 0; }
+.ib-title { font-weight: 600; font-size: 14px; }
+
+.search-again { display: flex; gap: 8px; margin-top: 10px; }
+.search-again .input { flex: 1; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+
+/* ==================== 响应式：桌面加宽 + 窄屏导航不折字（2026-10-18 审计） ==================== */
+@media (min-width: 1000px) {
+  /* 桌面利用横向空间：列表/发现类页面两列，正文类页面保持易读宽度 */
+  body[data-route='discover'] #app,
+  body[data-route='me'] #app,
+  body[data-route='venues'] #app,
+  body[data-route='articles'] #app { max-width: 1040px; }
+  body[data-route='city'] #app,
+  body[data-route='venue'] #app,
+  body[data-route='template'] #app,
+  body[data-route='article'] #app,
+  body[data-route='itinerary'] #app { max-width: 760px; }
+  body[data-route='discover'] .tpl-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body[data-route='me'] .hist-rail { padding-left: 22px; }
+  .bottom-bar, .sheet-body { max-width: inherit; }
+  .sheet-body { left: 50%; width: 100%; }
+  #view { padding: 16px 24px 60px; }
+  .disc-search .input { font-size: 15px; }
+}
+@media (max-width: 380px) {
+  #app-header { padding: 8px 8px; }
+  .brand { font-size: 16px; letter-spacing: .5px; }
+  .brand-sub { display: none; }   /* 极窄屏先让导航完整可用 */
+  .nav-btn { padding: 6px 7px; font-size: 13.5px; }
+}
+.brand { white-space: nowrap; }
+.top-nav { flex: none; }
+.nav-btn { white-space: nowrap; flex: none; }

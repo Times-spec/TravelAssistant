@@ -136,10 +136,11 @@ function tplCard(t, featured) {
   const names = t.stopNames || [];
   const route = names.join(' → ') + (t.stopCount > names.length ? ` → …共 ${t.stopCount} 站` : '');
   return h('button', { class: 'tpl-card', onclick: () => { location.hash = '#/template/' + t.id; } },
-    featured ? h('span', { class: 'tpl-badge' }, '本周最热') : null,
+    featured ? h('span', { class: 'tpl-badge' }, '编辑精选') : null,
     h('div', { class: 'tpl-top' },
       h('span', { class: 'tpl-name' }, t.name),
-      h('span', { class: 'tpl-heat' }, `🔥 ${t.heat}`)),
+      // 不是"用户验证数"：编辑初始热度 + 真实使用次数，避免把种子值读成周活跃
+      h('span', { class: 'tpl-heat', title: '推荐指数 = 编辑初始热度 + 真实使用次数（非周活跃统计）' }, `🔥 推荐指数 ${t.heat}`)),
     h('div', { class: 'tpl-city' }, [t.cityName, t.venueName || SCENE_TXT[t.scene] || t.scene, fmtDur(t.durationSec), `${t.stopCount} 站`].filter(Boolean).join(' · ')),
     route ? h('div', { class: 'tpl-route' }, route) : null,
     h('div', { class: 'tpl-sum' }, t.summary),
@@ -235,7 +236,8 @@ async function resolveTemplateStops(cityName, stops) {
 async function useTemplate(ctx, t) {
   try { await post(`/v1/hub/templates/${t.id}/use`); } catch (e) { /* 热度计数失败不阻断 */ }
   const d = ctx.state.draft;
-  if (t.scene === 'itinerary') { location.hash = '#/itinerary?city=' + t.cityId; return; }
+  // 多日模板：把模板 id 一起带过去，行程页按模板还原天数/兴趣并保证途经点纳入（不能只带城市）
+  if (t.scene === 'itinerary') { location.hash = '#/itinerary?template=' + t.id; return; }
   d.scene = t.scene === 'venue' ? 'venue' : 'wander';
   d.timeMode = 'duration';
   d.durationSec = t.durationSec || 7200;
@@ -321,6 +323,7 @@ export async function renderSearch(view, ctx, query) {
   view.append(box);
   const data = await get('/v1/hub/search?q=' + encodeURIComponent(q));
   const groups = [
+    ['路线', data.templates, (t) => ({ hash: '#/template/' + t.id, n: t.name, a: `${t.cityName || ''} · ${SCENE_TXT[t.scene] || t.scene} · ${fmtDur(t.durationSec)} · ${t.stopCount} 站` })],
     ['城市', data.cities, (c) => ({ hash: '#/city/' + c.id, n: c.name + ' — ' + c.slogan, a: (c.tags || []).join('、') })],
     ['场所', data.venues, (v) => ({ hash: '#/venue/' + v.id, n: `${v.name}（${v.level}）`, a: v.kind + ' · ' + v.rating.toFixed(1) + ' 分' })],
     ['攻略', data.articles, (a) => ({ hash: '#/article/' + a.id, n: a.title, a: a.readMin + ' 分钟阅读' })],
@@ -333,7 +336,16 @@ export async function renderSearch(view, ctx, query) {
       h('p', { class: 'card-title' }, name),
       ...list.map((x) => { const f = fmt(x); return h('div', { class: 'poi-result', onclick: () => { location.hash = f.hash; } }, h('div', { class: 'n' }, f.n), h('div', { class: 'a' }, f.a)); })));
   }
-  if (!any) box.append(h('div', { class: 'empty' }, '没有找到相关内容，换个关键词试试'));
+  if (!any) {
+    const input = h('input', { class: 'input', value: q, placeholder: '换个关键词试试，比如「杭州」「半日」「故宫」' });
+    const again = () => { const v = input.value.trim(); if (v) location.hash = '#/search?q=' + encodeURIComponent(v); };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') again(); });
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'empty' }, '没有找到相关内容'),
+      h('div', { class: 'search-again' }, input, h('button', { class: 'btn btn-primary btn-sm', onclick: again }, '再搜')),
+      h('div', { class: 'tl-meta', style: 'margin-top:8px' }, '可以搜：城市（杭州）、路线主题（半日 / 人文）、场所（故宫）、攻略关键词'),
+      h('button', { class: 'btn btn-ghost btn-block', onclick: () => { location.hash = '#/discover'; } }, '去发现页逛逛')));
+  }
 }
 
 /* ==================== 城市详情 ==================== */

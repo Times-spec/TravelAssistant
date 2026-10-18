@@ -572,6 +572,13 @@ function diagnose(pack, intent, graph, solved, ev, state) {
       if (better) add({ kind: 'swap', outId: low.id, inId: better.id, why: '换成更值得去的点' });
     }
   }
+  // 无美食偏好时，餐饮/消费类站点最多留 1 个（2 小时精华路线不该有近半数停留是吃，2026-10-18 审计样本）
+  const foodStops = stops.filter((s) => !must.has(s.poi.id) && !s.poi.nominated && /^05/.test(String(s.poi.typecode || '')));
+  if (!foodWanted && foodStops.length > 1) {
+    const dropList = [...foodStops].sort((a, b) => valueOf(a.poi) - valueOf(b.poi)).slice(0, foodStops.length - 1);
+    issues.push({ code: 'TOO_MANY_FOOD', label: `未要求美食却有 ${foodStops.length} 个餐饮停靠` });
+    for (const st of dropList) add({ kind: 'exclude', outId: st.poi.id, why: '控制餐饮停靠数量' });
+  }
   // 漏掉代表性地点 → 纳入/替换
   const minIn = stops.length ? Math.min(...stops.map((s) => valueOf(s.poi))) : 0;
   const highs = pool.filter((p) => (valueOf(p) >= 0.75 || (p.nominated && valueOf(p) >= 0.6)) && valueOf(p) > minIn + 0.15).slice(0, 2);

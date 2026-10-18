@@ -17,6 +17,7 @@
     "test:route-strategies": "node scripts/compare-route-strategies.js",
     "test:live-fixes": "node scripts/live-fixes.js",
     "test:agent-kernel": "node scripts/agent-kernel.js",
-    "eval:agent": "node scripts/agent-eval.js"
+    "eval:agent": "node scripts/agent-eval.js",
+    "bench": "node scripts/planner-bench.js"
   }
 }
