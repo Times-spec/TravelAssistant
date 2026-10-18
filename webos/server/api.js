@@ -963,9 +963,16 @@ class Api {
     const events = store.find('trip_events', (e) => e.tripId === trip.id);
     const visited = events.filter((e) => e.type === 'arrive_confirm').map((e) => ({ poiId: e.data.poiId, confirmType: e.confirmType, at: e.occurredAt }));
     const skipped = events.filter((e) => e.type === 'stop_skipped').map((e) => ({ poiId: e.data.poiId, reason: e.data.reason || null }));
+    // 实时路线（area_amap/live）的点位不在演示场所包里，必须回落到路线版本中的站名；
+    // 否则小结会直接暴露 am_xxx 这样的高德 POI id（2026-10-18 线上实测）。
+    const routeNames = new Map();
+    for (const r of store.find('route_versions', (x) => x.planId === trip.planId)) {
+      for (const s of r.stops || []) if (s.poiId && s.name) routeNames.set(s.poiId, s.name);
+    }
     const poiName = (pid) => {
+      if (!pid) return pid;
       for (const pack of this.ctx.packs) { const p = pack._poiById.get(pid); if (p) return p.name; }
-      return pid;
+      return routeNames.get(pid) || pid;
     };
     const durationSec = trip.finishedAt ? Math.round((new Date(trip.finishedAt) - new Date(trip.startedAt)) / 1000) : null;
     return {

@@ -34,14 +34,25 @@ export function renderFinish(view, ctx, tripId) {
         ...s.looseNotes.map((n) => h('div', { class: 'highlight-item' },
           h('div', { class: 'h-name' }, n.name || '路上'),
           h('div', { class: 'h-note' }, '✎ ' + n.text)))) : null,
-      h('div', { class: 'card' },
-        h('p', { class: 'card-title' }, '过程记录（计划与实际分开）'),
-        statRow('用时', s.actualDurationSec ? fmtMin(s.actualDurationSec) : '未知'),
-        statRow('跳过', s.skippedStops.length ? s.skippedStops.map((x) => x.name).join('、') : '无'),
-        statRow('原计划', s.plannedStops.join('、')),
-        s.replanCount > 0 ? statRow('途中调整', `${s.replanCount} 次重排（共 ${s.versionCount} 个路线版本）`) : null,
-        statRow('距离', `${fmtKm(s.distanceM)}（${s.distanceNote}）`),
-        h('div', { class: 'tl-meta', style: 'margin-top:6px;color:var(--warn)' }, s.dataCompleteness.note),
+      h('div', { class: 'card proc-card' },
+        h('p', { class: 'card-title' }, '过程记录'),
+        h('div', { class: 'proc-sub' }, `${s.startedAt ? s.startedAt.slice(11, 16) : ''} 出发 → ${s.finishedAt ? s.finishedAt.slice(11, 16) : '—'} 结束 · 计划与实际分开记录`),
+        h('div', { class: 'proc-stats' },
+          procStat('用时', s.actualDurationSec ? fmtMin(s.actualDurationSec) : '未知', s.plannedDurationSec ? `计划约 ${fmtMin(s.plannedDurationSec)}` : ''),
+          procStat('到访', `${(s.confirmedVisits || []).length} 站`, s.skippedStops.length ? `跳过 ${s.skippedStops.length} 站` : '全部走到'),
+          procStat('途中调整', s.replanCount ? `${s.replanCount} 次` : '无', s.replanCount ? `共 ${s.versionCount} 个路线版本` : ''),
+          procStat('规划距离', fmtKm(s.distanceM), '无实际轨迹')),
+        h('div', { class: 'proc-block' },
+          h('div', { class: 'proc-label' }, `原计划 · ${s.plannedStops.length} 站`),
+          h('div', { class: 'proc-chips' }, s.plannedStops.map((name, i) =>
+            h('span', { class: 'proc-chip' }, h('i', {}, String(i + 1)), name)))),
+        s.skippedStops.length ? h('div', { class: 'proc-block' },
+          h('div', { class: 'proc-label' }, `实际 · 跳过 ${s.skippedStops.length} 站`),
+          h('div', { class: 'proc-chips' }, s.skippedStops.map((x) =>
+            h('span', { class: 'proc-chip skip' }, x.name)))) : null,
+        h('div', { class: 'proc-note' },
+          h('span', { class: 'proc-note-i' }, 'i'),
+          h('span', {}, s.distanceNote)),
         h('button', { class: 'btn btn-ghost btn-block', style: 'margin-top:10px', onclick: () => copySummary(s, highlights) }, '复制小结分享给朋友')),
       buildFeedback(tripId),
       h('div', { class: 'chips', style: 'justify-content:center' },
@@ -100,7 +111,7 @@ export function renderFinish(view, ctx, tripId) {
           e.currentTarget.classList.toggle('sel', !on);
         },
       }, r)));
-    return h('div', { class: 'card' },
+    const card = h('div', { class: 'card' },
       h('p', { class: 'card-title' }, '这条路线合你心意吗？（可跳过，不影响保存记录）'),
       stars,
       h('div', { style: 'margin:8px 0' }, reasonChips),
@@ -111,21 +122,33 @@ export function renderFinish(view, ctx, tripId) {
             if (!rating) { toast('点个星星再提交，或直接跳过'); return; }
             try {
               await post('/v1/feedback', { tripId: tid, targetType: 'route', rating, reasons: [...reasons] });
+              card.innerHTML = '';
+              card.append(
+                h('p', { class: 'card-title' }, '已收到你的反馈'),
+                h('div', { class: 'tl-meta' }, `评分 ${rating} 星${reasons.size ? ' · ' + [...reasons].join('、') : ''}，会用于改进后续路线。`));
               toast('感谢反馈！');
             } catch (e) { toast(e.message); }
           },
         }, '提交反馈'),
-        h('button', { class: 'btn btn-ghost btn-sm' }, '跳过')));
+        h('button', {
+          class: 'btn btn-ghost btn-sm',
+          onclick: () => {
+            card.remove();
+            toast('已跳过评价，游览记录已保存');
+          },
+        }, '跳过')));
+    return card;
   }
 
   boot().catch((e) => root.append(h('div', { class: 'card empty' }, e.message)));
   return () => {};
 }
 
-function statRow(k, v) {
-  return h('div', { class: 'row', style: 'padding:5px 0;border-bottom:1px dashed var(--line)' },
-    h('span', { class: 'tl-meta', style: 'flex:none;width:76px' }, k),
-    h('span', { style: 'font-size:14px' }, v));
+function procStat(k, v, sub) {
+  return h('div', { class: 'proc-stat' },
+    h('span', { class: 'proc-stat-k' }, k),
+    h('b', {}, v),
+    sub ? h('span', { class: 'proc-stat-s' }, sub) : null);
 }
 
 /* ================= 我的 ================= */
