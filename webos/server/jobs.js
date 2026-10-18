@@ -6,7 +6,7 @@
  * - 阶段边界检查取消标志；事件带 seq，支持断线补偿。
  */
 const { id, nowIso } = require('./util');
-const { VenueGraph, solveAlternatives, buildRoutePlan, solveOnce, scheduleRoute, validatePlan, diffRoutes } = require('./planner');
+const { VenueGraph, solveAlternatives, buildRoutePlan, solveOnce, scheduleRoute, validatePlan, diffRoutes, hydrateSolved } = require('./planner');
 const { buildGuideContent } = require('./providers');
 const tk = require('./timekit');
 
@@ -299,6 +299,10 @@ class JobRunner {
       return;
     }
 
+    // 距离矩阵模式：发布前给每个方案回填真实步行折线（智能体内核已回填过的段直接跳过）
+    for (const r of results) {
+      if (r && r.solved) r.solved = await hydrateSolved(pack, intent, graph, r.solved);
+    }
     const routeIds = [];
     let version = store.find('route_versions', (r) => r.planId === plan.id).length;
     for (let i = 0; i < results.length; i++) {
@@ -415,7 +419,9 @@ class JobRunner {
     if (Array.isArray(edits.reorder) && edits.reorder.length) {
       // 用户指定顺序：直接排程校验，不让求解器悄悄改回
       const startNodeId = base.startNodeId;
-      const sch = scheduleRoute(pack, edited, graph, edits.reorder, { startNodeId, endNodeId: base.endNodeId });
+      // 保留原路线每站的停留时长（含"停留补足"），只按新顺序重排路程
+      const dwellOverride = Object.fromEntries((base.stops || []).filter((x) => x.entranceNodeId && x.dwellSec).map((x) => [x.entranceNodeId, x.dwellSec]));
+      const sch = scheduleRoute(pack, edited, graph, edits.reorder, { startNodeId, endNodeId: base.endNodeId, dwellOverride });
       if (!sch.ok || sch.totals.totalSec > edited.budgetSec) {
         this.emit(job, 'job.failed', { code: 'NO_FEASIBLE_ROUTE', message: '调整顺序后超出时间预算或时间窗，未替换原路线', retryable: false });
         return;
@@ -429,6 +435,7 @@ class JobRunner {
       }
       solved = r;
     }
+    solved = await hydrateSolved(pack, edited, graph, solved);
     const version = store.find('route_versions', (x) => x.planId === plan.id).length + 1;
     const newPlan = buildRoutePlan(pack, edited, graph, solved, { version, planId: plan.id, parentVersion: base.version });
     store.insert('route_versions', newPlan);
@@ -514,11 +521,12 @@ class JobRunner {
       edited.hard.avoidPoiIds = [...new Set(edited.hard.avoidPoiIds)];
     }
 
-    const r = solveOnce(pack, edited, graph, { interestW: 1, timeCostW: 0.55, dwellFactor: 1 });
+    let r = solveOnce(pack, edited, graph, { interestW: 1, timeCostW: 0.55, dwellFactor: 1 });
     if (r.status !== 'ok') {
       this.emit(job, 'job.failed', { code: r.conflict.code, message: r.conflict.message, retryable: false, conflict: r.conflict });
       return;
     }
+    r = await hydrateSolved(pack, edited, graph, r);
     const version = store.find('route_versions', (x) => x.planId === plan.id).length + 1;
     const proposal = buildRoutePlan(pack, edited, graph, r, { version, planId: plan.id, parentVersion: base.version });
     proposal.isProposal = true;

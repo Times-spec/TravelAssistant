@@ -8,7 +8,7 @@
  * - 开放时间/门票高德不提供 → 标记 unknown，方案标为条件性；
  * - 路段一律走高德步行路径规划（真实折线），没有真实路由的边标 unreachable，绝不用直线顶替。
  */
-const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf, EXCLUDE_NAME_RE } = require('./amap');
+const { AmapAreaGraph, amapGet, mapType, textSearch, maxCandidatesForQuota, matrixCacheKeyOf, endKeyOf, isJunkPoi, candidateCapFor, resolveMatrixMode } = require('./amap');
 const { haversineM } = require('./geo');
 
 const VENUE_TYPECODES = ['110101', '110102', '110103', '110105', '110200', '110202', '141201', '141200'];
@@ -171,8 +171,11 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
   const core = String(venueRef.name || '').replace(/[（(][^）)]*[）)]/g, '').replace(/(博物院|博物馆|风景名胜区|风景区|旅游区|景区|公园)$/, '');
   const insideOf = (p) => core.length >= 2 && (p.name.includes(core) || (p.address || '').includes(core));
   const isMust = (p) => p.mustForce || mustPid.has(p.providerPoiId) || p.nominated;
-  pois = pois.filter((p) => isMust(p)
-    || (!(EXCLUDE_NAME_RE.test(p.name) && !insideOf(p)) && !(/(大街|胡同|路|街|巷)$/.test(p.name) && !insideOf(p))));
+  // 无价值判定与闲逛同口径（机构/培训/连锁快餐/路口/外送…）；园内点只剔除设施类
+  const facilityRe = /(卫生间|厕所|公厕|停车场|售票处|检票口|地铁站|公交站|外送|外卖|自提点|服务中心|管理处)/;
+  pois = pois.filter((p) => (p.mustForce || mustPid.has(p.providerPoiId))
+    || (!(isJunkPoi(p.name, p.typecode, { nominated: true }) && (!insideOf(p) || facilityRe.test(p.name)))
+      && (isMust(p) || !(/(大街|胡同|路|街|巷)$/.test(p.name) && !insideOf(p)))));
   if (core.length >= 2 && pois.filter(insideOf).length >= 6) {
     pois = pois.filter((p) => isMust(p) || insideOf(p) || p.distanceM <= 300);
   }
@@ -214,7 +217,11 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
     seenCore.add(core);
     buckets.get(b).push(p);
   }
-  const cap = Math.min(12, maxCandidatesForQuota(cfg.limits.maxRoutingCalls));
+  // 距离矩阵模式下园内点位放宽到 12/16/20（按预算）；两两模式仍受路由配额约束
+  const matrixMode = await resolveMatrixMode(cfg, center);
+  const cap = matrixMode === 'distance'
+    ? Math.min(budgetSec >= 10800 ? 20 : budgetSec >= 7200 ? 16 : 12, candidateCapFor(cfg, budgetSec, 2, 'distance').cap)
+    : Math.min(12, maxCandidatesForQuota(cfg.limits.maxRoutingCalls));
   const picked = [...buckets.values()].flat()
     .sort((a, b) => b.quality - a.quality)
     // 半天预算装得下更多点；上限同时受路由矩阵配额约束（候选 + 起点两两成对都要抓得到），
@@ -238,6 +245,30 @@ async function resolveVenue(cfg, venueRef, budgetSec = 7200, opts = {}) {
   return cacheSet(key, value);
 }
 
+const WALLED_VENUE_RE = /(故宫|博物院|紫禁城|皇城|宫殿|行宫|王府|宫$|陵$|陵园$|寺$|庙$|府$|坛$|天坛|地坛|颐和园|圆明园)/;
+function markVenueEstimates(graph, center, radiusM) {
+  const nodes = [...graph.nodes.values()].filter((n) => haversineM(center, n) <= Math.max(800, radiusM * 1.2));
+  let changed = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      const r = graph._routeCache.get(a.id + '>' + b.id);
+      if (!r || r.status !== 'ok' || r.venueEstimate) continue;
+      const straight = haversineM(a, b);
+      if (!(r.distanceM > Math.max(straight * 2.2, straight + 500))) continue;
+      const geometry = [[a.lng, a.lat], [b.lng, b.lat]];
+      const eid = (r.edgeIds && r.edgeIds[0]) || ('ame_v' + i + '_' + j);
+      const d = Math.round(straight * 1.3);
+      const edge = graph._edges.get(eid);
+      if (edge) { edge.lengthM = d; edge.physicalSegmentKeys = null; }
+      graph._storePair(a.id, b.id, eid, d, geometry, null, true, null, null, { venueEstimate: true, estimated: true, provider: 'venue-estimate' });
+      changed++;
+    }
+  }
+  graph.venueEstimates = changed;
+  return changed;
+}
+
 /** 构建真实场所的路网/图（含路由矩阵；起点由调用方给出） */
 async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
   const resolved = await resolveVenue(cfg, venueRef, budgetSec, opts);
@@ -251,7 +282,8 @@ async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
   let cands = resolved.pois.map((p) => ({
     id: p.id, name: p.shortName, lng: p.lng, lat: p.lat,
   }));
-  if (hasEnd) cands = cands.slice(0, Math.max(1, maxCandidatesForQuota(cfg.limits.maxRoutingCalls) - 1));
+  const matrixMode = await resolveMatrixMode(cfg, originPoint);
+  if (hasEnd) cands = cands.slice(0, Math.max(1, candidateCapFor(cfg, budgetSec, 2, matrixMode).cap));
   // 点位已定、路网矩阵还没抓：交给调用方提前评审（与矩阵抓取并行）
   if (typeof opts.onCandidates === 'function') {
     const ids = new Set(cands.map((c) => c.id));
@@ -261,7 +293,11 @@ async function buildLiveVenue(cfg, venueRef, origin, budgetSec, opts = {}) {
       })));
     } catch (e) { /* 回调失败不影响建包 */ }
   }
-  await graph.init(cands, { cacheKey: matrixCacheKeyOf('venue:' + venueRef.id, originPoint, [...(hasEnd ? [endKeyOf(graph.endpoint)] : []), ...cands.map((c) => c.id)]) });
+  await graph.init(cands, { matrixMode, cacheKey: matrixCacheKeyOf('venue:' + venueRef.id, originPoint, [...(hasEnd ? [endKeyOf(graph.endpoint)] : []), ...cands.map((c) => c.id)]) });
+
+  // 围墙内的宫殿/寺庙/陵园：高德步行路网没有园内道路，两点间路线会绕到园外（故宫午门→神武门 3km）。
+  // 路由距离远超直线（>2.2 倍且多出 500m 以上）的园内点对改为直线 ×1.3 估算，并如实标注"园内路线为估算"。
+  if (WALLED_VENUE_RE.test(venueRef.name || '')) markVenueEstimates(graph, resolved.center, radiusForBudget(budgetSec));
 
   const usable = resolved.pois.filter((p) => graph.nodes.has(p.id));
   const venueId = venueRef.id;

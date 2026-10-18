@@ -85,6 +85,17 @@ global.fetch = async (url, opts) => {
       { instruction: '沿示例街步行到达目的地', action: '', road: '示例街', distance: String(Math.round(d / 2)), polyline: `${mid};${b}` },
     ] }] } });
   }
+  if (u.pathname.includes('/v3/distance')) {
+    // 距离矩阵（步行测距）：与路径规划同一口径（直线 ×1.25）；KERNEL_MATRIX=pairwise 时模拟"接口不可用"走旧模式
+    if (process.env.KERNEL_MATRIX === 'pairwise') return J({ results: [] });
+    const [dx, dy] = q.get('destination').split(',').map(Number);
+    const results = q.get('origins').split('|').map((o, i) => {
+      const [ox, oy] = o.split(',').map(Number);
+      const d = Math.round(haversineM({ lng: ox, lat: oy }, { lng: dx, lat: dy }) * 1.25);
+      return d > 6000 ? { origin_id: String(i + 1), dest_id: '1', info: '超出步行测距范围', code: '3' } : { origin_id: String(i + 1), dest_id: '1', distance: String(d), duration: String(Math.round(d / 1.2)) };
+    });
+    return J({ count: String(results.length), results });
+  }
   if (u.pathname.includes('/place/detail')) return J({ pois: [] });
   return J({});
 };

@@ -17,7 +17,7 @@
  * - 智能体选的点不会被标成"用户锁定"；
  * - 任何一步失败/超时都回退到原有规则路径，绝不因为智能体而出不了路线。
  */
-const { solveOnce, solveAlternatives, buildRoutePlan } = require('./planner');
+const { solveOnce, solveAlternatives, buildRoutePlan, hydrateSolved } = require('./planner');
 const { RoutePlanningAgent, verifyRoutePlan } = require('./route_planning_agent');
 const { haversineM } = require('./geo');
 
@@ -29,7 +29,7 @@ const DEFAULTS = {
   llmExplain: true,     // ⑦ 大模型写理由（失败回退诚实模板）
   maxRounds: 3,         // 反思-修复最多轮数
   maxNominate: 10,
-  maxAppraise: 16,
+  maxAppraise: 24,
   minGain: 0.01,        // 质量分至少提升这么多才接受修改
   timeBudgetMs: 60000,  // 智能体额外耗时上限：超出后跳过剩余大模型步骤
 };
@@ -222,7 +222,7 @@ async function geocodePlace(cfg, place, scope, city, deps, venue) {
       if (!p || !p.id || (venue && p.id === venue.providerPoiId)) continue;
       const [lng, lat] = String(p.location || ',').split(',').map(Number);
       if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
-      if (BAD_TYPECODE_RE.test(String(p.typecode || '')) || EXCLUDE_NAME_RE.test(p.name || '')) continue;
+      if (BAD_TYPECODE_RE.test(String(p.typecode || '')) || EXCLUDE_NAME_RE.test(p.name || '') || require('./amap').isJunkPoi(p.name, p.typecode, { nominated: true })) continue;
       if (!nameMatches(place.name, p.name, venueCore)) continue;
       if (!scope.accept({ lng, lat })) continue;
       return { p, lng, lat };
@@ -505,12 +505,16 @@ function evaluateSolved(pack, intent, solved) {
   const nomPool = pack.pois.filter((p) => p.nominated).length;
   const nomVisited = stops.filter((s) => s.poi.nominated).length;
   const nomCov = nomPool ? Math.min(1, nomVisited / Math.min(nomPool, Math.max(1, n))) : 1;
-  const Q = n ? (0.35 * avgValue + 0.2 * Math.min(1, util / utilTarget) + 0.15 * interestHit + 0.1 * (1 - commercialShare)
-    + 0.1 * endFit + 0.05 * (1 - repeatRatio) + 0.05 * nomCov) : 0;
+  // 值得度按"总量覆盖"计（Σ值得度 / 预算对应的目标站数），而不是平均值：
+  // 旧版 0.35×平均值奖励"少而精"，反思修复把 3 小时路线从 4 站压成 1 站（2026-10-18 线上实测 W3/W4/W9/W11）。
+  const targetStops = clamp(Math.round(intent.budgetSec / 60 / 35), 1, 8);
+  const coverage = Math.min(1, stops.reduce((a, s) => a + valueOf(s.poi), 0) / (targetStops * 0.75));
+  const Q = n ? (0.3 * coverage + 0.12 * avgValue + 0.15 * Math.min(1, util / utilTarget) + 0.12 * interestHit + 0.1 * (1 - commercialShare)
+    + 0.12 * endFit + 0.05 * (1 - repeatRatio) + 0.04 * nomCov) : 0;
   return {
     Q: r3(Q),
     metrics: {
-      stops: n, avgValue: r2(avgValue), util: r2(util), interestHit: r2(interestHit), commercialShare: r2(commercialShare),
+      stops: n, avgValue: r2(avgValue), coverage: r2(coverage), targetStops, util: r2(util), interestHit: r2(interestHit), commercialShare: r2(commercialShare),
       endWalkM, repeatSightM: Math.round(sch.totals.repeatSightM || 0), distanceM: Math.round(sch.totals.distanceM || 0),
       totalSec: Math.round(sch.totals.totalSec || 0), nomVisited, nomPool, isAB,
     },
@@ -632,7 +636,7 @@ ${cLines.join('\n') || '（无）'}`;
   return out;
 }
 
-const BOOST = 1.5;
+const BOOST = 0.8; // 1.5 过大：远点被优先插入、挤掉多个近点（2026-10-18 实测）
 function workingIntent(intent, state) {
   return {
     ...intent,
@@ -692,7 +696,11 @@ async function criticLoop({ cfg, pack, intent, graph, policy, solved, deps, dead
       if (r.status !== 'ok' || !(r.schedule.stops || []).length) { tried.push({ label, source: op.source, q: null, ok: false }); continue; }
       if (sameStops(r, cur)) { tried.push({ label, source: op.source, q: curEv.Q, ok: true, same: true }); continue; }
       const ev = evaluateSolved(pack, intent, r);
-      tried.push({ label, source: op.source, q: ev.Q, ok: true });
+      // 护栏：修复不得把路线"压塌"——站数少 2 站以上、或预算利用率掉 15 个百分点以上的方案一律不采纳
+      const collapsed = ev.metrics.stops < curEv.metrics.stops - 1 || ev.metrics.util < curEv.metrics.util - 0.15
+        || (ev.metrics.stops < curEv.metrics.stops && ev.metrics.stops < Math.min(3, ev.metrics.targetStops));
+      tried.push({ label, source: op.source, q: ev.Q, ok: true, rejected: collapsed ? 'collapse' : undefined });
+      if (collapsed) continue;
       if (!best || ev.Q > best.ev.Q) best = { op, st, r, ev, label };
     }
     const gain = best ? best.ev.Q - curEv.Q : 0;
@@ -830,12 +838,15 @@ async function runAgentKernel({ cfg, pack, intent, graph, planId = 'agent_plan',
     solutions.push(alt);
     if (solutions.length >= 3) break;
   }
+  // 距离矩阵模式：先回填真实步行折线并按真实距离重排时间，再验证、再写解释（解释里的数字与发布路线一致）
+  for (const s of solutions) s.solved = await hydrateSolved(pack, intent, graph, s.solved);
   // 发布前独立验证（用用户原始意图：智能体选的点不算用户锁定，硬约束按用户口径复核）
   const verified = solutions.filter((s, i) => {
     const plan = buildRoutePlan(pack, intent, graph, s.solved, { version: i + 1, planId });
     return verifyRoutePlan(plan).ok;
   });
   const finalSolutions = verified.length && verified[0] === solutions[0] ? verified : base.solutions;
+  if (finalSolutions === base.solutions) for (const s of finalSolutions) s.solved = await hydrateSolved(pack, intent, graph, s.solved);
   trace.push({
     stage: 'agent.quality', ms: deps.now() - t0, durMs: deps.now() - tc,
     before: loop.initial.Q, after: finalSolutions === base.solutions ? loop.initial.Q : mainEv.Q,
@@ -845,7 +856,8 @@ async function runAgentKernel({ cfg, pack, intent, graph, planId = 'agent_plan',
 
   // 解释
   const usedSolved = finalSolutions[0].solved;
-  const usedEv = finalSolutions === base.solutions ? loop.initial : mainEv;
+  // 回填折线后距离/末段以真实路线为准：重新评估一次，解释与质量分都用发布口径
+  const usedEv = evaluateSolved(pack, intent, usedSolved);
   const facts = explainFacts(pack, intent, usedSolved, usedEv, finalSolutions === base.solutions ? [] : loop.accepted);
   if (onProgress) onProgress({ stage: 'explain' });
   const te = deps.now();

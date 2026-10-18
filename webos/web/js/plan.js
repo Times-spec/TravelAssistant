@@ -614,7 +614,9 @@ export function renderPlan(view, ctx, planId) {
       return replan();
     }
     if (s.action === 'extend_time') {
-      d.durationSec = Math.min(28800, d.durationSec + 1800);
+      d.durationSec = Math.min(28800, (d.durationSec || 7200) + 1800);
+      // 标记为用户最新的时长选择：否则草稿里一句话写过"3小时"时，文本时长会盖掉这次延长
+      d.timeMode = 'duration'; d.durationTouched = true; d.durationTouchedAt = Date.now();
       saveDraftSafe();
       toast('预算增加 30 分钟，正在重新规划…');
       return replan();

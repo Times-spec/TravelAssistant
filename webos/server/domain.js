@@ -39,16 +39,27 @@ function ruleNLU(text) {
   if (!text || !text.trim()) return out;
   const t = text.trim();
 
-  // 时长：半小时/两小时/2小时/90分钟/半天
-  let m = t.match(/(半|一|两|二|三|四|五|六|七|八|九|\d+)\s*(?:个)?\s*半?\s*(?:小时|钟头)/);
-  if (m) {
-    let h = cnToNum(m[1]) || 0;
-    if (/半\s*(?:小时|钟头)/.test(t) && m[0].includes('半') && m[1] !== '半') h += 0.5;
-    if (m[1] === '半') h = 0.5;
-    out.durationSec = Math.round(h * 3600);
+  // 时长：半小时/两小时/2小时/2.5小时/3h/1.5h/90分钟/90min/半天
+  // （规则兜底此前不认"3h""2.5小时""90min"，LLM 不可用时会退回默认时长）
+  let m = t.match(/(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)(?![a-z])/i);
+  if (m && Number(m[1]) > 0) out.durationSec = Math.round(Number(m[1]) * 3600);
+  if (!out.durationSec) {
+    m = t.match(/(\d+\.\d+)\s*(?:个)?\s*(?:小时|钟头|个钟)/);
+    if (m) out.durationSec = Math.round(Number(m[1]) * 3600);
   }
   if (!out.durationSec) {
-    m = t.match(/(\d+)\s*分钟/);
+    m = t.match(/(半|一|两|二|三|四|五|六|七|八|九|十|\d+)\s*(?:个)?\s*半?\s*(?:小时|钟头|个钟)/);
+    if (m) {
+      let h = cnToNum(m[1]) || 0;
+      if (/半\s*(?:小时|钟头|个钟)/.test(t) && m[0].includes('半') && m[1] !== '半') h += 0.5;
+      if (m[1] === '半') h = 0.5;
+      out.durationSec = Math.round(h * 3600);
+      const extra = t.slice(m.index + m[0].length).match(/^\s*(?:零)?\s*(\d+|[一二两三四五六七八九十]+)\s*分/);
+      if (extra && !m[0].includes('半')) out.durationSec += (cnToNum(extra[1]) || 0) * 60;
+    }
+  }
+  if (!out.durationSec) {
+    m = t.match(/(\d+)\s*(?:分钟|min|mins|minutes)(?![a-z])/i);
     if (m) out.durationSec = Number(m[1]) * 60;
   }
   if (!out.durationSec && /半天/.test(t)) out.durationSec = 4 * 3600;
@@ -164,11 +175,23 @@ function resolveTimes(form, textParsed, tz, evidence) {
     mark('startAt', 'default', '现在');
   }
 
-  // 时长：表单优先；文本补充
-  const formDuration = form.durationTouched !== false && form.durationSec;
-  let durationSec = formDuration || textParsed.durationSec || form.durationSec || 2 * 3600;
+  // 时长：用户"最后一次表达"优先。
+  // 旧逻辑是"表单优先"：草稿持久化在本地，用户以前点过一次 30 分钟 chip（durationTouched=true）后，
+  // 再在一句话里写"我有3h想出去转转"会被静默按 30 分钟编排（2026-10-18 线上实测）。
+  // 现在：前端在文字晚于 chip 修改时带 textOverrides=true（AI 按钮提交恒为 true），文本时长胜出；
+  // 若文本时长仍被表单覆盖，返回 notice 明确告知，不再静默。
+  const formDurationRaw = form.durationTouched !== false && form.durationSec;
+  const textWins = !!(textParsed.durationSec && (form.textOverrides || !formDurationRaw));
+  const formDuration = textWins ? 0 : formDurationRaw;
+  let durationSec = (textWins ? textParsed.durationSec : 0) || formDuration || textParsed.durationSec || form.durationSec || 2 * 3600;
   durationSec = clamp(durationSec, 30 * 60, 8 * 3600); // 文档 §2.2：30 分钟～8 小时
-  mark('durationSec', formDuration ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : tk.fmtDuration(durationSec));
+  mark('durationSec', textWins ? 'text' : formDuration ? 'form' : textParsed.durationSec ? 'text' : 'default', textParsed.durationSec ? undefined : tk.fmtDuration(durationSec));
+  let timeNotice = null;
+  if (textParsed.durationSec && !textWins && formDuration && Math.abs(formDuration - textParsed.durationSec) >= 60) {
+    timeNotice = { code: 'DURATION_FORM_WINS', message: `你在描述里提到 ${tk.fmtDuration(textParsed.durationSec)}，但表单时长是 ${tk.fmtDuration(formDuration)}，本次按表单规划；如需改用描述里的时长，请在时长处修改` };
+  } else if (textWins && formDurationRaw && Math.abs(formDurationRaw - textParsed.durationSec) >= 60) {
+    timeNotice = { code: 'DURATION_FROM_TEXT', message: `已按你描述里的 ${tk.fmtDuration(durationSec)} 规划（表单原为 ${tk.fmtDuration(formDurationRaw)}）` };
+  }
 
   // 截止：表单 arrive-by 模式 or 文本"几点前"
   let latestEndMs = startMs + durationSec * 1000;
@@ -203,7 +226,14 @@ function resolveTimes(form, textParsed, tz, evidence) {
   if (latestEndMs <= startMs) {
     throw E.badRequest('开始时间已晚于截止时间，请修正日期或时间', { field: 'latestEndAt' });
   }
-  return { startMs, latestEndMs, durationSec: Math.floor((latestEndMs - startMs) / 1000), dualConstraint: deadlineSource != null && latestEndMs < byDuration };
+  // "下午2点到5点"在 16:37 说出：开始被推到现在，剩余时间远小于原时间窗 → 明确告知而不是静默压缩成 20 多分钟。
+  if (textWindow && textParsed.startClock && startMs > tk.zonedTimeToMs(now.dateStr, textParsed.startClock, tz) + 5 * 60000) {
+    const leftMin = Math.round((latestEndMs - startMs) / 60000);
+    if (windowSec && leftMin * 60 < windowSec * 0.7) {
+      timeNotice = { code: 'WINDOW_ALREADY_STARTED', message: `你说的 ${textParsed.startClock}–${textParsed.latestEndClock} 已经开始，按现在出发只剩约 ${leftMin} 分钟；如果是指明天，请在出发时间里改为"稍后出发"` };
+    }
+  }
+  return { startMs, latestEndMs, durationSec: Math.floor((latestEndMs - startMs) / 1000), dualConstraint: deadlineSource != null && latestEndMs < byDuration, notice: timeNotice };
 }
 
 /* ---------------- 实体解析：文本地名 → 已知 POI/节点 ID（模型不创造 ID） ---------------- */
@@ -407,6 +437,7 @@ function normalizeIntent(input, packs, preParsed = null) {
     latestEndAtMs: times.latestEndMs,
     budgetSec: times.durationSec,
     dualConstraint: times.dualConstraint,
+    timeNotice: times.notice || null,
     timezone: tz,
     mobility,
     pace,

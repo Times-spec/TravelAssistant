@@ -390,7 +390,15 @@ class Api {
     let unresolvedEndpoint = null;
     const endPlaceName = parsed.endPlaceName || rules.endPlaceName;
     const endpointExplicit = form.endpointTouched || (form.endpointMode === 'fixed' && form.endpointPoint);
-    if (endPlaceName && !endpointExplicit && form.origin) {
+    // "五点前回南门"而起点正是南门 → 语义就是回到起点，不该再按具名地点另建一个终点
+    // （模型是否抽出 endPlaceName 不稳定，会时而是 return_to_origin、时而是 fixed，2026-10-18 复现）
+    const originLabel = String((form.origin && form.origin.label) || '');
+    const sameAsOrigin = !!(endPlaceName && originLabel
+      && (originLabel === endPlaceName || originLabel.includes(endPlaceName) || endPlaceName.includes(originLabel)));
+    if (endPlaceName && !endpointExplicit && form.origin && sameAsOrigin) {
+      form.endpointMode = 'return_to_origin';
+      if (!form.endpointTouched) form.endpointPoint = null;
+    } else if (endPlaceName && !endpointExplicit && form.origin) {
       let pick = null;
       try {
         let city = form.origin.city || form.city || parsed.venueCity || (form.venueRef && form.venueRef.city) || '';
@@ -511,6 +519,7 @@ class Api {
         });
       }
     }
+    if (intent.timeNotice) notices.push(intent.timeNotice);
     intent.notices = notices;
 
     // 同一用户同场景同场所 → revision 递增（§6.2）
@@ -800,7 +809,9 @@ class Api {
       budgetSec: Math.max(0, Math.floor((intent.latestEndAtMs - nowMs) / 1000)),
     };
     const nodeSeq = route.stops.map((s) => s.entranceNodeId);
-    const sch = scheduleRoute(pack, freshIntent, graph, nodeSeq, { startNodeId: route.startNodeId, endNodeId: route.endNodeId });
+    // 停留时长沿用路线上展示给用户的值（含'停留补足'），只按真实出发时刻平移
+    const dwellOverride = Object.fromEntries(route.stops.filter((s) => s.entranceNodeId && s.dwellSec).map((s) => [s.entranceNodeId, s.dwellSec]));
+    const sch = scheduleRoute(pack, freshIntent, graph, nodeSeq, { startNodeId: route.startNodeId, endNodeId: route.endNodeId, dwellOverride });
     const shiftWarnings = [];
     let adjusted = null;
     if (sch.ok) {
